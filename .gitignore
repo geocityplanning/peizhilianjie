@@ -1,0 +1,37 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime databases, task data, and logs
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+
+# Browser sessions and automation evidence
+browser-profile/
+app/executor/browser-profile/
+app/executor/data/
+app/executor/output/
+output/
+screenshots/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+app/executor/config.json

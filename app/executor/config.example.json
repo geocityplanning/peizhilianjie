@@ -1,0 +1,13 @@
+﻿{
+    "login":  {
+                  "url":  "https://plus.buy.139.com/cloudappadmin/#/login",
+                  "username_xpath":  "//input[@placeholder=\u0027璇疯緭鍏ョ敤鎴峰悕\u0027]",
+                  "password_xpath":  "//input[@placeholder=\u0027璇疯緭鍏ュ瘑鐮?]",
+                  "captcha_image_xpath":  "//img[@alt=\u0027楠岃瘉鐮?]",
+                  "captcha_input_xpath":  "//input[@placeholder=\u0027璇疯緭鍏ラ獙璇佺爜\u0027]",
+                  "login_button_xpath":  "//button[.//span[text()=\u0027鐧诲綍\u0027]]",
+                  "success_url_contains":  "/welcome",
+                  "username":  "",
+                  "password_encrypted":  ""
+              }
+}

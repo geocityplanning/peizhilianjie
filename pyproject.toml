@@ -1,0 +1,29 @@
+[project]
+name = "link-orchestrator"
+version = "0.1.0"
+description = "FastAPI orchestration layer for 139 cloud app link automation"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.116.0",
+    "uvicorn[standard]>=0.35.0",
+    "openpyxl>=3.1.5",
+    "pydantic>=2.11.0",
+    "pydantic-settings>=2.10.0",
+    "python-multipart>=0.0.20",
+    "requests>=2.32.0",
+    "playwright>=1.62.0",
+    "ddddocr>=1.5.6",
+    "opencv-python>=4.12.0",
+    "Pillow>=10.0.0",
+    "numpy>=2.0.0",
+    "cryptography>=44.0.0",
+    "mcp>=2.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0",
+]
+
+[tool.uv]
+package = false

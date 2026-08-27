@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>自动配链接操作台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <h1>自动配链接操作台</h1>
+        <p>粘贴客户邮件并确认字段；可新建渠道，也可填写已有渠道后直接创建应用。</p>
+      </div>
+    </header>
+
+    <section class="statusCard" id="loginCard">
+      <div class="statusMain">
+        <span class="statusDot idle" id="loginDot"></span>
+        <div>
+          <strong id="loginTitle">浏览器和登录状态未检查</strong>
+          <p id="loginMessage">点击检查后会启动浏览器守护，并确认 139 后台是否已登录。</p>
+        </div>
+      </div>
+      <div class="statusActions"><button id="statusBtn" type="button">检查浏览器和登录状态</button><button id="lockBtn" class="secondary" type="button">查看执行端锁</button><button id="releaseLockBtn" class="danger" type="button">释放卡住任务</button></div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHead">
+        <h2>客户邮件</h2>
+        <button id="parseBtn" type="button">解析并填表</button>
+      </div>
+      <textarea id="rawText" placeholder="把客户发来的邮件内容粘贴到这里"></textarea>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <div class="panelHead"><h2>创建渠道</h2></div>
+        <label>渠道基础名<input id="channel_base_name"></label>
+        <label>底座<select id="base_platform"><option value="">默认：华为底座2.0</option><option>华为底座2.0</option><option>蜂助手底座</option></select></label>
+        <button id="createChannelBtn" type="button" disabled>创建渠道</button>
+        <div id="channelResult" class="result muted">请先检查浏览器和登录状态</div>
+      </div>
+
+      <div class="panel">
+        <div class="panelHead"><h2>创建应用</h2></div>
+        <label>业务对象<input id="business_object"></label>
+        <label>活动名称<input id="activity_name"></label>
+        <label>实际渠道名<input id="actual_channel_name" placeholder="已有渠道可直接填写"></label>
+        <div class="hint">渠道已存在时无需重复创建，填写准确的实际渠道名即可。</div>
+        <label>应用类型<select id="application_type"><option>云盘</option><option>掌厅</option></select></label>
+        <label>结算类型<input id="settlement_type"></label>
+        <label>分组<input id="group_name"></label>
+        <label>调起路径<textarea id="jump_address"></textarea></label>
+        <label>资源不足兜底页<textarea id="resource_fallback_page"></textarea></label>
+        <div class="hint" id="template_hint">解析后会提示复制模板建议。</div>
+        <button id="createAppBtn" type="button" disabled>确认并创建应用</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHead">
+        <h2>执行结果</h2>
+        <button id="copyLedgerBtn" type="button" disabled>复制台账行</button>
+      </div>
+      <div id="appResult" class="result muted">等待创建应用</div>
+      <textarea id="ledgerPreview" readonly placeholder="创建应用成功后，这里会生成可粘贴到 Excel 的一行"></textarea>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
+
