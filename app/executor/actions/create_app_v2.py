@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-创建应用 — 契约版（v2，加超时保护+智能等待）。
-
-入口 execute_create_app(request: CommonWriteRequest) -> ExecutionResult
-改进：
-  - 所有 locator 操作加 5 秒超时，不再默认 30 秒干等
-  - 固定 wait_for_timeout 换成 wait_for_selector 智能等待
-  - 每步加 try/except，卡住立刻报错返回，不干等
+创建应用 — 契约版（v2，JS 直操 DOM，绕过 Playwright :visible 伪类）。
 """
 import json
 import os
@@ -25,18 +19,14 @@ from actions.ensure_login import ensure_login
 OPERATION = "CREATE_APP"
 BASE_URL_H5 = "https://plus.buy.139.com/cloudappadmin/#/cloudAppManager"
 DEFAULT_BASE = "华为底座2.0"
-
-# 统一超时：每个 UI 操作最多等 5 秒
-STEP_TIMEOUT = 10000
+STEP_TIMEOUT = 5000
 
 DIR = Path(__file__).resolve().parent.parent
-OUT = Path(__file__).resolve().parents[3] / "data" / "executor" / "output"
+OUT = DIR / "output"
 OUT.mkdir(exist_ok=True)
 
 
 def _shot(page, name):
-    if os.environ.get("LINK_EXECUTOR_STEP_SCREENSHOTS") != "1":
-        return
     try:
         page.screenshot(path=str(OUT / f"appv3_{name}.png"), timeout=8000)
     except Exception:
@@ -66,88 +56,203 @@ def _cleanup_overlays(page):
             pass
 
 
-def _find_form_item(page, label):
-    """找到指定 label 的 form-item，找不到返回 None（不干等）。"""
-    items = page.locator(".el-dialog:visible .el-form-item")
-    n = items.count()
-    for i in range(n):
-        try:
-            lbl_el = items.nth(i).locator(".el-form-item__label").first
-            lbl = lbl_el.inner_text(timeout=2000).strip(" *:").strip()
-            if lbl == label:
-                return items.nth(i)
-        except Exception:
-            continue
-    return None
-
+# ====== JS 直操 DOM 工具函数（不依赖 Playwright :visible） ======
 
 def _available_tabs(page):
+    """用 JS 查可见对话框的 Tab 名称。"""
     try:
-        tabs = page.locator(".el-dialog:visible .el-tabs__item")
-        values = []
-        for i in range(tabs.count()):
-            try:
-                values.append(tabs.nth(i).inner_text(timeout=500).strip())
-            except Exception:
-                pass
-        return values
+        return page.evaluate("""
+        () => {
+          const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+          for (const w of wrappers) {
+            if (w.style.display === 'none') continue;
+            const tabs = w.querySelectorAll('.el-tabs__item');
+            if (tabs.length > 0) {
+              return Array.from(tabs).map(t => t.innerText.trim());
+            }
+          }
+          return [];
+        }
+        """)
     except Exception:
         return []
 
 
 def _go_tab(page, name):
-    """切 Tab：先收起浮层，再在短时间内重试找 Tab，避免页面刚渲染时误判失败。"""
-    try:
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(300)
-    except Exception:
-        pass
-
-    deadline = time.monotonic() + 12
+    """用 JS 点击目标 Tab。"""
+    deadline = time.monotonic() + 6
     last_tabs = []
     while time.monotonic() < deadline:
-        try:
-            page.wait_for_selector(".el-dialog:visible .el-tabs__item", timeout=2000)
-            tabs = page.locator(".el-dialog:visible .el-tabs__item")
-            last_tabs = _available_tabs(page)
-            for i in range(tabs.count()):
-                tab = tabs.nth(i)
-                text = tab.inner_text(timeout=2000).strip()
-                if name in text:
-                    tab.scroll_into_view_if_needed(timeout=2000)
-                    tab.click(timeout=STEP_TIMEOUT)
-                    page.wait_for_timeout(500)
-                    try:
-                        page.wait_for_selector(".el-dialog:visible .el-tab-pane:visible", timeout=3000)
-                    except Exception:
-                        pass
-                    return True
-        except Exception:
-            pass
-        page.wait_for_timeout(200)
-
-    print(f"[create_app] WARN: 未找到Tab {name}，当前Tabs={last_tabs}")
+        last_tabs = _available_tabs(page)
+        if last_tabs:
+            break
+        page.wait_for_timeout(300)
+    if not last_tabs:
+        print(f"[create_app] WARN: 未找到Tab {name}，当前Tabs={last_tabs}")
+        return False
+    clicked = page.evaluate("""
+    (tabName) => {
+      const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+      for (const w of wrappers) {
+        if (w.style.display === 'none') continue;
+        const tabs = w.querySelectorAll('.el-tabs__item');
+        for (const t of tabs) {
+          if (t.innerText.trim().includes(tabName)) { t.click(); return true; }
+        }
+      }
+      return false;
+    }
+    """, name)
+    if clicked:
+        page.wait_for_timeout(500)
+        return True
+    print(f"[create_app] WARN: Tab '{name}' 不在 {last_tabs} 中")
     return False
 
-def _select_dropdown(page, form_item, value):
-    """点下拉框选值，超时 5 秒。"""
-    try:
-        form_item.locator(".el-select").first.click(timeout=STEP_TIMEOUT)
-        # 等下拉面板出现（智能等待）
-        page.wait_for_selector(".el-select-dropdown:visible", timeout=STEP_TIMEOUT)
-        opt = page.locator(".el-select-dropdown:visible .el-select-dropdown__item").filter(has_text=value).first
-        if opt.count() > 0:
-            opt.click(timeout=STEP_TIMEOUT)
-            return True
-        # 选项没找到，关掉下拉
+
+def _js_fill(page, label, value):
+    """用 JS 找 label 对应的 input 并填值。"""
+    return page.evaluate("""
+    ({label, value}) => {
+      const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+      for (const w of wrappers) {
+        if (w.style.display === 'none') continue;
+        const items = w.querySelectorAll('.el-form-item');
+        for (const it of items) {
+          if (it.offsetParent === null) continue;
+          const lblEl = it.querySelector('.el-form-item__label');
+          if (!lblEl) continue;
+          const lbl = lblEl.innerText.replace(/[ *:]/g, '').trim();
+          if (lbl === label) {
+            const input = it.querySelector('input.el-input__inner');
+            if (input) {
+              const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+              setter.call(input, value);
+              input.dispatchEvent(new Event('input', {bubbles: true}));
+              input.dispatchEvent(new Event('change', {bubbles: true}));
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    }
+    """, {"label": label, "value": value})
+
+
+def _js_select(page, label, value):
+    """用 JS 点下拉框并选项。"""
+    opened = page.evaluate("""
+    (label) => {
+      const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+      for (const w of wrappers) {
+        if (w.style.display === 'none') continue;
+        const items = w.querySelectorAll('.el-form-item');
+        for (const it of items) {
+          if (it.offsetParent === null) continue;
+          const lblEl = it.querySelector('.el-form-item__label');
+          if (!lblEl) continue;
+          const lbl = lblEl.innerText.replace(/[ *:]/g, '').trim();
+          if (lbl === label) {
+            const sel = it.querySelector('.el-select');
+            if (sel) { sel.click(); return true; }
+          }
+        }
+      }
+      return false;
+    }
+    """, label)
+    if not opened:
+        return False
+    page.wait_for_timeout(500)
+    picked = page.evaluate("""
+    (value) => {
+      const dropdowns = document.querySelectorAll('.el-select-dropdown');
+      for (const dd of dropdowns) {
+        if (dd.style.display === 'none') continue;
+        const items = dd.querySelectorAll('.el-select-dropdown__item');
+        for (const it of items) {
+          if (it.innerText.trim().includes(value)) { it.click(); return true; }
+        }
+      }
+      return false;
+    }
+    """, value)
+    if not picked:
         page.keyboard.press("Escape")
+    return picked
+
+
+def _js_channel_popover(page, label, channel_name):
+    """用 JS 处理渠道 popover 选择器（带 A-Z 字母索引的自定义组件）。"""
+    # 1. 点 channel-input 打开 popover
+    opened = page.evaluate("""
+    (label) => {
+      const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+      for (const w of wrappers) {
+        if (w.style.display === 'none') continue;
+        const items = w.querySelectorAll('.el-form-item');
+        for (const it of items) {
+          if (it.offsetParent === null) continue;
+          const lblEl = it.querySelector('.el-form-item__label');
+          if (!lblEl) continue;
+          if (lblEl.innerText.includes(label)) {
+            const ci = it.querySelector('.channel-input');
+            if (ci) { ci.click(); return true; }
+          }
+        }
+      }
+      return false;
+    }
+    """, label)
+    if not opened:
         return False
-    except Exception:
-        return False
+    page.wait_for_timeout(1500)
+
+    # 2. 在 popover 里找渠道名并点击
+    picked = page.evaluate("""
+    (name) => {
+      // 找所有可能的 popover 元素
+      const pops = document.querySelectorAll('[id^="el-popover-"], .el-popover, .el-popper, .channel-popover');
+      for (const p of pops) {
+        if (p.offsetParent === null && !p.style.display) continue;
+        if (p.style.display === 'none') continue;
+        // 查找所有可能的渠道选项元素
+        const candidates = p.querySelectorAll('li, td, span, div, a, p');
+        for (const el of candidates) {
+          if (el.offsetParent === null) continue;
+          const t = el.innerText ? el.innerText.trim() : '';
+          // 精确匹配渠道名（排除包含匹配，避免误点）
+          if (t === name) {
+            el.click();
+            return true;
+          }
+        }
+      }
+      // 如果精确匹配没找到，试前缀匹配
+      for (const p of pops) {
+        if (p.style.display === 'none') continue;
+        const candidates = p.querySelectorAll('li, td, span, div, a, p');
+        for (const el of candidates) {
+          if (el.offsetParent === null) continue;
+          const t = el.innerText ? el.innerText.trim() : '';
+          if (t.startsWith(name) || (name.startsWith(t) && t.length > 3)) {
+            el.click();
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+    """, channel_name)
+    if picked:
+        page.wait_for_timeout(500)
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+    return picked
 
 
 def _set_stage(execution_id, stage):
-    """更新执行记录的阶段，供前端轮询显示进度。"""
     try:
         ex.update_execution(execution_id, output_json=json.dumps({"_stage": stage}, ensure_ascii=False))
         print(f"[create_app] stage: {stage}")
@@ -161,7 +266,6 @@ def execute_create_app(request: dict) -> dict:
     environment = request.get("environment", "TEST")
     idempotency_key = request["idempotency_key"]
 
-    # 1. 幂等
     existing = ex.find_by_idempotency(idempotency_key)
     if existing:
         return ex.build_result(task_id, OPERATION, idempotency_key,
@@ -170,13 +274,11 @@ def execute_create_app(request: dict) -> dict:
                               error=json.loads(existing.get("error_json") or "null") if existing.get("error_json") else None,
                               environment=existing.get("environment"))
 
-    # 2. 锁
     if ex.is_locked():
         active = ex.get_active_execution_id()
         return ex.build_result(task_id, OPERATION, idempotency_key, accepted=False,
                               error=err("EXECUTOR_BUSY", "LOCK", f"执行端忙碌中，占用执行: {active}", NEXT_QUERY))
 
-    # 3. 字段校验
     required = ["application_type", "business_object", "actual_channel_name",
                 "jump_address", "resource_fallback_page", "settlement_type"]
     missing = [f for f in required if not (data.get(f) or "").strip()]
@@ -189,7 +291,6 @@ def execute_create_app(request: dict) -> dict:
     activity = data.get("activity_name", "")
     app_name = f"{bo}-{activity}" if activity else bo
 
-    # 4. 建执行记录
     execution = ex.create_execution(task_id, OPERATION, idempotency_key, data, environment)
     execution_id = execution["execution_id"]
     if not ex.acquire_lock(execution_id):
@@ -202,6 +303,7 @@ def execute_create_app(request: dict) -> dict:
     try:
         pw, browser, page = get_browser_page()
         page.bring_to_front()
+        _set_stage(execution_id, "正在登录")
         auth = ensure_login(page)
         if not auth["success"]:
             e = err("NOT_LOGGED_IN", "LOGIN", f"登录失败: {auth['message']}", NEXT_QUERY)
@@ -213,11 +315,10 @@ def execute_create_app(request: dict) -> dict:
         _set_stage(execution_id, "正在加载应用列表")
         _cleanup_overlays(page)
         page.goto(BASE_URL_H5, wait_until="domcontentloaded")
-        # 智能等待表格出现，最多 5 秒
         try:
             page.wait_for_selector("table tbody tr", timeout=STEP_TIMEOUT)
         except Exception:
-            page.wait_for_timeout(2000)  # 兜底
+            page.wait_for_timeout(2000)
         try:
             page.get_by_text("确定", exact=True).first.click(timeout=2000)
         except Exception:
@@ -227,12 +328,11 @@ def execute_create_app(request: dict) -> dict:
         # reset + search
         try:
             page.get_by_text("重置", exact=True).first.click(timeout=STEP_TIMEOUT)
-            # 等表格刷新
             page.wait_for_timeout(500)
         except Exception:
             pass
         try:
-            page.get_by_text("搜 索", exact=False).first.click(timeout=STEP_TIMEOUT)
+            page.get_by_text("搜", exact=False).first.click(timeout=STEP_TIMEOUT)
             try:
                 page.wait_for_selector("table tbody tr", timeout=STEP_TIMEOUT)
             except Exception:
@@ -243,116 +343,112 @@ def execute_create_app(request: dict) -> dict:
         # copy template
         _set_stage(execution_id, "正在复制模板应用")
         copy_btns = page.get_by_text("复制", exact=True)
-        copied = False
-        for i in range(copy_btns.count()):
+        n_btns = copy_btns.count()
+        print(f"[create_app] 找到 {n_btns} 个复制按钮")
+        if n_btns > 0:
             try:
-                btn = copy_btns.nth(i)
-                if bo in btn.locator("xpath=ancestor::tr").first.inner_text(timeout=2000):
-                    btn.click(timeout=STEP_TIMEOUT)
-                    # 等对话框出现
-                    try:
-                        page.wait_for_selector(".el-dialog:visible", timeout=STEP_TIMEOUT)
-                    except Exception:
-                        page.wait_for_timeout(500)
-                    copied = True
-                    break
-            except Exception:
-                continue
-        if not copied:
-            page.get_by_text("复制", exact=True).first.click(timeout=STEP_TIMEOUT)
-            try:
-                page.wait_for_selector(".el-dialog:visible", timeout=STEP_TIMEOUT)
-            except Exception:
-                page.wait_for_timeout(500)
+                copy_btns.first.click(timeout=STEP_TIMEOUT)
+                try:
+                    page.wait_for_selector(".el-dialog__wrapper:not([style*='display: none']) .el-tabs__item", timeout=STEP_TIMEOUT)
+                except Exception:
+                    page.wait_for_timeout(1000)
+            except Exception as e:
+                print(f"[create_app] WARN: 复制按钮点击失败: {e}")
         _shot(page, "02_copy_dialog")
 
         # === 体验配置 ===
         _set_stage(execution_id, "正在填写体验配置")
         if not _go_tab(page, "体验配置"):
             raise RuntimeError(f"无法切换到体验配置Tab，当前可见Tabs={_available_tabs(page)}")
-        fi = _find_form_item(page, "应用名称")
-        if fi:
-            try:
-                fi.locator("input.el-input__inner").first.fill(app_name, timeout=STEP_TIMEOUT)
-            except Exception:
-                pass
-        else:
-            print("[create_app] WARN: 应用名称 字段未找到")
-        fi = _find_form_item(page, "底座")
-        if fi:
-            _select_dropdown(page, fi, DEFAULT_BASE)
-        else:
-            print("[create_app] WARN: 底座 字段未找到")
-        fi = _find_form_item(page, "所属渠道")
-        if fi:
-            try:
-                fi.locator(".channel-input").first.click(timeout=STEP_TIMEOUT)
-                # 等 popover 出现
-                try:
-                    page.wait_for_selector(".el-popover:visible, .el-popper:visible", timeout=STEP_TIMEOUT)
-                except Exception:
-                    page.wait_for_timeout(500)
-                pop = page.locator(".el-popover:visible, .el-popper:visible").last
-                tgt = pop.get_by_text(data["actual_channel_name"], exact=False).first
-                if tgt.count() > 0:
-                    tgt.click(timeout=STEP_TIMEOUT)
-                    page.wait_for_timeout(500)
-                    page.keyboard.press("Escape")
-                    page.wait_for_timeout(300)
-            except Exception as e:
-                print(f"[create_app] WARN: 所属渠道选择失败: {e}")
-        else:
-            print("[create_app] WARN: 所属渠道 字段未找到")
+        if not _js_fill(page, "应用名称", app_name):
+            print("[create_app] WARN: 应用名称 填写失败")
+        if not _js_select(page, "底座", DEFAULT_BASE):
+            print("[create_app] WARN: 底座 选择失败")
+        if not _js_channel_popover(page, "所属渠道", data["actual_channel_name"]):
+            print(f"[create_app] WARN: 所属渠道 选择失败: {data['actual_channel_name']}")
         _shot(page, "03_exp_config")
 
         # === 登录页配置 ===
         _set_stage(execution_id, "正在填写登录页配置")
         if not _go_tab(page, "登录页配置"):
             raise RuntimeError(f"无法切换到登录页配置Tab，当前可见Tabs={_available_tabs(page)}")
-        paths = page.locator(".el-dialog:visible .el-form-item").filter(has_text="配置调起路径")
-        for i in range(paths.count()):
-            try:
-                it = paths.nth(i)
-                if "is-required" in (it.get_attribute("class") or ""):
-                    it.locator("input.el-input__inner").first.fill(data["jump_address"], timeout=STEP_TIMEOUT)
-                    break
-            except Exception:
-                continue
+        page.evaluate("""
+        (jumpAddr) => {
+          const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+          for (const w of wrappers) {
+            if (w.style.display === 'none') continue;
+            const items = w.querySelectorAll('.el-form-item');
+            for (const it of items) {
+              if (it.offsetParent === null) continue;
+              if (!it.className.includes('is-required')) continue;
+              const lblEl = it.querySelector('.el-form-item__label');
+              if (!lblEl || !lblEl.innerText.includes('配置调起路径')) continue;
+              const input = it.querySelector('input.el-input__inner');
+              if (input) {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(input, jumpAddr);
+                input.dispatchEvent(new Event('input', {bubbles: true}));
+                return true;
+              }
+            }
+          }
+          return false;
+        }
+        """, data["jump_address"])
         _shot(page, "04_login_config")
 
         # === 基础配置 ===
         _set_stage(execution_id, "正在填写基础配置")
         if not _go_tab(page, "基础配置"):
             raise RuntimeError(f"无法切换到基础配置Tab，当前可见Tabs={_available_tabs(page)}")
-        fi = _find_form_item(page, "资源不足中间页链接")
-        if fi:
-            try:
-                fi.locator("input.el-input__inner").first.fill(data["resource_fallback_page"], timeout=STEP_TIMEOUT)
-            except Exception as e:
-                print(f"[create_app] WARN: 资源不足中间页链接填写失败: {e}")
-        else:
-            print("[create_app] WARN: 资源不足中间页链接 字段未找到")
-        fi = _find_form_item(page, "结算类型")
-        if fi:
-            if not _select_dropdown(page, fi, data["settlement_type"]):
-                print(f"[create_app] WARN: 结算类型选择失败，目标值: {data['settlement_type']}")
-        else:
-            print("[create_app] WARN: 结算类型 字段未找到")
+        if not _js_fill(page, "资源不足中间页链接", data["resource_fallback_page"]):
+            print("[create_app] WARN: 资源不足中间页链接 填写失败")
+        if not _js_select(page, "结算类型", data["settlement_type"]):
+            print(f"[create_app] WARN: 结算类型 选择失败: {data['settlement_type']}")
         _shot(page, "05_basic_config")
 
         # === save ===
         _set_stage(execution_id, "正在保存应用")
         if not _go_tab(page, "悬浮球配置"):
             raise RuntimeError(f"无法切换到悬浮球配置Tab，当前可见Tabs={_available_tabs(page)}")
+        # 关掉子弹窗
+        page.evaluate("""
+        () => {
+          const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+          for (const w of wrappers) {
+            if (w.style.display === 'none') continue;
+            if (w.querySelectorAll('.el-tabs__item').length === 0) {
+              const closeBtn = w.querySelector('.el-dialog__headerbtn');
+              if (closeBtn) closeBtn.click();
+              return;
+            }
+          }
+        }
+        """)
+        page.wait_for_timeout(300)
+        # 用 JS 点主对话框保存按钮
+        saved = page.evaluate("""
+        () => {
+          const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+          for (const w of wrappers) {
+            if (w.style.display === 'none') continue;
+            if (w.querySelectorAll('.el-tabs__item').length === 0) continue;
+            const btns = w.querySelectorAll('button');
+            let saveBtn = null;
+            for (const b of btns) {
+              if (b.innerText.includes('保存')) saveBtn = b;
+            }
+            if (saveBtn) { saveBtn.click(); return true; }
+          }
+          return false;
+        }
+        """)
+        if not saved:
+            raise RuntimeError("未找到主对话框的保存按钮")
+        # 等对话框消失
         try:
-            page.locator(".el-dialog:visible").locator("button").filter(has_text="保存").first.click(timeout=STEP_TIMEOUT)
-        except Exception as e:
-            raise RuntimeError(f"保存按钮点击失败: {e}")
-        # 等对话框消失（保存成功），最多 8 秒
-        try:
-            page.wait_for_selector(".el-dialog:visible", state="detached", timeout=8000)
+            page.wait_for_selector(".el-dialog__wrapper:not([style*='display: none'])", state="detached", timeout=8000)
         except Exception:
-            # 对话框还在 = 可能保存失败或还在处理
             page.wait_for_timeout(2000)
         _shot(page, "06_after_save")
         save_err = capture_page_errors(page, screenshot_name=f"app_save_{app_name}")
@@ -390,7 +486,6 @@ def execute_create_app(request: dict) -> dict:
         if "is-checked" not in (sw.get_attribute("class") or ""):
             try:
                 sw.click(timeout=STEP_TIMEOUT)
-                # 等确认弹窗或状态变化
                 try:
                     page.wait_for_selector(".el-message-box:visible", timeout=3000)
                     page.keyboard.press("Enter")
@@ -399,7 +494,6 @@ def execute_create_app(request: dict) -> dict:
                     page.wait_for_timeout(500)
             except Exception as e:
                 print(f"[create_app] WARN: 状态开关点击失败: {e}")
-        # 确认开关状态
         sw2 = found_row.locator(".el-switch").first
         if "is-checked" not in (sw2.get_attribute("class") or ""):
             pub_err = capture_page_errors(page, screenshot_name=f"app_publish_fail_{app_name}")
@@ -417,20 +511,37 @@ def execute_create_app(request: dict) -> dict:
             try:
                 set_btns.last.click(timeout=STEP_TIMEOUT)
                 try:
-                    page.wait_for_selector(".el-dialog:visible", timeout=STEP_TIMEOUT)
+                    page.wait_for_selector(".el-dialog__wrapper:not([style*='display: none'])", timeout=STEP_TIMEOUT)
                 except Exception:
                     page.wait_for_timeout(500)
-                dlg = page.locator(".el-dialog:visible").last
-                dlg.get_by_text("按分组", exact=True).first.click(timeout=STEP_TIMEOUT)
-                page.wait_for_timeout(300)
-                dlg.locator("input.el-input__inner").last.fill(group_name, timeout=STEP_TIMEOUT)
-                page.wait_for_timeout(200)
-                dlg.get_by_text("确定", exact=True).first.click(timeout=STEP_TIMEOUT)
-                # 等成功提示或对话框消失
-                try:
-                    page.wait_for_selector(".el-dialog:visible", state="detached", timeout=5000)
-                except Exception:
-                    page.wait_for_timeout(700)
+                # 用 JS 操作分组设置
+                page.evaluate("""
+                (groupName) => {
+                  const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+                  for (const w of wrappers) {
+                    if (w.style.display === 'none') continue;
+                    if (w.querySelectorAll('.el-tabs__item').length > 0) continue;
+                    // 这是子弹窗
+                    const radios = w.querySelectorAll('.el-radio, .el-radio-button, span');
+                    for (const r of radios) {
+                      if (r.innerText && r.innerText.includes('按分组')) { r.click(); break; }
+                    }
+                    const inputs = w.querySelectorAll('input.el-input__inner');
+                    if (inputs.length > 0) {
+                      const last = inputs[inputs.length - 1];
+                      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                      setter.call(last, groupName);
+                      last.dispatchEvent(new Event('input', {bubbles: true}));
+                    }
+                    const btns = w.querySelectorAll('button');
+                    for (const b of btns) {
+                      if (b.innerText.includes('确定')) { b.click(); return true; }
+                    }
+                  }
+                  return false;
+                }
+                """, group_name)
+                page.wait_for_timeout(2000)
             except Exception as ge:
                 g_err = capture_page_errors(page, screenshot_name=f"app_group_fail_{app_name}")
                 e = err("GROUP_SET_FAILED", "GROUP", f"分组设置异常: {ge}", NEXT_MANUAL)
@@ -493,9 +604,3 @@ def execute_create_app(request: dict) -> dict:
                 pw.stop()
             except Exception:
                 pass
-
-
-
-
-
-
