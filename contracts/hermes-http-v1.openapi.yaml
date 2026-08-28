@@ -1,0 +1,146 @@
+openapi: 3.0.3
+info:
+  title: Hermes HTTP Executor
+  version: 1.0.0
+  description: TEST/FAKE 联调接口，不执行真实浏览器自动化。
+servers:
+  - url: http://127.0.0.1:8001
+security:
+  - bearerAuth: []
+paths:
+  /v1/exec/info:
+    get:
+      operationId: getInfo
+      summary: 获取执行端信息
+      responses:
+        '200':
+          description: 执行端信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InfoResponse'
+  /v1/exec/create-channel:
+    post:
+      operationId: createChannel
+      summary: 提交创建渠道任务
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecutionRequest'
+      responses:
+        '200':
+          description: 已受理或幂等重放
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionReceipt'
+        '400':
+          description: 请求校验失败
+        '401':
+          description: 鉴权失败
+        '409':
+          description: 执行端忙碌或幂等冲突
+  /v1/exec/create-app:
+    post:
+      operationId: createApp
+      summary: 提交创建应用任务
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecutionRequest'
+      responses:
+        '200':
+          description: 已受理或幂等重放
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionReceipt'
+        '400':
+          description: 请求校验失败
+        '401':
+          description: 鉴权失败
+        '409':
+          description: 执行端忙碌或幂等冲突
+  /v1/exec/query:
+    post:
+      operationId: queryExecution
+      summary: 查询原始执行任务
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+      responses:
+        '200':
+          description: 原始任务状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionReceipt'
+        '400':
+          description: 查询条件错误或任务不存在
+        '401':
+          description: 鉴权失败
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    ExecutionRequest:
+      type: object
+      required: [contract_version, task_id, operation, environment, idempotency_key, input]
+      properties:
+        contract_version: {type: string, example: http-executor.v1}
+        task_id: {type: string, example: HERMES-20260828-0001}
+        operation: {type: string, enum: [exec.create_channel, exec.create_app]}
+        environment: {type: string, example: TEST}
+        idempotency_key: {type: string, example: HERMES-20260828-0001-create-channel}
+        input: {type: object, additionalProperties: true}
+    QueryRequest:
+      type: object
+      required: [contract_version]
+      properties:
+        contract_version: {type: string, example: http-executor.v1}
+        execution_id: {type: string, nullable: true}
+        task_id: {type: string, nullable: true}
+        operation: {type: string, nullable: true}
+        environment: {type: string, nullable: true}
+        idempotency_key: {type: string, nullable: true}
+    ExecutionReceipt:
+      type: object
+      required: [contract_version, accepted, execution_state, business_status, next_action]
+      properties:
+        contract_version: {type: string}
+        accepted: {type: boolean}
+        execution_id: {type: string, nullable: true}
+        task_id: {type: string, nullable: true}
+        operation: {type: string, nullable: true}
+        environment: {type: string, nullable: true}
+        idempotency_key: {type: string, nullable: true}
+        execution_state: {type: string, enum: [ACCEPTED, RUNNING, SUCCEEDED, FAILED, UNKNOWN, REJECTED]}
+        business_status: {type: string}
+        data: {type: object, nullable: true, additionalProperties: true}
+        error: {type: object, nullable: true, additionalProperties: true}
+        evidence_ref: {type: array, items: {type: string}}
+        next_action: {type: string, enum: [QUERY, STOP, MANUAL_CHECK]}
+        created_at: {type: string}
+        updated_at: {type: string}
+    InfoResponse:
+      type: object
+      required: [contract_version, capabilities, environment, mode]
+      properties:
+        contract_version: {type: string}
+        service: {type: string}
+        environment: {type: string}
+        mode: {type: string}
+        capabilities: {type: array, items: {type: string}}
+        browser_status: {type: string}
+        login_status: {type: string}
+        active_execution_id: {type: string, nullable: true}
+        database_status: {type: string}
