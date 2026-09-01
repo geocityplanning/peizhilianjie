@@ -21,10 +21,16 @@ BASE_URL_H5 = "https://plus.buy.139.com/cloudappadmin/#/cloudAppManager"
 DEFAULT_BASE = "华为底座2.0"
 STEP_TIMEOUT = 5000
 
-# 参考应用长链接默认值：application_type 未传 ref_cloud_app_link 时使用
-DEFAULT_REF_LINKS = {
-    "云盘": "https://plus.buy.139.com/mccloudgame/#/?i=KWcMvfaFlhw=",
-    "掌厅": "https://plus.buy.139.com/mccloudgame/#/?i=zZVurLOuLsI=",
+# 参考应用默认配置：application_type 未传 ref_cloud_app_link 时使用
+DEFAULT_REF_SOURCES = {
+    "云盘": {
+        "app_id": "11926",
+        "cloud_app_link": "https://plus.buy.139.com/mccloudgame/#/?i=KWcMvfaFlhw=",
+    },
+    "掌厅": {
+        "app_id": "11935",
+        "cloud_app_link": "https://plus.buy.139.com/mccloudgame/#/?i=zZVurLOuLsI=",
+    },
 }
 
 DIR = Path(__file__).resolve().parent.parent
@@ -343,7 +349,199 @@ def _close_group_dialog(page):
     """)
 
 
-def _stage_create_save(page, execution_id, data, ref_cloud_app_link, app_name,
+def _search_by_link(page, ref_cloud_app_link):
+    """主路径：用长链接搜索参考应用并点击复制。
+
+    Returns:
+        {clicked: bool, uncertain: bool, error: str_or_None}
+        - clicked=True: 已点击复制按钮
+        - clicked=False, uncertain=False, error=None: 安全，可进入兜底
+        - clicked=False, uncertain=False, error="SEARCH_FAILED": 搜索组件缺失
+        - clicked=True, uncertain=True: 不确定是否点了复制（不能进兜底）
+    """
+    link_key = ref_cloud_app_link.split("i=")[-1] if "i=" in ref_cloud_app_link else ref_cloud_app_link
+
+    # 1. 精确查找 placeholder 包含"长链接"的可见输入框
+    input_ok = page.evaluate("""
+    (link) => {
+      const inputs = document.querySelectorAll('input');
+      for (const inp of inputs) {
+        if (inp.offsetParent === null) continue;
+        if ((inp.placeholder || '').includes('长链接')) {
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          setter.call(inp, link);
+          inp.dispatchEvent(new Event('input', {bubbles: true}));
+          return {filled: true, actual: inp.value};
+        }
+      }
+      return {filled: false};
+    }
+    """, ref_cloud_app_link)
+    if not input_ok or not input_ok.get("filled"):
+        print("[create_app] 主路径失败：未找到长链接输入框")
+        return {"clicked": False, "uncertain": False, "error": "SEARCH_FAILED"}
+    if input_ok.get("actual") != ref_cloud_app_link:
+        print(f"[create_app] 主路径失败：长链接输入框值不匹配 expected={ref_cloud_app_link[:40]} actual={input_ok.get('actual', '')[:40]}")
+        return {"clicked": False, "uncertain": False, "error": "SEARCH_FAILED"}
+
+    # 2. JS 遍历 button，只点击 innerText.trim() === "搜索"
+    search_clicked = page.evaluate("""
+    () => {
+      const btns = document.querySelectorAll('button');
+      for (const b of btns) {
+        if (b.offsetParent === null) continue;
+        if (b.innerText.trim() === '搜索') { b.click(); return true; }
+      }
+      return false;
+    }
+    """)
+    if not search_clicked:
+        print("[create_app] 主路径失败：未找到搜索按钮")
+        return {"clicked": False, "uncertain": False, "error": "SEARCH_FAILED"}
+
+    # 等搜索结果
+    page.wait_for_timeout(2000)
+    try:
+        page.wait_for_selector("table tbody tr", timeout=5000)
+    except Exception:
+        pass
+    page.wait_for_timeout(1000)
+
+    # 3. 从 ref_cloud_app_link 提取 i 参数，用 textContent 匹配行
+    copied = page.evaluate("""
+    (linkKey) => {
+      const rows = document.querySelectorAll('table tbody tr');
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        if (row.offsetParent === null) continue;
+        // 用 textContent 匹配（包含隐藏的完整URL），用 i= 参数部分匹配
+        if (!(row.textContent || '').includes(linkKey)) continue;
+        const btns = row.querySelectorAll('button, a, span');
+        for (const b of btns) {
+          if (b.offsetParent !== null && b.innerText.trim() === '复制') {
+            b.click();
+            return {clicked: true, row_idx: i};
+          }
+        }
+      }
+      return {clicked: false};
+    }
+    """, link_key)
+
+    if copied and copied.get("clicked"):
+        print(f"[create_app] 主路径：已点击复制 (row_idx={copied.get('row_idx')})")
+        return {"clicked": True, "uncertain": False, "error": None}
+    else:
+        print("[create_app] 主路径：长链接搜索失败，未找到复制按钮")
+        return {"clicked": False, "uncertain": False, "error": None}
+
+
+def _locate_by_app_id(page, ref_app_id):
+    """兜底路径：按 app_id 逐页精确定位并点击复制。
+
+    Returns:
+        {clicked: bool, error: str_or_None}
+        - clicked=True: 已点击复制按钮
+        - clicked=False, error="COPY_FAILED": 所有页都没有找到
+    """
+    print(f"[create_app] 兜底路径：按 app_id={ref_app_id} 逐页精确定位")
+
+    # 先重置搜索条件
+    page.evaluate("""
+    () => {
+      const inputs = document.querySelectorAll('input');
+      for (const inp of inputs) {
+        if (inp.offsetParent === null) continue;
+        const ph = inp.placeholder || '';
+        if (ph.includes('长链接') || ph.includes('应用名称') || ph.includes('应用')) {
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          setter.call(inp, '');
+          inp.dispatchEvent(new Event('input', {bubbles: true}));
+        }
+      }
+    }
+    """)
+    page.wait_for_timeout(300)
+    page.evaluate("""
+    () => {
+      const btns = document.querySelectorAll('button');
+      for (const b of btns) {
+        if (b.offsetParent === null) continue;
+        if (b.innerText.trim() === '搜索') { b.click(); return; }
+      }
+    }
+    """)
+    page.wait_for_timeout(2000)
+
+    # 逐页查找
+    for _page_num in range(50):  # 最多翻50页
+        # 展开所有折叠行
+        page.evaluate("""
+        () => {
+          const rows = document.querySelectorAll('table tbody tr');
+          for (const row of rows) {
+            if (row.offsetParent === null) continue;
+            const ei = row.querySelector('.el-table__expand-icon, [class*="expand-icon"]');
+            if (ei && !ei.className.includes('expanded')) ei.click();
+          }
+        }
+        """)
+        page.wait_for_timeout(1000)
+
+        # 在当前页用完整单元格精确匹配 app_id
+        found = page.evaluate("""
+        (refId) => {
+          const rows = document.querySelectorAll('table tbody tr');
+          for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            if (row.offsetParent === null) continue;
+            // 逐个单元格精确匹配
+            const cells = row.querySelectorAll('td');
+            for (const cell of cells) {
+              if ((cell.textContent || '').trim() === refId) {
+                // 找到，点复制
+                const btns = row.querySelectorAll('button, a, span');
+                for (const b of btns) {
+                  if (b.offsetParent !== null && b.innerText.trim() === '复制') {
+                    b.click();
+                    return {clicked: true, row_idx: i};
+                  }
+                }
+                return {clicked: false, reason: 'found_row_no_copy_button', row_idx: i};
+              }
+            }
+          }
+          return {clicked: false, reason: 'not_on_this_page'};
+        }
+        """, ref_app_id)
+
+        if found and found.get("clicked"):
+            print(f"[create_app] 兜底结果：成功 (page={_page_num+1}, row_idx={found.get('row_idx')})")
+            return {"clicked": True, "error": None}
+
+        # 检查是否有下一页
+        has_next = page.evaluate("""
+        () => {
+          const next = document.querySelector('.el-pagination .btn-next');
+          if (!next) return false;
+          return !next.className.includes('disabled');
+        }
+        """)
+        if not has_next:
+            break
+
+        # 翻到下一页
+        page.evaluate("""() => {
+          const next = document.querySelector('.el-pagination .btn-next');
+          if (next) next.click();
+        }""")
+        page.wait_for_timeout(2000)
+
+    print(f"[create_app] 兜底结果：失败 (app_id={ref_app_id} 在所有页都未找到)")
+    return {"clicked": False, "error": "COPY_FAILED"}
+
+
+def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id, app_name,
                        jump_address, resource_fallback_page, settlement_type):
     """Stage 1: 用长链接搜索参考应用 → 点复制 → 填字段 → 保存 → 定位新行。
     Returns: {success: bool, target_idx: int, error: err_or_None}
@@ -370,67 +568,33 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, app_name,
 
     _shot(page, "01_list")
 
-    # 用长链接搜索参考应用
+    # ====== 主路径：用长链接搜索参考应用并点复制 ======
     _set_stage(execution_id, f"正在搜索参考应用(长链接)")
-    page.evaluate("""
-    (link) => {
-      const inputs = document.querySelectorAll('input');
-      for (const inp of inputs) {
-        if (inp.offsetParent === null) continue;
-        if ((inp.placeholder || '').includes('长链接')) {
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-          setter.call(inp, link);
-          inp.dispatchEvent(new Event('input', {bubbles: true}));
-          return true;
-        }
-      }
-      return false;
-    }
-    """, ref_cloud_app_link)
-    page.wait_for_timeout(500)
+    primary = _search_by_link(page, ref_cloud_app_link)
 
-    # 点搜索
-    try:
-        page.get_by_text("搜", exact=False).first.click(timeout=3000)
-        page.wait_for_timeout(2000)
-    except Exception:
-        pass
+    # 安全边界
+    if primary["error"] == "SEARCH_FAILED":
+        # 主路径组件缺失，返回错误，不进兜底
+        return {"success": False, "error": err("SEARCH_FAILED", "SEARCH",
+                f"主路径失败：未找到长链接输入框/搜索按钮", NEXT_STOP)}
+    if primary.get("uncertain"):
+        # 不确定是否点了复制，不能进兜底
+        return {"success": False, "error": err("COPY_RESULT_UNKNOWN", "COPY",
+                "无法确认是否已经点击复制", NEXT_STOP)}
 
-    # 等搜索结果
-    try:
-        page.wait_for_selector("table tbody tr", timeout=5000)
-    except Exception:
-        page.wait_for_timeout(2000)
-    page.wait_for_timeout(1000)
-    _shot(page, "01b_search_result")
+    copy_clicked = primary["clicked"]
 
-    # 找搜索结果中的复制按钮
-    copied = {"clicked": False}
-    for _copy_attempt in range(3):
-        copied = page.evaluate("""
-        (link) => {
-          const rows = document.querySelectorAll('table tbody tr');
-          for (let i = 0; i < rows.length; i++) {
-            const row = rows[i];
-            if (row.offsetParent === null) continue;
-            if (!row.innerText.includes(link)) continue;
-            const btns = row.querySelectorAll('button, a, span');
-            for (const b of btns) {
-              if (b.offsetParent !== null && b.innerText.trim() === '复制') {
-                b.click();
-                return {clicked: true, row_idx: i};
-              }
-            }
-          }
-          return {clicked: false};
-        }
-        """, ref_cloud_app_link)
-        if copied and copied.get("clicked"):
-            break
-        page.wait_for_timeout(1000)
-
-    if not copied or not copied.get("clicked"):
-        return {"success": False, "error": err("COPY_FAILED", "COPY", f"搜索长链接后未找到复制按钮: {ref_cloud_app_link[:60]}", NEXT_STOP)}
+    # ====== 兜底路径：主路径明确未点击复制时，按 app_id 逐页定位 ======
+    if not copy_clicked:
+        _set_stage(execution_id, f"主路径：长链接搜索失败\n兜底路径：按 app_id={ref_app_id} 逐页精确定位")
+        fallback = _locate_by_app_id(page, ref_app_id)
+        if fallback.get("error") == "COPY_FAILED":
+            return {"success": False, "error": err("COPY_FAILED", "COPY",
+                    f"两条路径都没有找到复制源或复制按钮 (ref_app_id={ref_app_id})", NEXT_STOP)}
+        if not fallback.get("clicked"):
+            return {"success": False, "error": err("COPY_RESULT_UNKNOWN", "COPY",
+                    "兜底路径无法确认复制结果", NEXT_STOP)}
+        copy_clicked = True
 
     try:
         page.wait_for_selector(".el-dialog__wrapper:not([style*='display: none']) .el-tabs__item", timeout=STEP_TIMEOUT)
@@ -1002,9 +1166,11 @@ def execute_create_app(request: dict) -> dict:
     app_name = f"{business_object}-{activity_name}" if activity_name else business_object
 
     ref_cloud_app_link = (data.get("ref_cloud_app_link") or "").strip()
+    app_type = data["application_type"].strip()
+    ref_source = DEFAULT_REF_SOURCES.get(app_type, {})
     if not ref_cloud_app_link:
-        app_type = data["application_type"].strip()
-        ref_cloud_app_link = DEFAULT_REF_LINKS.get(app_type, "")
+        ref_cloud_app_link = ref_source.get("cloud_app_link", "")
+    ref_app_id = ref_source.get("app_id", "")
     if not ref_cloud_app_link:
         return rejected(
             err(
@@ -1085,6 +1251,7 @@ def execute_create_app(request: dict) -> dict:
             execution_id,
             data,
             ref_cloud_app_link,
+            ref_app_id,
             app_name,
             jump_address,
             resource_fallback_page,
