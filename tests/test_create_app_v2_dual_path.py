@@ -41,6 +41,7 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
 
 def test_no_get_by_text_search():
     src = _source()
+    # 不得使用 get_by_text 模糊匹配"搜"作为搜索按钮
     assert 'get_by_text("搜"' not in src, "不得使用 get_by_text 模糊匹配'搜'"
     assert "get_by_text(\"搜\"" not in src
 
