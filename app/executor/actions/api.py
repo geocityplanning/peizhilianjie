@@ -17,18 +17,19 @@
     result = create_channel(channel_base_name="he0820")
     # {"success": True, "actual_channel_name": "he0820", "message": "创建渠道he0820成功"}
 
-    # 4. 创建应用
+    # 4. 创建应用（复制指定参考应用）
     result = create_app(
         business_object="中国移动云盘",
         activity_name="活动1",
-        actual_channel_name="he0820",  # 从上一步拿
+        actual_channel_name="he0820",  # 从 create_channel 返回值拿
         application_type="云盘",
         jump_address="mcloud://main/tab?params=xxx&tk=",
         resource_fallback_page="https://m.mcloud.139.com/portal/...",
         settlement_type="云盘",
-        group_name="10028",
+        group_name="10028",            # 可选，空则跳过分组设置
+        # ref_cloud_app_link="https://...",  # 可选，不传则按 application_type 使用默认长链接
     )
-    # {"success": True, "cloud_app_link": "https://l.yun.139.com/...", "message": "..."}
+    # {"success": True, "cloud_app_link": "https://l.yun.139.com/...", "message": "操作成功"}
 
     # 5. 修改应用
     result = update_app(
@@ -78,11 +79,12 @@ def _make_request(operation: str, data: dict, task_id: str = None) -> dict:
 
 def _strip(result: dict) -> dict:
     """从 ExecutionResult 中提取业务数据，返回简洁格式。"""
+    data = result.get("data") or {}
     if result.get("business_status") == "SUCCESS":
         return {
             "success": True,
             "message": "操作成功",
-            **(result.get("data") or {}),
+            **data,
         }
     else:
         error = result.get("error") or {}
@@ -92,6 +94,7 @@ def _strip(result: dict) -> dict:
             "error_code": error.get("code"),
             "error_stage": error.get("stage"),
             "next_action": error.get("next_action"),
+            **data,
         }
 
 
@@ -169,26 +172,35 @@ def create_app(
     resource_fallback_page: str = "",
     settlement_type: str = "云盘",
     group_name: str = "",
+    ref_cloud_app_link: str = None,
     task_id: str = None,
     **extra,
 ) -> dict:
-    """创建应用。
+    """创建应用（复制参考应用）。
+
+    通过长链接搜索参考应用，点击"复制"打开预填编辑弹窗，
+    只修改必须改的字段（应用名称、所属渠道等），其余字段保留参考应用的值。
 
     Args:
-        business_object: 业务对象（如"中国移动云盘"），用于匹配复制模板
+        business_object: 业务对象（如"中国移动云盘"）
         activity_name: 活动名后缀（与 business_object 拼成应用名）
         actual_channel_name: 所属渠道名（必须来自 create_channel 的返回值）
-        application_type: "云盘" / "掌厅"
-        jump_address: 登录页"配置调起路径"
-        resource_fallback_page: 基础配置"资源不足中间页链接"
+        application_type: "云盘" / "掌厅"，决定 ref_cloud_app_link 默认值
+        jump_address: 登录页"配置调起路径"，必填
+        resource_fallback_page: 基础配置"资源不足中间页链接"，必填
         settlement_type: 结算类型
-        group_name: 云机链接分组（如"10028"，空则跳过分组设置）
+        group_name: 分组名（空则跳过分组设置）
+        ref_cloud_app_link: 参考应用长链接（复制源），不传则按 application_type 取默认值
+                    （云盘→"https://plus.buy.139.com/mccloudgame/#/?i=KWcMvfaFlhw="，
+                     掌厅→"https://plus.buy.139.com/mccloudgame/#/?i=zZVurLOuLsI="）
         task_id: 可选，用于追溯
         **extra: 预留扩展字段
 
     Returns:
-        成功: {"success": True, "cloud_app_link": "https://l.yun.139.com/...(长链接)", "cloud_app_short_link": "https://l.yun.139.com/m/a/s/...(短链接)", "message": "操作成功"}
-        失败: {"success": False, "message": "...", "error_code": "SAVE_FAILED"}
+        成功: {"success": True, "cloud_app_link": "...", "cloud_app_short_link": "...",
+               "completed_stages": ["CREATE_SAVE", "ENABLE", "SET_GROUP", "COMPLETED"]}
+        失败: {"success": False, "message": "...", "error_code": "...",
+               "completed_stages": [...], "failed_stage": "..."}
     """
     data = {
         "application_type": application_type,
@@ -199,6 +211,7 @@ def create_app(
         "resource_fallback_page": resource_fallback_page,
         "settlement_type": settlement_type,
         "group_name": group_name,
+        "ref_cloud_app_link": ref_cloud_app_link,
     }
     data.update(extra)
     req = _make_request("CREATE_APP", data, task_id)
