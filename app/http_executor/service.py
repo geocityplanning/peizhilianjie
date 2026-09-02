@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 import time
+from collections.abc import Callable
 from typing import Any, Dict, Optional
 
 from .models import ExecutionRequest, QueryRequest
@@ -36,9 +37,15 @@ class ServiceError(Exception):
 
 
 class ExecutionService:
-    def __init__(self, settings: Settings, store: ExecutorStore):
+    def __init__(
+        self,
+        settings: Settings,
+        store: ExecutorStore,
+        real_caller: Callable[..., dict[str, Any]] | None = None,
+    ):
         self.settings = settings
         self.store = store
+        self.real_caller = real_caller
 
     def _validate_common(self, request: ExecutionRequest, operation: str) -> None:
         if request.contract_version != CONTRACT_VERSION:
@@ -61,6 +68,7 @@ class ExecutionService:
                 "jump_address",
                 "resource_fallback_page",
                 "settlement_type",
+                "group_name",
             ],
         }[request.operation]
         missing = [field for field in required if not str(request.input.get(field, "")).strip()]
@@ -70,6 +78,8 @@ class ExecutionService:
     def create(self, request: ExecutionRequest, operation: str) -> Dict[str, Any]:
         self._validate_common(request, operation)
         self._validate_input(request)
+        if self.settings.mode not in {"FAKE", "REAL"}:
+            raise ServiceError("UNSUPPORTED_MODE", "VALIDATE", f"不支持的执行模式: {self.settings.mode}")
         record, should_run = self.store.reserve(
             task_id=request.task_id,
             operation=request.operation,
@@ -87,13 +97,55 @@ class ExecutionService:
                 error.get("next_action", "STOP"),
             )
         if should_run:
+            target = self._run_real if self.settings.mode == "REAL" else self._run_fake
             threading.Thread(
-                target=self._run_fake,
+                target=target,
                 args=(record["execution_id"], request),
                 daemon=True,
                 name=f"hermes-exec-{record['execution_id']}",
             ).start()
         return self._envelope(record)
+
+    def _run_real(self, execution_id: str, request: ExecutionRequest) -> None:
+        from .real_runner import map_real_failure, map_real_success, run_real_request
+
+        try:
+            self.store.mark_running(execution_id)
+            result = run_real_request(request, self.real_caller)
+            if result.get("success"):
+                self.store.finish(
+                    execution_id=execution_id,
+                    execution_state="SUCCEEDED",
+                    business_status="SUCCESS",
+                    data=map_real_success(request, result),
+                    error=None,
+                    evidence_ref=[],
+                )
+                return
+
+            execution_state, business_status, data, error = map_real_failure(result)
+            self.store.finish(
+                execution_id=execution_id,
+                execution_state=execution_state,
+                business_status=business_status,
+                data=data,
+                error=error,
+                evidence_ref=[],
+            )
+        except Exception as exc:
+            self.store.finish(
+                execution_id=execution_id,
+                execution_state="UNKNOWN",
+                business_status="UNKNOWN",
+                data=None,
+                error={
+                    "error_code": "REAL_EXECUTION_UNKNOWN",
+                    "error_stage": "EXECUTE",
+                    "message": str(exc),
+                    "next_action": "QUERY",
+                },
+                evidence_ref=[],
+            )
 
     def _run_fake(self, execution_id: str, request: ExecutionRequest) -> None:
         try:
@@ -116,7 +168,7 @@ class ExecutionService:
                 data = {
                     "simulated": True,
                     "application_id": app_id,
-                    "application_name": request.input.get("application_name") or app_id,
+                    "application_name": request.input["business_object"],
                     "actual_channel_name": request.input["actual_channel_name"],
                     "long_link": None,
                     "short_link": None,

@@ -6,11 +6,12 @@
   "idempotency_key": "HERMES-20260828-0001-create-app",
   "input": {
     "application_type": "云盘",
-    "business_object": "云盘",
+    "business_object": "中国移动云盘",
     "actual_channel_name": "甘肃体验有礼掌厅瀑布流-1",
     "jump_address": "mcloud://main/webView?params=fake",
     "resource_fallback_page": "https://example.invalid/fallback",
     "settlement_type": "云盘",
+    "group_name": "10086",
     "download_link": "https://example.invalid/download",
     "fixed_fields": {}
   }

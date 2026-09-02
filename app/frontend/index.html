@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>自动配链接操作台</title>
+  <title>应用上架开发自测台</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <main class="shell">
     <header class="topbar">
       <div>
-        <h1>自动配链接操作台</h1>
-        <p>粘贴客户邮件并确认字段；可新建渠道，也可填写已有渠道后直接创建应用。</p>
+        <h1>应用上架开发自测台</h1>
+        <p>Hermes HTTP 联调与自动化执行端验收</p>
       </div>
     </header>
 
@@ -34,12 +34,17 @@
       <textarea id="rawText" placeholder="把客户发来的邮件内容粘贴到这里"></textarea>
     </section>
 
+    <section class="workflowRunner" aria-label="完整上架自测">
+      <button id="runWorkflowBtn" type="button" disabled>完整上架自测</button>
+      <div id="workflowMessage" class="result muted" role="status">等待登录检查</div>
+    </section>
+
     <section class="grid">
       <div class="panel">
         <div class="panelHead"><h2>创建渠道</h2></div>
         <label>渠道基础名<input id="channel_base_name"></label>
         <label>底座<select id="base_platform"><option value="">默认：华为底座2.0</option><option>华为底座2.0</option><option>蜂助手底座</option></select></label>
-        <button id="createChannelBtn" type="button" disabled>创建渠道</button>
+        <button id="createChannelBtn" type="button" disabled>仅测试创建渠道</button>
         <div id="channelResult" class="result muted">请先检查浏览器和登录状态</div>
       </div>
 
@@ -55,7 +60,10 @@
         <label>调起路径<textarea id="jump_address"></textarea></label>
         <label>资源不足兜底页<textarea id="resource_fallback_page"></textarea></label>
         <div class="hint" id="template_hint">解析后会提示复制模板建议。</div>
-        <button id="createAppBtn" type="button" disabled>确认并创建应用</button>
+        <div class="appActions">
+          <button id="createAppBtn" type="button" disabled>仅测试应用三阶段</button>
+          <button id="locateAppBtn" class="secondary" type="button" disabled>定位现有应用</button>
+        </div>
       </div>
     </section>
 

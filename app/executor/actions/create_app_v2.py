@@ -283,7 +283,8 @@ def _set_stage(execution_id, stage):
 def _open_group_dialog(page, row_idx):
     return page.evaluate("""
     (rowIdx) => {
-      const rows = document.querySelectorAll('table tbody tr');
+      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
+      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
       if (rowIdx < 0 || rowIdx >= rows.length) return false;
       const row = rows[rowIdx];
       // 只匹配 BUTTON 元素（排除 SPAN），行里有两个"设置"按钮：
@@ -541,10 +542,226 @@ def _locate_by_app_id(page, ref_app_id):
     return {"clicked": False, "error": "COPY_FAILED"}
 
 
+def _reset_list_filters(page):
+    """Clear list filters without depending on fuzzy text locators."""
+    clicked = page.evaluate("""() => {
+      const buttons = document.querySelectorAll('button');
+      for (const button of buttons) {
+        if (button.offsetParent !== null && button.innerText.trim() === '重置') {
+          button.click();
+          return true;
+        }
+      }
+      return false;
+    }""")
+    if not clicked:
+        page.evaluate("""() => {
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          for (const input of document.querySelectorAll('input')) {
+            if (input.offsetParent === null) continue;
+            const placeholder = input.placeholder || '';
+            if (!placeholder.includes('搜索') && !placeholder.includes('应用') && !placeholder.includes('长链接')) continue;
+            setter.call(input, '');
+            input.dispatchEvent(new Event('input', {bubbles: true}));
+          }
+        }""")
+    page.wait_for_timeout(1200)
+
+
+def _go_to_first_page(page):
+    for _ in range(50):
+        moved = page.evaluate("""() => {
+          const prev = document.querySelector('.el-pagination .btn-prev');
+          if (!prev || prev.disabled || prev.className.includes('disabled')) return false;
+          prev.click();
+          return true;
+        }""")
+        if not moved:
+            break
+        page.wait_for_timeout(500)
+
+
+def _expand_visible_rows(page):
+    expanded = page.evaluate("""() => {
+      let count = 0;
+      for (const row of document.querySelectorAll('table tbody tr')) {
+        if (row.offsetParent === null) continue;
+        const icon = row.querySelector('.el-table__expand-icon, [class*="expand-icon"]');
+        if (icon && !icon.className.includes('expanded')) {
+          icon.click();
+          count += 1;
+        }
+      }
+      return count;
+    }""")
+    if expanded:
+        page.wait_for_timeout(600)
+
+
+def _read_current_page_app_rows(page):
+    return page.evaluate("""() => {
+      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
+      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const primaryHeaders = document.querySelectorAll('.el-table__header-wrapper th');
+      const headerNodes = primaryHeaders.length ? primaryHeaders : document.querySelectorAll('th');
+      const headers = Array.from(headerNodes).map(
+        th => (th.innerText || '').trim()
+      );
+      const result = [];
+      for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+        const row = rows[rowIdx];
+        if (row.offsetParent === null) continue;
+        const cells = Array.from(row.querySelectorAll('td'));
+        let appId = '';
+        for (let i = 0; i < cells.length && i < headers.length; i++) {
+          const header = headers[i];
+          if (header === 'ID' || header.includes('应用ID')) {
+            appId = (cells[i].textContent || '').trim();
+            break;
+          }
+        }
+        if (!appId) continue;
+        result.push({
+          app_id: appId,
+          row_idx: rowIdx,
+          row_text: (row.textContent || '').trim()
+        });
+      }
+      return result;
+    }""")
+
+
+def _collect_all_app_rows(page, reset_filters=False):
+    """Collect app rows across pagination, keyed by the exact application ID."""
+    if reset_filters:
+        _reset_list_filters(page)
+    _go_to_first_page(page)
+    records = {}
+    seen_pages = set()
+
+    for _ in range(50):
+        page.wait_for_timeout(300)
+        _expand_visible_rows(page)
+        active_page = page.evaluate("""() => {
+          const active = document.querySelector('.el-pagination .el-pager li.active');
+          return active ? active.innerText.trim() : '1';
+        }""")
+        if active_page in seen_pages:
+            break
+        seen_pages.add(active_page)
+
+        for row in _read_current_page_app_rows(page):
+            records[row["app_id"]] = row
+
+        moved = page.evaluate("""() => {
+          const next = document.querySelector('.el-pagination .btn-next');
+          if (!next || next.disabled || next.className.includes('disabled')) return false;
+          next.click();
+          return true;
+        }""")
+        if not moved:
+            break
+        page.wait_for_timeout(700)
+
+    return records
+
+
+def _identify_new_app(page, before_ids, actual_channel_name):
+    """Find the row created by this save using an ID set difference."""
+    last_candidates = []
+    for attempt in range(5):
+        after_rows = _collect_all_app_rows(page, reset_filters=True)
+        candidates = [row for app_id, row in after_rows.items() if app_id not in before_ids]
+        last_candidates = candidates
+        print(f"[create_app] 新增ID识别 attempt={attempt + 1}: {[row['app_id'] for row in candidates]}")
+
+        if len(candidates) == 1:
+            return {"success": True, "app_id": candidates[0]["app_id"]}
+        if len(candidates) > 1:
+            channel_matches = [
+                row for row in candidates
+                if actual_channel_name and actual_channel_name in row.get("row_text", "")
+            ]
+            if len(channel_matches) == 1:
+                return {"success": True, "app_id": channel_matches[0]["app_id"]}
+            if len(channel_matches) > 1:
+                return {
+                    "success": False,
+                    "error": err(
+                        "NEW_APP_ID_AMBIGUOUS",
+                        "VERIFY",
+                        f"保存后出现多个属于渠道 {actual_channel_name} 的新增应用ID: "
+                        f"{[row['app_id'] for row in channel_matches]}",
+                        NEXT_MANUAL,
+                    ),
+                }
+        page.wait_for_timeout(1500)
+
+    if last_candidates:
+        candidate_ids = [row["app_id"] for row in last_candidates]
+        message = f"保存后新增应用ID无法唯一确定: {candidate_ids}"
+        code = "NEW_APP_ID_AMBIGUOUS"
+    else:
+        message = "保存后未检测到新增应用ID"
+        code = "NEW_APP_ID_NOT_FOUND"
+    return {"success": False, "error": err(code, "VERIFY", message, NEXT_MANUAL)}
+
+
+def _find_target_row_by_id(page, app_id, expected_channel_name=""):
+    """Locate an existing application by exact ID and leave its page visible."""
+    _reset_list_filters(page)
+    _go_to_first_page(page)
+    mismatch = None
+
+    for _ in range(50):
+        _expand_visible_rows(page)
+        found = page.evaluate("""
+        ({appId, expectedChannel}) => {
+          const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
+          const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+          for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+            const row = rows[rowIdx];
+            if (row.offsetParent === null) continue;
+            const exactId = Array.from(row.querySelectorAll('td')).some(
+              cell => (cell.textContent || '').trim() === appId
+            );
+            if (!exactId) continue;
+            const rowText = (row.textContent || '').trim();
+            return {
+              found: !expectedChannel || rowText.includes(expectedChannel),
+              channel_mismatch: Boolean(expectedChannel) && !rowText.includes(expectedChannel),
+              row_idx: rowIdx,
+              row_text: rowText
+            };
+          }
+          return {found: false, channel_mismatch: false, row_idx: -1};
+        }
+        """, {"appId": str(app_id), "expectedChannel": expected_channel_name})
+        if found.get("found"):
+            return found
+        if found.get("channel_mismatch"):
+            mismatch = found
+            break
+
+        moved = page.evaluate("""() => {
+          const next = document.querySelector('.el-pagination .btn-next');
+          if (!next || next.disabled || next.className.includes('disabled')) return false;
+          next.click();
+          return true;
+        }""")
+        if not moved:
+            break
+        page.wait_for_timeout(700)
+
+    if mismatch:
+        return {"found": False, "reason": "channel_mismatch", "row_text": mismatch.get("row_text", "")}
+    return {"found": False, "reason": "not_found"}
+
+
 def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id, app_name,
                        jump_address, resource_fallback_page, settlement_type):
     """Stage 1: 用长链接搜索参考应用 → 点复制 → 填字段 → 保存 → 定位新行。
-    Returns: {success: bool, target_idx: int, error: err_or_None}
+    Returns: {success: bool, target_app_id: str, error: err_or_None}
     """
     _set_stage(execution_id, "正在加载应用列表")
     _cleanup_overlays(page)
@@ -565,6 +782,16 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
         page.wait_for_timeout(1500)
     except Exception:
         pass
+
+    _set_stage(execution_id, "正在记录创建前应用ID")
+    before_rows = _collect_all_app_rows(page, reset_filters=True)
+    if not before_rows:
+        return {
+            "success": False,
+            "error": err("APP_ID_SNAPSHOT_FAILED", "VERIFY", "创建前未读取到任何应用ID", NEXT_MANUAL),
+        }
+    before_ids = set(before_rows)
+    print(f"[create_app] 创建前应用ID数量: {len(before_ids)}")
 
     _shot(page, "01_list")
 
@@ -719,110 +946,44 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
     except Exception:
         pass
 
-    # 清空长链接搜索框，用应用名称搜索新创建的应用
-    page.evaluate("""() => {
-      const inputs = document.querySelectorAll('input');
-      for (const inp of inputs) {
-        if (inp.offsetParent === null) continue;
-        const ph = inp.placeholder || '';
-        if (ph.includes('长链接')) {
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-          setter.call(inp, '');
-          inp.dispatchEvent(new Event('input', {bubbles: true}));
-          break;
+    _set_stage(execution_id, "正在识别新增应用ID")
+    identified = _identify_new_app(page, before_ids, data["actual_channel_name"])
+    if not identified["success"]:
+        return identified
+    target_app_id = identified["app_id"]
+    located = _find_target_row_by_id(page, target_app_id, data["actual_channel_name"])
+    if not located.get("found"):
+        return {
+            "success": False,
+            "error": err(
+                "NEW_APP_ID_NOT_FOUND",
+                "VERIFY",
+                f"已识别新增应用ID={target_app_id}，但无法按ID和渠道重新定位",
+                NEXT_MANUAL,
+            ),
         }
-      }
-    }""")
-    page.wait_for_timeout(300)
-    # 在应用名称搜索框输入新应用名
-    page.evaluate("""
-    (appName) => {
-      const inputs = document.querySelectorAll('input');
-      for (const inp of inputs) {
-        if (inp.offsetParent === null) continue;
-        const ph = inp.placeholder || '';
-        if (ph.includes('应用名称') || ph.includes('应用')) {
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-          setter.call(inp, appName);
-          inp.dispatchEvent(new Event('input', {bubbles: true}));
-          break;
-        }
-      }
-    }
-    """, app_name)
-    page.wait_for_timeout(500)
-    # 用 JS 精确点击"搜索"按钮
-    page.evaluate("""
-    () => {
-      const btns = document.querySelectorAll('button');
-      for (const b of btns) {
-        if (b.offsetParent === null) continue;
-        if (b.innerText.trim() === '搜索') { b.click(); return; }
-      }
-    }
-    """)
-    page.wait_for_timeout(2000)
-    try:
-        page.wait_for_selector("table tbody tr", timeout=5000)
-    except Exception:
-        pass
-    page.wait_for_timeout(1000)
-
-    found_info = page.evaluate("""
-    (appName) => {
-      const rows = document.querySelectorAll('table tbody tr');
-      for (let i = 0; i < rows.length; i++) {
-        const row = rows[i];
-        if (row.offsetParent === null) continue;
-        if (!row.innerText.includes(appName)) continue;
-        const ei = row.querySelector('.el-table__expand-icon, [class*="expand-icon"]');
-        if (ei) {
-          if (!ei.className.includes('expanded')) ei.click();
-          return {found: true, expanded: !ei.className.includes('expanded'), index: i};
-        }
-        return {found: true, expanded: false, index: i};
-      }
-      return {found: false, index: -1};
-    }
-    """, app_name)
-    print(f"[create_app] found_info: {found_info}")
-    if found_info.get("expanded"):
-        page.wait_for_timeout(1000)
-
-    target_idx = page.evaluate("""
-    (appName) => {
-      const rows = document.querySelectorAll('table tbody tr');
-      let lastMatch = -1;
-      for (let i = 0; i < rows.length; i++) {
-        const row = rows[i];
-        if (row.offsetParent === null) continue;
-        if (!row.innerText.includes(appName)) continue;
-        if (row.querySelector('.el-switch') || row.innerText.includes('设置')) lastMatch = i;
-      }
-      return lastMatch;
-    }
-    """, app_name)
-    print(f"[create_app] target row index: {target_idx}")
-
-    if target_idx < 0:
-        if found_info.get("found"):
-            target_idx = found_info["index"]
-        else:
-            return {"success": False, "error": err("SAVE_FAILED", "VERIFY", f"保存后未在列表中找到应用: {app_name}", NEXT_MANUAL)}
     _shot(page, "07_created")
-    return {"success": True, "target_idx": target_idx}
+    return {"success": True, "target_app_id": target_app_id}
 
 
-def _stage_enable(page, execution_id, target_idx, app_name):
+def _stage_enable(page, execution_id, target_app_id, app_name, actual_channel_name):
     """Stage 2: 检查状态 → 如果已上线则跳过 → 如果没上线则点击开关 → 确认 → 验证。
     Returns: {success: bool, error: err_or_None}
     """
     _set_stage(execution_id, "正在检查应用状态")
-    
+    located = _find_target_row_by_id(page, target_app_id, actual_channel_name)
+    if not located.get("found"):
+        return {
+            "success": False,
+            "error": err("TARGET_APP_NOT_FOUND", "PUBLISH", f"上线前未找到应用ID={target_app_id}", NEXT_MANUAL),
+        }
+    target_idx = located["row_idx"]
+
     # 先检查当前是否已上线
     status_check = page.evaluate("""
     (rowIdx) => {
-      const rows = document.querySelectorAll('table tbody tr');
+      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
+      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
       if (rowIdx < 0 || rowIdx >= rows.length) return {error: 'row not found'};
       const sw = rows[rowIdx].querySelector('.el-switch');
       if (!sw) return {error: 'no switch'};
@@ -841,7 +1002,8 @@ def _stage_enable(page, execution_id, target_idx, app_name):
     _set_stage(execution_id, "正在发布上线")
     publish_result = page.evaluate("""
     (rowIdx) => {
-      const rows = document.querySelectorAll('table tbody tr');
+      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
+      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
       if (rowIdx < 0 || rowIdx >= rows.length) return {error: 'row not found'};
       const sw = rows[rowIdx].querySelector('.el-switch');
       if (!sw) return {error: 'no switch'};
@@ -877,7 +1039,8 @@ def _stage_enable(page, execution_id, target_idx, app_name):
     # 验证开关是否变 ON
     is_on = page.evaluate("""
     (rowIdx) => {
-      const rows = document.querySelectorAll('table tbody tr');
+      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
+      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
       if (rowIdx < 0 || rowIdx >= rows.length) return false;
       const sw = rows[rowIdx].querySelector('.el-switch');
       return sw ? sw.className.includes('is-checked') : false;
@@ -891,11 +1054,18 @@ def _stage_enable(page, execution_id, target_idx, app_name):
     return {"success": True, "error": None}
 
 
-def _stage_set_group(page, execution_id, target_idx, group_name, app_name):
+def _stage_set_group(page, execution_id, target_app_id, group_name, app_name, actual_channel_name):
     """Stage 3: 打开云机链接设置 → 选按分组 → 填值 → 确定 → 读回验证。
     Returns: {success: bool, error: err_or_None}
     """
     _set_stage(execution_id, "正在设置分组")
+    located = _find_target_row_by_id(page, target_app_id, actual_channel_name)
+    if not located.get("found"):
+        return {
+            "success": False,
+            "error": err("TARGET_APP_NOT_FOUND", "GROUP", f"设置分组前未找到应用ID={target_app_id}", NEXT_MANUAL),
+        }
+    target_idx = located["row_idx"]
 
     if not _open_group_dialog(page, target_idx):
         capture_page_errors(page, screenshot_name=f"app_group_fail_{app_name}")
@@ -1030,16 +1200,26 @@ def _stage_set_group(page, execution_id, target_idx, group_name, app_name):
     return {"success": True, "error": None}
 
 
-def _stage_collect_result(page, execution_id, target_idx, app_name):
+def _stage_collect_result(page, execution_id, target_app_id, app_name, actual_channel_name):
     """Read the final row and verify that the app is online with a generated link."""
     _set_stage(execution_id, "正在校验终态")
+    located = _find_target_row_by_id(page, target_app_id, actual_channel_name)
+    if not located.get("found"):
+        return {
+            "success": False,
+            "error": err("TARGET_APP_NOT_FOUND", "VERIFY", f"终态校验前未找到应用ID={target_app_id}", NEXT_MANUAL),
+        }
+    target_idx = located["row_idx"]
     try:
         row_data = page.evaluate("""
         (rowIdx) => {
-          const rows = document.querySelectorAll('table tbody tr');
+          const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
+          const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
           if (rowIdx < 0 || rowIdx >= rows.length) return {};
           const row = rows[rowIdx];
-          const headers = Array.from(document.querySelectorAll('th')).map(
+          const primaryHeaders = document.querySelectorAll('.el-table__header-wrapper th');
+          const headerNodes = primaryHeaders.length ? primaryHeaders : document.querySelectorAll('th');
+          const headers = Array.from(headerNodes).map(
             th => (th.innerText || '').trim()
           );
           const cells = row.querySelectorAll('td');
@@ -1086,6 +1266,7 @@ def _stage_collect_result(page, execution_id, target_idx, app_name):
     return {
         "success": True,
         "data": {
+            "app_id": str(target_app_id),
             "app_name": app_name,
             "cloud_app_link": cloud_link,
             "cloud_app_short_link": short_link,
@@ -1162,8 +1343,7 @@ def execute_create_app(request: dict) -> dict:
     resource_fallback_page = (data.get("resource_fallback_page") or "").strip()
     settlement_type = (data.get("settlement_type") or "").strip()
     business_object = data["business_object"].strip()
-    activity_name = (data.get("activity_name") or "").strip()
-    app_name = f"{business_object}-{activity_name}" if activity_name else business_object
+    app_name = business_object
 
     ref_cloud_app_link = (data.get("ref_cloud_app_link") or "").strip()
     app_type = data["application_type"].strip()
@@ -1259,11 +1439,17 @@ def execute_create_app(request: dict) -> dict:
         )
         if not create_result["success"]:
             return finish_failure(create_result["error"], current_stage)
-        target_idx = create_result["target_idx"]
+        target_app_id = create_result["target_app_id"]
         completed_stages.append(current_stage)
 
         current_stage = "ENABLE"
-        enable_result = _stage_enable(page, execution_id, target_idx, app_name)
+        enable_result = _stage_enable(
+            page,
+            execution_id,
+            target_app_id,
+            app_name,
+            data["actual_channel_name"],
+        )
         if not enable_result["success"]:
             return finish_failure(enable_result["error"], current_stage)
         completed_stages.append(current_stage)
@@ -1273,16 +1459,23 @@ def execute_create_app(request: dict) -> dict:
             group_result = _stage_set_group(
                 page,
                 execution_id,
-                target_idx,
+                target_app_id,
                 group_name,
                 app_name,
+                data["actual_channel_name"],
             )
             if not group_result["success"]:
                 return finish_failure(group_result["error"], current_stage)
             completed_stages.append(current_stage)
 
         current_stage = "VERIFY"
-        final_result = _stage_collect_result(page, execution_id, target_idx, app_name)
+        final_result = _stage_collect_result(
+            page,
+            execution_id,
+            target_app_id,
+            app_name,
+            data["actual_channel_name"],
+        )
         if not final_result["success"]:
             return finish_failure(final_result["error"], current_stage, ex.BIZ_UNKNOWN)
 

@@ -1,6 +1,6 @@
 # Hermes HTTP Executor v1
 
-这是第一阶段 Hermes 联调契约。当前只支持 `TEST/FAKE`，不会打开浏览器、登录 139 后台或创建真实渠道和应用。
+这是 Hermes HTTP 执行契约。执行端支持 `FAKE` 和 `REAL`：`FAKE` 只验证接口，`REAL` 会调用本项目现有浏览器自动化创建真实渠道和应用。
 
 ## 启动
 
@@ -15,11 +15,41 @@ uv run python -m app.http_executor.init_db
 ```powershell
 $env:HERMES_EXECUTOR_TOKEN = "change-this-local-token"
 $env:HERMES_EXECUTOR_ENV = "TEST"
-$env:HERMES_EXECUTOR_MODE = "FAKE"
+$env:HERMES_EXECUTOR_MODE = "REAL"
 uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
 ```
 
-服务不会复用 `app.main`、旧 `job_manager` 或旧的前端接口。
+需要纯接口联调时可将 `HERMES_EXECUTOR_MODE` 改为 `FAKE`。服务不会复用 `app.main`、旧 `job_manager` 或旧的前端接口；REAL 模式通过适配层调用同一套自动化 action。
+
+## Hermes 电脑首次部署
+
+在 Windows 上拉取 `feat/hermes-http-integration` 后，从仓库根目录执行：
+
+```powershell
+uv sync
+Copy-Item app\executor\config.example.json app\executor\config.json
+```
+
+编辑本机 `app\executor\config.json`，填写 `username`。密码不要写明文：先设置双方约定的 `AMOO_SECRET_KEY`，再生成密文并填入 `password_encrypted`：
+
+```powershell
+$env:AMOO_SECRET_KEY = "双方约定的Fernet密钥"
+uv run python app\executor\actions\ensure_login.py encrypt "真实密码"
+```
+
+`config.json`、`browser-profile`、数据库和日志均被 Git 忽略，不得提交。每次启动 REAL 服务的终端都要设置同一个 `AMOO_SECRET_KEY`。机器需安装 Chrome 或 Edge；首次运行会创建该机器自己的 `browser-profile`。
+
+然后初始化 8001 专用数据库并启动：
+
+```powershell
+uv run python -m app.http_executor.init_db
+$env:HERMES_EXECUTOR_TOKEN = "Hermes与执行端约定的Bearer Token"
+$env:HERMES_EXECUTOR_ENV = "TEST"
+$env:HERMES_EXECUTOR_MODE = "REAL"
+uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
+```
+
+Hermes 与执行端运行在同一台电脑时使用 `http://127.0.0.1:8001`。首次真实任务前先访问 `/v1/exec/info`，确认返回的 `mode` 为 `REAL`；浏览器首次出现时允许操作人员完成必要的登录确认。
 
 ## 通用请求
 
@@ -63,15 +93,18 @@ Content-Type: application/json
 ```json
 {
   "application_type": "云盘",
-  "business_object": "云盘",
+  "business_object": "中国移动云盘",
   "actual_channel_name": "甘肃体验有礼掌厅瀑布流-1",
   "jump_address": "mcloud://...",
   "resource_fallback_page": "https://...",
   "settlement_type": "云盘",
+  "group_name": "10086",
   "download_link": "https://...",
   "fixed_fields": {}
 }
 ```
+
+`business_object` 是应用名称（例如“中国移动云盘”或“中国移动”）；`actual_channel_name` 必须使用创建渠道接口返回的实际名称；`group_name` 是应用上线后的分组值。活动名称已由 Hermes 用于组装 `requested_channel_name`，不属于创建应用输入。
 
 查询可以使用 `execution_id`，也可以使用 `idempotency_key`，或者使用 `task_id + operation + environment`。
 
@@ -85,5 +118,4 @@ ACCEPTED -> RUNNING -> SUCCEEDED
 
 请求超时或连接断开时，Hermes 必须查询原任务，不能重新提交创建请求。
 
-`TEST/FAKE` 成功会返回 `business_status=SIMULATED_SUCCESS`，且不会生成真实长链接。
-
+`FAKE` 成功返回 `business_status=SIMULATED_SUCCESS`，且不会生成真实长链接；`REAL` 成功返回 `business_status=SUCCESS`。

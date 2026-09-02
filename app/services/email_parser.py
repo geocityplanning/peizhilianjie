@@ -57,8 +57,8 @@ def parse_customer_email(raw_text: str) -> dict[str, Any]:
 
     application_type = '掌厅' if ('掌厅' in text and '云盘' not in type_hint) else '云盘'
     settlement_type = '云盘' if ('云盘' in text or 'mcloud://' in text) else '在线'
-    business_object = '中国移动云盘' if settlement_type == '云盘' else '中国移动APP'
-    app_name_preview = f'{business_object}-{activity_name}' if activity_name else business_object
+    business_object = '中国移动云盘' if settlement_type == '云盘' else '中国移动'
+    app_name_preview = business_object
 
     parsed = {
         'business_object': business_object,

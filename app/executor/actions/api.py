@@ -183,7 +183,7 @@ def create_app(
 
     Args:
         business_object: 业务对象（如"中国移动云盘"）
-        activity_name: 活动名后缀（与 business_object 拼成应用名）
+        activity_name: 兼容保留字段，不参与应用名称生成
         actual_channel_name: 所属渠道名（必须来自 create_channel 的返回值）
         application_type: "云盘" / "掌厅"，决定 ref_cloud_app_link 默认值
         jump_address: 登录页"配置调起路径"，必填

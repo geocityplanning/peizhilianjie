@@ -65,7 +65,7 @@ from actions.api import create_app
 
 result = create_app(
     business_object="中国移动云盘",        # 用于匹配复制模板
-    activity_name="活动1",                 # 与 business_object 拼成应用名
+    activity_name="",                      # 兼容保留，不参与应用名称生成
     actual_channel_name="he0820",          # 从 create_channel 返回值拿
     application_type="云盘",               # "云盘" / "掌厅"
     jump_address="mcloud://main/tab?params=xxx&tk=",

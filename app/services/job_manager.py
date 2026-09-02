@@ -12,16 +12,23 @@ from typing import Any
 
 from app.core.config import settings
 from app.services.executor_lock import get_executor_lock_status, release_executor_lock
+from app.services.job_store import load_jobs as load_job_records, save_job as save_job_record
 from app.services.repository import save_app, save_operation
 
 _jobs: dict[str, dict[str, Any]] = {}
 _queue: deque[str] = deque()
-_jobs_lock = threading.Lock()
+_jobs_lock = threading.RLock()
 _queue_event = threading.Event()
 _worker_started = False
 _worker_lock = threading.Lock()
+_initialized = False
+_initialize_lock = threading.Lock()
 
-MAX_RETRIES = 2
+DEFAULT_MAX_RETRIES = 2
+OPERATION_MAX_RETRIES = {
+    "CREATE_APP": 0,
+}
+RETRYABLE_OPERATIONS: set[str] = set()
 STAGE_STALL_SECONDS = 300
 TASK_TIMEOUT_SECONDS = 900
 POLL_SECONDS = 2
@@ -31,8 +38,21 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _max_retries_for(operation: str) -> int:
+    return OPERATION_MAX_RETRIES.get(operation, DEFAULT_MAX_RETRIES)
+
+
+def _should_retry(operation: str, attempt: int, max_retries: int, result: dict[str, Any]) -> bool:
+    return (
+        operation in RETRYABLE_OPERATIONS
+        and attempt <= max_retries
+        and result.get("next_action") == "QUERY"
+    )
+
+
 def _touch(job: dict[str, Any]) -> None:
     job["updated_at"] = _now()
+    save_job_record(job)
 
 
 def _executor_db_path() -> Path:
@@ -77,6 +97,68 @@ def read_running_executor_stage() -> dict[str, Any]:
         return {}
 
 
+def _public_job(job: dict[str, Any]) -> dict[str, Any]:
+    public = dict(job)
+    public.pop("payload", None)
+    public.pop("batch_id", None)
+    return public
+
+
+def initialize_job_manager() -> None:
+    """Load persisted jobs and resume only work that had not started."""
+    global _initialized
+    with _initialize_lock:
+        if _initialized:
+            return
+
+        persisted_jobs = load_job_records()
+        with _jobs_lock:
+            _jobs.clear()
+            _queue.clear()
+            for job in persisted_jobs:
+                _jobs[job["job_id"]] = job
+                status = job.get("status")
+                if status in {"QUEUED", "WAITING", "RUNNING"}:
+                    job["max_retries"] = min(
+                        int(job.get("max_retries") or 0),
+                        _max_retries_for(str(job.get("operation") or "")),
+                    )
+                if status in {"QUEUED", "WAITING"}:
+                    job.update(
+                        status="QUEUED",
+                        stage="后端重启后恢复排队",
+                        message="后端已重启，未开始的任务已恢复到队列。",
+                        queue_position=None,
+                    )
+                    _queue.append(job["job_id"])
+                    _touch(job)
+                elif status == "RUNNING":
+                    recovery_error = {
+                        "success": False,
+                        "message": "后端重启时任务仍在执行，无法确认平台侧是否已完成；已停止自动重跑并放行后续任务。",
+                        "error_code": "BACKEND_RESTARTED",
+                        "error_stage": "RECOVERY",
+                        "next_action": "MANUAL_CHECK",
+                    }
+                    job.update(
+                        status="FAILED",
+                        stage="后端重启导致任务中断",
+                        message=recovery_error["message"],
+                        queue_position=None,
+                        result=recovery_error,
+                        error=recovery_error,
+                        finished_at=_now(),
+                    )
+                    _touch(job)
+
+            _refresh_queue_positions_locked()
+            _initialized = True
+
+    _start_worker_once()
+    if _queue:
+        _queue_event.set()
+
+
 def _start_worker_once() -> None:
     global _worker_started
     with _worker_lock:
@@ -87,7 +169,7 @@ def _start_worker_once() -> None:
 
 
 def create_job(operation: str, payload: dict[str, Any], batch_id: str | None = None) -> dict[str, Any]:
-    _start_worker_once()
+    initialize_job_manager()
     job_id = f"JOB-{uuid.uuid4().hex[:10].upper()}"
     with _jobs_lock:
         position = len(_queue) + 1
@@ -99,7 +181,7 @@ def create_job(operation: str, payload: dict[str, Any], batch_id: str | None = N
             "stage": "排队等待",
             "queue_position": position,
             "attempt": 0,
-            "max_retries": MAX_RETRIES,
+            "max_retries": _max_retries_for(operation),
             "result": None,
             "error": None,
             "payload": payload,
@@ -121,20 +203,13 @@ def get_job(job_id: str) -> dict[str, Any] | None:
         job = _jobs.get(job_id)
         if not job:
             return None
-        public = dict(job)
-        public.pop("payload", None)
-        public.pop("batch_id", None)
-        return public
+        return _public_job(job)
+
 
 
 def list_jobs() -> list[dict[str, Any]]:
     with _jobs_lock:
-        rows = []
-        for job in _jobs.values():
-            public = dict(job)
-            public.pop("payload", None)
-            public.pop("batch_id", None)
-            rows.append(public)
+        rows = [_public_job(job) for job in _jobs.values()]
         return sorted(rows, key=lambda item: item.get("created_at") or "", reverse=True)
 
 
@@ -148,11 +223,11 @@ def cancel_job(job_id: str) -> dict[str, Any] | None:
                 _queue.remove(job_id)
             except ValueError:
                 pass
-            job.update(status="CANCELLED", stage="已取消", message="任务尚未开始，已取消。", finished_at=_now())
+            job.update(status="CANCELLED", stage="已取消", message="任务尚未开始，已取消。", queue_position=None, finished_at=_now())
             _touch(job)
             _refresh_queue_positions_locked()
         elif job["status"] == "RUNNING":
-            job.update(message="任务正在运行；如卡住会由超时监控自动终止并重试/失败跳过。")
+            job.update(message="任务正在运行，无法中途取消；如卡住会由超时监控终止，本任务不会自动重跑。")
             _touch(job)
         return get_job(job_id)
 
@@ -220,8 +295,20 @@ def _run_job_with_retries(job_id: str) -> None:
             job["attempt"] = attempt
             payload = dict(job.get("payload") or {})
             operation = job["operation"]
+            max_retries = min(
+                int(job.get("max_retries") or 0),
+                _max_retries_for(operation),
+            )
+            job["max_retries"] = max_retries
             batch_id = job.get("batch_id")
-            job.update(status="RUNNING", stage="启动执行", message=f"正在执行第 {attempt} 次尝试。", started_at=job.get("started_at") or _now())
+            total_attempts = max_retries + 1
+            job.update(
+                status="RUNNING",
+                stage="启动执行",
+                message=f"正在执行第 {attempt} 次尝试，共允许 {total_attempts} 次。",
+                queue_position=None,
+                started_at=job.get("started_at") or _now(),
+            )
             _touch(job)
 
         result = _run_subprocess_attempt(job_id, operation, payload)
@@ -230,19 +317,39 @@ def _run_job_with_retries(job_id: str) -> None:
                 save_operation("CREATE_APP", result, batch_id)
                 if result.get("success"):
                     save_app(result)
-            update_job(job_id, status="SUCCESS", stage="完成", message="任务执行成功。", result=result, finished_at=_now())
+            update_job(job_id, status="SUCCESS", stage="完成", message="任务执行成功。", queue_position=None, result=result, finished_at=_now())
             return
 
         if operation == "CREATE_APP":
             save_operation("CREATE_APP", result, batch_id)
 
-        should_retry = attempt <= MAX_RETRIES and result.get("next_action") != "STOP"
+        should_retry = _should_retry(operation, attempt, max_retries, result)
         if should_retry:
             update_job(job_id, status="RUNNING", stage="准备重试", message=f"第 {attempt} 次失败：{result.get('message')}。即将自动重试。", error=result)
             time.sleep(2)
             continue
 
-        update_job(job_id, status="FAILED", stage=result.get("error_stage") or "失败", message=result.get("message") or "任务失败，已跳过。", result=result, error=result, finished_at=_now())
+        failure = dict(result)
+        failure_message = failure.get("message") or "任务执行失败。"
+        if operation == "CREATE_APP":
+            failure["automatic_retry"] = False
+            completed = failure.get("completed_stages") or []
+            completed_text = f"已完成阶段：{', '.join(completed)}。" if completed else ""
+            failure["operator_message"] = (
+                f"{completed_text}创建应用未自动重试。"
+                "请先按应用ID或实际渠道名检查平台，再决定是手动处理还是重新提交。"
+            )
+            failure_message = f"{failure_message} 创建应用未自动重试，请先检查平台是否已保存。"
+        update_job(
+            job_id,
+            status="FAILED",
+            stage=failure.get("failed_stage") or failure.get("error_stage") or "失败",
+            message=failure_message,
+            queue_position=None,
+            result=failure,
+            error=failure,
+            finished_at=_now(),
+        )
         return
 
 

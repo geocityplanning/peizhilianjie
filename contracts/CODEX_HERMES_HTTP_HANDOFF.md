@@ -17,7 +17,7 @@ Hermes 接收客户邮件
   -> 向操作人员返回执行结果
 ```
 
-当前执行端为 `TEST/FAKE` 模式，不会打开浏览器，不会登录 139 后台，也不会创建真实渠道、应用或真实长链接。
+执行端支持 `FAKE` 与 `REAL`。`FAKE` 不打开浏览器；`REAL` 会调用当前项目的创建渠道和创建应用自动化。REAL 代码已接入，本轮尚未代替操作人员执行真实业务数据验收。
 
 ## 2. Git 交接位置
 
@@ -110,10 +110,14 @@ uv run python -m app.http_executor.init_db
 ```powershell
 $env:HERMES_EXECUTOR_TOKEN = "change-this-local-token"
 $env:HERMES_EXECUTOR_ENV = "TEST"
-$env:HERMES_EXECUTOR_MODE = "FAKE"
+$env:HERMES_EXECUTOR_MODE = "REAL"
 
 uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
 ```
+
+只验证 Hermes HTTP 对话和幂等行为时，可临时改为 `HERMES_EXECUTOR_MODE="FAKE"`。
+
+Hermes 电脑首次部署、`config.json`、`AMOO_SECRET_KEY` 和本机浏览器 Profile 的配置步骤，以 `contracts/hermes-http-v1.md` 的“首次部署”章节为准。敏感配置和浏览器会话不随 Git 分发。
 
 Hermes 使用以下连接信息：
 
@@ -221,6 +225,7 @@ actual_channel_name
 jump_address
 resource_fallback_page
 settlement_type
+group_name
 ```
 
 示例：
@@ -234,16 +239,19 @@ settlement_type
   "idempotency_key": "HERMES-20260828-0001-create-app",
   "input": {
     "application_type": "云盘",
-    "business_object": "云盘",
+    "business_object": "中国移动云盘",
     "actual_channel_name": "甘肃体验有礼掌厅瀑布流-1",
     "jump_address": "mcloud://main/webView?params=fake",
     "resource_fallback_page": "https://example.invalid/fallback",
     "settlement_type": "云盘",
+    "group_name": "10086",
     "download_link": "https://example.invalid/download",
     "fixed_fields": {}
   }
 }
 ```
+
+字段语义：`business_object` 直接作为应用名称；`actual_channel_name` 必须来自 `exec.create_channel` 的返回值；`group_name` 用于应用上线后的分组设置。活动名称由 Hermes 在创建渠道前用于组装 `requested_channel_name`，不传入 `exec.create_app`。
 
 当前 Fake 结果示例：
 
@@ -420,20 +428,18 @@ POST /v1/exec/query             200 OK
 - 没有完成 Hermes 实际 Agent 调用验证；
 - 没有完成 Excel 批量任务；
 - 新增联调代码尚需独立提交并持续维护；
-- 真实执行接入前必须重新执行 E01-E10 对应用例。
+- REAL 模式正式验收前必须重新执行 E01-E10 对应用例。
 
 ## 15. 后续实施顺序
 
 ```text
-1. Hermes 使用 TEST/FAKE 接口完成对话联调
-2. 确认 Hermes 任务 ID、幂等键和确认状态管理
-3. 接入真实创建渠道自动化
-4. 自动化同事完成直接新建应用流程
-5. 接入真实创建应用并补充阶段证据
-6. 执行 E04-E10 的 HTTP、幂等、并发和环境测试
+1. Hermes 使用 FAKE 模式确认任务 ID、幂等键和查询状态管理
+2. 使用 REAL 模式跑一条唯一渠道和应用数据
+3. 核对返回的 actual_channel_name、application_id、长链接和短链接
+4. 验证创建应用的 CREATE_SAVE、ENABLE、SET_GROUP 阶段结果
+5. 执行 E04-E10 的 HTTP、幂等、并发和环境测试
 7. 执行 E01-E03 的真实业务验收
 8. 最后接入 Excel 批量编排
 ```
 
 任何 Agent 在修改真实自动化之前，必须先保留当前 Hermes HTTP 契约，除非同步更新版本号、OpenAPI、示例和测试。
-

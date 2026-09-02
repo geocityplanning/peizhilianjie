@@ -34,4 +34,27 @@ CREATE TABLE IF NOT EXISTS operations (
     error_message TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    queue_position INTEGER,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL,
+    result_json TEXT,
+    error_json TEXT,
+    batch_id TEXT,
+    execution_id TEXT,
+    stage_elapsed_seconds INTEGER,
+    elapsed_seconds INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
 
+CREATE INDEX IF NOT EXISTS idx_jobs_status_created
+ON jobs (status, created_at);

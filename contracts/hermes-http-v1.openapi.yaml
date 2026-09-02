@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Hermes HTTP Executor
   version: 1.0.0
-  description: TEST/FAKE 联调接口，不执行真实浏览器自动化。
+  description: Hermes 独立 HTTP 执行接口，支持 FAKE 联调与 REAL 浏览器自动化。
 servers:
   - url: http://127.0.0.1:8001
 security:
@@ -51,7 +51,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ExecutionRequest'
+              $ref: '#/components/schemas/CreateAppExecutionRequest'
       responses:
         '200':
           description: 已受理或幂等重放
@@ -102,6 +102,35 @@ components:
         environment: {type: string, example: TEST}
         idempotency_key: {type: string, example: HERMES-20260828-0001-create-channel}
         input: {type: object, additionalProperties: true}
+    CreateAppExecutionRequest:
+      allOf:
+        - $ref: '#/components/schemas/ExecutionRequest'
+        - type: object
+          properties:
+            operation: {type: string, enum: [exec.create_app]}
+            input:
+              $ref: '#/components/schemas/CreateAppInput'
+    CreateAppInput:
+      type: object
+      additionalProperties: true
+      required:
+        - application_type
+        - business_object
+        - actual_channel_name
+        - jump_address
+        - resource_fallback_page
+        - settlement_type
+        - group_name
+      properties:
+        application_type: {type: string, example: 云盘}
+        business_object: {type: string, example: 中国移动云盘}
+        actual_channel_name: {type: string, example: 甘肃体验有礼掌厅瀑布流-1}
+        jump_address: {type: string}
+        resource_fallback_page: {type: string, format: uri}
+        settlement_type: {type: string, example: 云盘}
+        group_name: {type: string, example: '10086'}
+        download_link: {type: string, format: uri}
+        fixed_fields: {type: object, additionalProperties: true}
     QueryRequest:
       type: object
       required: [contract_version]

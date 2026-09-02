@@ -11,19 +11,19 @@ from app.http_executor.settings import Settings
 from app.http_executor.store import ExecutorStore, initialize_database
 
 
-def make_client(tmp_path: Path, *, delay_ms: int = 0) -> TestClient:
+def make_client(tmp_path: Path, *, delay_ms: int = 0, mode: str = "FAKE", real_caller=None) -> TestClient:
     db_path = tmp_path / "executor.db"
     initialize_database(db_path)
     settings = Settings(
         db_path=db_path,
         environment="TEST",
-        mode="FAKE",
+        mode=mode,
         auth_token="test-token",
         allow_anonymous=False,
         fake_delay_ms=delay_ms,
         fake_channel_suffix="-1",
     )
-    service = ExecutionService(settings, ExecutorStore(db_path))
+    service = ExecutionService(settings, ExecutorStore(db_path), real_caller=real_caller)
     return TestClient(create_app(service))
 
 
@@ -51,11 +51,12 @@ def app_request(key: str = "key-app-1") -> dict:
         "idempotency_key": key,
         "input": {
             "application_type": "云盘",
-            "business_object": "云盘",
+            "business_object": "中国移动云盘",
             "actual_channel_name": "甘肃体验有礼掌厅瀑布流-1",
             "jump_address": "mcloud://main/webView?params=fake",
             "resource_fallback_page": "https://example.invalid/fallback",
             "settlement_type": "云盘",
+            "group_name": "10086",
         },
     }
 
@@ -111,9 +112,11 @@ def test_same_idempotency_key_with_different_input_is_rejected(tmp_path: Path):
         assert response.json()["error"]["error_code"] == "IDEMPOTENCY_CONFLICT"
 
 
-def test_create_app_requires_actual_channel_and_can_be_queried(tmp_path: Path):
+def test_create_app_accepts_frozen_hermes_payload_without_ref_app_id(tmp_path: Path):
     with make_client(tmp_path) as client:
-        response = client.post("/v1/exec/create-app", headers=headers(), json=app_request())
+        request = app_request()
+        assert "ref_app_id" not in request["input"]
+        response = client.post("/v1/exec/create-app", headers=headers(), json=request)
         body = response.json()
         assert body["operation"] == "exec.create_app"
         final = wait_terminal(client, body["execution_id"])
@@ -128,6 +131,58 @@ def test_missing_required_field_is_rejected_before_execution(tmp_path: Path):
         response = client.post("/v1/exec/create-app", headers=headers(), json=invalid)
         assert response.status_code == 400
         assert response.json()["error"]["error_code"] == "MISSING_REQUIRED_FIELD"
+
+
+def test_group_name_is_required_for_create_app(tmp_path: Path):
+    with make_client(tmp_path) as client:
+        request = app_request()
+        del request["input"]["group_name"]
+        response = client.post("/v1/exec/create-app", headers=headers(), json=request)
+        assert response.status_code == 400
+        assert "group_name" in response.json()["error"]["message"]
+
+
+def test_real_create_app_maps_frozen_contract_to_automation(tmp_path: Path):
+    calls = []
+
+    def real_caller(name, **kwargs):
+        calls.append((name, kwargs))
+        return {
+            "success": True,
+            "app_id": "12001",
+            "app_name": "中国移动云盘",
+            "cloud_app_link": "https://plus.buy.139.com/mccloudgame/#/?i=new",
+            "cloud_app_short_link": "capp://new",
+            "completed_stages": ["CREATE_SAVE", "ENABLE", "SET_GROUP", "COMPLETED"],
+            "row_data": {"ID": "12001"},
+        }
+
+    with make_client(tmp_path, mode="REAL", real_caller=real_caller) as client:
+        response = client.post("/v1/exec/create-app", headers=headers(), json=app_request())
+        final = wait_terminal(client, response.json()["execution_id"])
+
+    assert final["execution_state"] == "SUCCEEDED"
+    assert final["business_status"] == "SUCCESS"
+    assert final["data"]["application_id"] == "12001"
+    assert final["data"]["application_name"] == "中国移动云盘"
+    assert calls[0][0] == "create_app"
+    assert calls[0][1]["business_object"] == "中国移动云盘"
+    assert calls[0][1]["activity_name"] == ""
+    assert calls[0][1]["group_name"] == "10086"
+
+
+def test_real_create_channel_returns_automation_actual_name(tmp_path: Path):
+    def real_caller(name, **kwargs):
+        assert name == "create_channel"
+        assert kwargs["channel_base_name"] == "甘肃体验有礼掌厅瀑布流"
+        return {"success": True, "actual_channel_name": "甘肃体验有礼掌厅瀑布流1"}
+
+    with make_client(tmp_path, mode="REAL", real_caller=real_caller) as client:
+        response = client.post("/v1/exec/create-channel", headers=headers(), json=channel_request())
+        final = wait_terminal(client, response.json()["execution_id"])
+
+    assert final["execution_state"] == "SUCCEEDED"
+    assert final["data"]["actual_channel_name"] == "甘肃体验有礼掌厅瀑布流1"
 
 
 def test_query_unknown_task_does_not_create_execution(tmp_path: Path):

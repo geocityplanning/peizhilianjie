@@ -11,7 +11,7 @@ class ChannelCreateRequest(BaseModel):
 
 class AppCreateRequest(BaseModel):
     business_object: str = Field(min_length=1)
-    activity_name: str = Field(min_length=1)
+    activity_name: str = ""
     actual_channel_name: str = Field(min_length=1)
     application_type: str = "云盘"
     jump_address: str = ""

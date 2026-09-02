@@ -18,6 +18,10 @@ p, .hint, .muted { color: #69717d; }
 .statusDot.checking { background: #c79022; }
 .statusDot.ok { background: #238636; }
 .statusDot.err { background: #c33838; }.panelHead { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
+.workflowRunner { display: grid; grid-template-columns: 180px minmax(0, 1fr); align-items: stretch; gap: 12px; margin-bottom: 16px; }
+.workflowRunner button { min-height: 56px; }
+.workflowRunner .result { display: flex; align-items: center; min-height: 56px; }
+.appActions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .grid { display: grid; grid-template-columns: minmax(280px, 0.8fr) minmax(420px, 1.2fr); gap: 16px; align-items: start; }
 label { display: block; font-size: 13px; color: #4f5965; margin: 10px 0; }
 input, textarea, select { width: 100%; margin-top: 6px; border: 1px solid #cbd3dc; border-radius: 6px; padding: 9px 10px; font: inherit; background: #fff; color: #20242a; }
@@ -28,11 +32,13 @@ textarea { min-height: 92px; resize: vertical; line-height: 1.45; }
 button { border: 1px solid #1f6feb; background: #1f6feb; color: #fff; border-radius: 6px; padding: 9px 14px; font: inherit; cursor: pointer; }
 button:disabled { background: #a8b4c2; border-color: #a8b4c2; cursor: not-allowed; }
 button.secondary { background: #fff; color: #1f6feb; }
+button.secondary:disabled { background: #eef1f4; border-color: #cbd3dc; color: #8a95a3; }
 .result { border: 1px solid #e2e7ee; background: #fafbfc; border-radius: 6px; padding: 12px; white-space: pre-wrap; word-break: break-word; min-height: 48px; }
 .result.ok { border-color: #a4d4b4; background: #f3fbf5; color: #1d6b35; }
 .result.err { border-color: #e4a5a5; background: #fff6f6; color: #a23232; }
 .hint { margin: 8px 0 12px; font-size: 13px; }
 @media (max-width: 900px) { .topbar, .grid, .statusCard { display: block; } .statusCard button, .topbar button { margin-top: 12px; } }
+@media (max-width: 520px) { .shell { padding: 14px; } .workflowRunner { grid-template-columns: 1fr; } }
 
 
 .result.running { border-color: #d8bf64; background: #fffbed; color: #5f4814; }
