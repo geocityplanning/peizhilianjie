@@ -33,7 +33,8 @@ Copy-Item app\executor\config.example.json app\executor\config.json
 编辑本机 `app\executor\config.json`，填写 `username`。密码不要写明文：先设置双方约定的 `AMOO_SECRET_KEY`，再生成密文并填入 `password_encrypted`：
 
 ```powershell
-$env:AMOO_SECRET_KEY = "双方约定的Fernet密钥"
+uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+$env:AMOO_SECRET_KEY = "上一步生成并由执行端安全保管的Fernet密钥"
 uv run python app\executor\actions\ensure_login.py encrypt "真实密码"
 ```
 
