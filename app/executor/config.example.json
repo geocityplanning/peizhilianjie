@@ -1,6 +1,6 @@
 {
   "login": {
-    "url": "https://plus.buy.139.com/cloudappadmin/#/login",
+    "url": "https://uat-cloud.139.com/cloudappadmin/#/login",
     "username_xpath": "//input[@placeholder='请输入用户名']",
     "password_xpath": "//input[@placeholder='请输入密码']",
     "captcha_image_xpath": "//img[@alt='验证码']",

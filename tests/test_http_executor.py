@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-import time
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -11,205 +13,280 @@ from app.http_executor.settings import Settings
 from app.http_executor.store import ExecutorStore, initialize_database
 
 
-def make_client(tmp_path: Path, *, delay_ms: int = 0, mode: str = "FAKE", real_caller=None) -> TestClient:
+HEADERS = {
+    "Authorization": "Bearer test-token",
+    "X-Contract-Version": "http-executor.v1",
+}
+
+
+def make_client(tmp_path: Path, *, real_caller=None) -> TestClient:
     db_path = tmp_path / "executor.db"
     initialize_database(db_path)
-    settings = Settings(
-        db_path=db_path,
-        environment="TEST",
-        mode=mode,
-        auth_token="test-token",
-        allow_anonymous=False,
-        fake_delay_ms=delay_ms,
-        fake_channel_suffix="-1",
-    )
+    settings = Settings(db_path=db_path, environment="TEST", auth_token="test-token")
+
+    if real_caller is None:
+        def real_caller(name, **kwargs):
+            if name == "create_channel":
+                return {
+                    "success": True,
+                    "actual_channel_name": kwargs["channel_base_name"] + "-1",
+                    "channel_data": {"source": "test-double"},
+                }
+            return {
+                "success": True,
+                "app_id": "12008",
+                "app_name": kwargs["business_object"],
+                "cloud_app_link": "https://example.invalid/#/?i=12008",
+                "cloud_app_short_link": "capp://12008",
+                "completed_stages": ["CREATE_SAVE", "ENABLE", "SET_GROUP", "COMPLETED"],
+                "row_data": {"ID": "12008"},
+            }
+
     service = ExecutionService(settings, ExecutorStore(db_path), real_caller=real_caller)
     return TestClient(create_app(service))
 
 
-def headers() -> dict[str, str]:
-    return {"Authorization": "Bearer test-token"}
-
-
 def channel_request(key: str = "key-channel-1") -> dict:
     return {
-        "contract_version": "http-executor.v1",
         "task_id": "HERMES-TEST-001",
-        "operation": "exec.create_channel",
+        "operation": "create_channel",
         "environment": "TEST",
+        "snapshot_version": "20260908-V1",
         "idempotency_key": key,
-        "input": {"requested_channel_name": "甘肃体验有礼掌厅瀑布流"},
+        "input": {
+            "requested_channel_name": "甘肃体验有礼-0908测试",
+            "base_platform": "掌厅",
+        },
     }
 
 
 def app_request(key: str = "key-app-1") -> dict:
     return {
-        "contract_version": "http-executor.v1",
         "task_id": "HERMES-TEST-002",
-        "operation": "exec.create_app",
+        "operation": "create_app",
         "environment": "TEST",
+        "snapshot_version": "20260908-V1",
         "idempotency_key": key,
         "input": {
             "application_type": "云盘",
-            "business_object": "中国移动云盘",
-            "actual_channel_name": "甘肃体验有礼掌厅瀑布流-1",
-            "jump_address": "mcloud://main/webView?params=fake",
+            "business_object": "中国移动云盘-0908测试",
+            "actual_channel_name": "甘肃体验有礼-0908测试-1",
+            "jump_address": "mcloud://main/webView?params=test",
             "resource_fallback_page": "https://example.invalid/fallback",
             "settlement_type": "云盘",
             "group_name": "10086",
+            "ref_cloud_app_link": "https://plus.buy.139.com/mccloudgame/#/?i=KWcMvfaFlhw=",
         },
     }
 
 
-def wait_terminal(client: TestClient, execution_id: str) -> dict:
-    for _ in range(30):
-        response = client.post(
-            "/v1/exec/query",
-            headers=headers(),
-            json={"contract_version": "http-executor.v1", "execution_id": execution_id},
+def test_only_four_post_routes_are_exposed(tmp_path: Path):
+    with make_client(tmp_path) as client:
+        routes = {
+            (route.path, method)
+            for route in client.app.routes
+            for method in getattr(route, "methods", set())
+        }
+        assert routes == {
+            ("/v1/exec/info", "POST"),
+            ("/v1/exec/create-channel", "POST"),
+            ("/v1/exec/create-app", "POST"),
+            ("/v1/exec/query", "POST"),
+        }
+        assert client.get("/v1/exec/info", headers=HEADERS).status_code == 405
+        assert client.get("/openapi.json", headers=HEADERS).status_code == 404
+
+
+def test_info_reports_real_mode(tmp_path: Path):
+    with make_client(tmp_path) as client:
+        response = client.post("/v1/exec/info", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "contract_version": "http-executor.v1",
+        "service": "hermes-real-executor",
+        "environment": "TEST",
+        "mode": "REAL",
+        "capabilities": ["get_info", "create_channel", "create_app", "query_execution"],
+        "active_execution_correlation_id": None,
+        "database_status": "AVAILABLE",
+    }
+
+
+def test_every_route_requires_bearer_token_and_contract_header(tmp_path: Path):
+    with make_client(tmp_path) as client:
+        missing_token = client.post(
+            "/v1/exec/info",
+            headers={"X-Contract-Version": "http-executor.v1"},
         )
-        body = response.json()
-        if body["execution_state"] in {"SUCCEEDED", "FAILED", "UNKNOWN", "REJECTED"}:
-            return body
-        time.sleep(0.01)
-    raise AssertionError("fake execution did not reach a terminal state")
+        missing_version = client.post(
+            "/v1/exec/info",
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+    assert missing_token.status_code == 401
+    assert missing_token.json()["error"]["error_code"] == "AUTH_FAILED"
+    assert missing_version.status_code == 400
+    assert missing_version.json()["error"]["error_code"] == "UNSUPPORTED_VERSION"
 
 
-def test_info_is_passive_and_create_channel_returns_full_receipt(tmp_path: Path):
+def test_create_channel_returns_synchronous_final_receipt(tmp_path: Path):
     with make_client(tmp_path) as client:
-        info = client.get("/v1/exec/info", headers=headers())
-        assert info.status_code == 200
-        assert info.json()["capabilities"] == [
-            "exec.get_info",
-            "exec.create_channel",
-            "exec.create_app",
-            "exec.query_execution",
-        ]
-        response = client.post("/v1/exec/create-channel", headers=headers(), json=channel_request())
-        body = response.json()
-        assert body["execution_id"]
-        assert body["task_id"] == "HERMES-TEST-001"
-        assert body["idempotency_key"] == "key-channel-1"
-        final = wait_terminal(client, body["execution_id"])
-        assert final["execution_state"] == "SUCCEEDED"
-        assert final["data"]["actual_channel_name"].endswith("-1")
+        response = client.post(
+            "/v1/exec/create-channel",
+            headers=HEADERS,
+            json=channel_request(),
+        )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["operation"] == "create_channel"
+    assert body["snapshot_version"] == "20260908-V1"
+    assert body["state"] == "SUCCEEDED"
+    assert body["status"] == "SUCCESS"
+    assert body["adjudicated"] is True
+    assert body["data"]["actual_channel_name"].endswith("-1")
+    assert "execution_id" not in body
+    assert "execution_state" not in body
+    assert "business_status" not in body
 
 
-def test_same_idempotency_key_has_one_execution(tmp_path: Path):
-    with make_client(tmp_path) as client:
-        first = client.post("/v1/exec/create-channel", headers=headers(), json=channel_request()).json()
-        second = client.post("/v1/exec/create-channel", headers=headers(), json=channel_request()).json()
-        assert first["execution_id"] == second["execution_id"]
+def test_same_idempotency_key_returns_original_execution(tmp_path: Path):
+    calls = []
+
+    def caller(name, **kwargs):
+        calls.append((name, kwargs))
+        return {"success": True, "actual_channel_name": kwargs["channel_base_name"]}
+
+    with make_client(tmp_path, real_caller=caller) as client:
+        first = client.post("/v1/exec/create-channel", headers=HEADERS, json=channel_request()).json()
+        second = client.post("/v1/exec/create-channel", headers=HEADERS, json=channel_request()).json()
+
+    assert first["execution_correlation_id"] == second["execution_correlation_id"]
+    assert len(calls) == 1
 
 
 def test_same_idempotency_key_with_different_input_is_rejected(tmp_path: Path):
     with make_client(tmp_path) as client:
-        client.post("/v1/exec/create-channel", headers=headers(), json=channel_request())
+        client.post("/v1/exec/create-channel", headers=HEADERS, json=channel_request())
         changed = channel_request()
         changed["input"]["requested_channel_name"] = "另一个渠道"
-        response = client.post("/v1/exec/create-channel", headers=headers(), json=changed)
-        assert response.status_code == 409
-        assert response.json()["error"]["error_code"] == "IDEMPOTENCY_CONFLICT"
+        response = client.post("/v1/exec/create-channel", headers=HEADERS, json=changed)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["error_code"] == "IDEMPOTENCY_CONFLICT"
 
 
-def test_create_app_accepts_frozen_hermes_payload_without_ref_app_id(tmp_path: Path):
-    with make_client(tmp_path) as client:
-        request = app_request()
-        assert "ref_app_id" not in request["input"]
-        response = client.post("/v1/exec/create-app", headers=headers(), json=request)
-        body = response.json()
-        assert body["operation"] == "exec.create_app"
-        final = wait_terminal(client, body["execution_id"])
-        assert final["business_status"] == "SIMULATED_SUCCESS"
-        assert final["data"]["actual_channel_name"] == "甘肃体验有礼掌厅瀑布流-1"
-
-
-def test_missing_required_field_is_rejected_before_execution(tmp_path: Path):
-    with make_client(tmp_path) as client:
-        invalid = app_request()
-        del invalid["input"]["resource_fallback_page"]
-        response = client.post("/v1/exec/create-app", headers=headers(), json=invalid)
-        assert response.status_code == 400
-        assert response.json()["error"]["error_code"] == "MISSING_REQUIRED_FIELD"
-
-
-def test_group_name_is_required_for_create_app(tmp_path: Path):
-    with make_client(tmp_path) as client:
-        request = app_request()
-        del request["input"]["group_name"]
-        response = client.post("/v1/exec/create-app", headers=headers(), json=request)
-        assert response.status_code == 400
-        assert "group_name" in response.json()["error"]["message"]
-
-
-def test_real_create_app_maps_frozen_contract_to_automation(tmp_path: Path):
+def test_create_app_maps_exact_real_result_fields(tmp_path: Path):
     calls = []
 
-    def real_caller(name, **kwargs):
+    def caller(name, **kwargs):
         calls.append((name, kwargs))
         return {
             "success": True,
-            "app_id": "12001",
-            "app_name": "中国移动云盘",
-            "cloud_app_link": "https://plus.buy.139.com/mccloudgame/#/?i=new",
-            "cloud_app_short_link": "capp://new",
+            "app_id": "12008",
+            "app_name": kwargs["business_object"],
+            "cloud_app_link": "https://example.invalid/#/?i=12008",
+            "cloud_app_short_link": "capp://12008",
             "completed_stages": ["CREATE_SAVE", "ENABLE", "SET_GROUP", "COMPLETED"],
-            "row_data": {"ID": "12001"},
+            "row_data": {"ID": "12008"},
         }
 
-    with make_client(tmp_path, mode="REAL", real_caller=real_caller) as client:
-        response = client.post("/v1/exec/create-app", headers=headers(), json=app_request())
-        final = wait_terminal(client, response.json()["execution_id"])
+    with make_client(tmp_path, real_caller=caller) as client:
+        response = client.post("/v1/exec/create-app", headers=HEADERS, json=app_request())
 
-    assert final["execution_state"] == "SUCCEEDED"
-    assert final["business_status"] == "SUCCESS"
-    assert final["data"]["application_id"] == "12001"
-    assert final["data"]["application_name"] == "中国移动云盘"
+    body = response.json()
+    assert response.status_code == 200
+    assert body["state"] == "SUCCEEDED"
+    assert body["status"] == "SUCCESS"
+    assert body["data"]["app_id"] == "12008"
+    assert body["data"]["app_link"] == "https://example.invalid/#/?i=12008"
+    assert "application_id" not in body["data"]
+    assert "long_link" not in body["data"]
     assert calls[0][0] == "create_app"
-    assert calls[0][1]["business_object"] == "中国移动云盘"
+    assert calls[0][1]["business_object"] == "中国移动云盘-0908测试"
     assert calls[0][1]["activity_name"] == ""
     assert calls[0][1]["group_name"] == "10086"
+    assert calls[0][1]["ref_cloud_app_link"].endswith("KWcMvfaFlhw=")
 
 
-def test_real_create_channel_returns_automation_actual_name(tmp_path: Path):
-    def real_caller(name, **kwargs):
-        assert name == "create_channel"
-        assert kwargs["channel_base_name"] == "甘肃体验有礼掌厅瀑布流"
-        return {"success": True, "actual_channel_name": "甘肃体验有礼掌厅瀑布流1"}
+def test_request_schema_and_operation_input_are_strict(tmp_path: Path):
+    body_version = channel_request()
+    body_version["contract_version"] = "http-executor.v1"
+    unknown_input = app_request("key-app-unknown")
+    unknown_input["input"]["download_link"] = "https://example.invalid/download"
+    missing_group = app_request("key-app-missing")
+    del missing_group["input"]["group_name"]
 
-    with make_client(tmp_path, mode="REAL", real_caller=real_caller) as client:
-        response = client.post("/v1/exec/create-channel", headers=headers(), json=channel_request())
-        final = wait_terminal(client, response.json()["execution_id"])
+    with make_client(tmp_path) as client:
+        body_response = client.post("/v1/exec/create-channel", headers=HEADERS, json=body_version)
+        unknown_response = client.post("/v1/exec/create-app", headers=HEADERS, json=unknown_input)
+        missing_response = client.post("/v1/exec/create-app", headers=HEADERS, json=missing_group)
 
-    assert final["execution_state"] == "SUCCEEDED"
-    assert final["data"]["actual_channel_name"] == "甘肃体验有礼掌厅瀑布流1"
+    assert body_response.status_code == 400
+    assert body_response.json()["error"]["error_code"] == "SCHEMA_INVALID"
+    assert unknown_response.status_code == 400
+    assert unknown_response.json()["error"]["error_code"] == "UNKNOWN_INPUT_FIELD"
+    assert missing_response.status_code == 400
+    assert missing_response.json()["error"]["error_code"] == "MISSING_REQUIRED_FIELD"
 
 
-def test_query_unknown_task_does_not_create_execution(tmp_path: Path):
+def test_query_uses_correlation_id_and_checks_snapshot(tmp_path: Path):
+    with make_client(tmp_path) as client:
+        created = client.post("/v1/exec/create-channel", headers=HEADERS, json=channel_request()).json()
+        query = {
+            "operation": "create_channel",
+            "environment": "TEST",
+            "snapshot_version": "20260908-V1",
+            "execution_correlation_id": created["execution_correlation_id"],
+        }
+        response = client.post("/v1/exec/query", headers=HEADERS, json=query)
+        query["snapshot_version"] = "different"
+        conflict = client.post("/v1/exec/query", headers=HEADERS, json=query)
+
+    assert response.status_code == 200
+    assert response.json()["execution_correlation_id"] == created["execution_correlation_id"]
+    assert conflict.status_code == 400
+    assert conflict.json()["error"]["error_code"] == "QUERY_ASSOCIATION_CONFLICT"
+
+
+def test_query_unknown_execution_returns_404(tmp_path: Path):
     with make_client(tmp_path) as client:
         response = client.post(
             "/v1/exec/query",
-            headers=headers(),
-            json={
-                "contract_version": "http-executor.v1",
-                "execution_id": "EXEC-NOT-FOUND",
-            },
+            headers=HEADERS,
+            json={"execution_correlation_id": "EXEC-NOT-FOUND"},
         )
-        assert response.status_code == 400
-        assert response.json()["error"]["error_code"] == "EXECUTION_NOT_FOUND"
+
+    assert response.status_code == 404
+    assert response.json()["error"]["error_code"] == "EXECUTION_NOT_FOUND"
 
 
-def test_query_rejects_mismatched_execution_association(tmp_path: Path):
-    with make_client(tmp_path) as client:
-        created = client.post("/v1/exec/create-channel", headers=headers(), json=channel_request()).json()
-        response = client.post(
-            "/v1/exec/query",
-            headers=headers(),
-            json={
-                "contract_version": "http-executor.v1",
-                "execution_id": created["execution_id"],
-                "task_id": "HERMES-OTHER-TASK",
-            },
-        )
-        assert response.status_code == 400
-        assert response.json()["error"]["error_code"] == "QUERY_ASSOCIATION_CONFLICT"
+def test_http_entrypoint_does_not_import_old_app_or_mcp():
+    code = """
+import json
+import sys
+import app.http_executor.main
+blocked = {
+    'app.main',
+    'app.services.job_manager',
+    'app.executor.mcp_server',
+}
+print(json.dumps(sorted(blocked.intersection(sys.modules))))
+"""
+    output = subprocess.check_output([sys.executable, "-c", code], text=True)
+    assert json.loads(output) == []
+
+
+def test_hermes_executor_call_is_allowlisted(monkeypatch):
+    from app.services import executor_client
+
+    monkeypatch.setattr(executor_client, "call_executor", lambda name, **kwargs: {"name": name})
+    assert executor_client.call_hermes_executor("create_app") == {"name": "create_app"}
+
+    try:
+        executor_client.call_hermes_executor("update_app")
+    except RuntimeError as exc:
+        assert "不允许调用" in str(exc)
+    else:
+        raise AssertionError("update_app must not be callable through Hermes HTTP")

@@ -1,10 +1,11 @@
 {
-  "contract_version": "http-executor.v1",
-  "task_id": "HERMES-20260828-0001",
-  "operation": "exec.create_channel",
+  "task_id": "HERMES-20260908-0001",
+  "operation": "create_channel",
   "environment": "TEST",
-  "idempotency_key": "HERMES-20260828-0001-create-channel",
+  "snapshot_version": "20260908-V1",
+  "idempotency_key": "HERMES-20260908-0001-create-channel",
   "input": {
-    "requested_channel_name": "甘肃体验有礼掌厅瀑布流"
+    "requested_channel_name": "甘肃体验有礼-0908测试",
+    "base_platform": "掌厅"
   }
 }

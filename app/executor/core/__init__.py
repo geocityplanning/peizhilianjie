@@ -9,7 +9,7 @@ from datetime import datetime
 
 from playwright.sync_api import sync_playwright
 
-BASE_URL = "https://plus.buy.139.com"
+BASE_URL = "https://uat-cloud.139.com"
 ADMIN_URL = f"{BASE_URL}/cloudappadmin/#/cloudAppChannelManager"
 CDP_URL = "http://127.0.0.1:9222"
 
@@ -22,7 +22,7 @@ def get_browser_page(cdp_url=CDP_URL):
     page = None
     for ctx in browser.contexts:
         for pg in ctx.pages:
-            if "plus.buy.139.com" in pg.url:
+            if "uat-cloud.139.com" in pg.url:
                 page = pg
                 break
         if page:

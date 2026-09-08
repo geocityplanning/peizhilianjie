@@ -1,74 +1,78 @@
 openapi: 3.0.3
 info:
-  title: Hermes HTTP Executor
+  title: Hermes REAL Executor
   version: 1.0.0
-  description: Hermes 独立 HTTP 执行接口，支持 FAKE 联调与 REAL 浏览器自动化。
+  description: Hermes 调用真实浏览器自动化创建渠道和应用的唯一 HTTP 契约。
 servers:
   - url: http://127.0.0.1:8001
 security:
   - bearerAuth: []
 paths:
   /v1/exec/info:
-    get:
+    post:
       operationId: getInfo
-      summary: 获取执行端信息
+      summary: 获取 REAL 执行端状态
+      parameters:
+        - $ref: '#/components/parameters/ContractVersion'
       responses:
         '200':
-          description: 执行端信息
+          description: 执行端状态
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/InfoResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /v1/exec/create-channel:
     post:
       operationId: createChannel
-      summary: 提交创建渠道任务
+      summary: 同步创建渠道并返回最终结果
+      parameters:
+        - $ref: '#/components/parameters/ContractVersion'
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ExecutionRequest'
+              $ref: '#/components/schemas/CreateChannelRequest'
       responses:
         '200':
-          description: 已受理或幂等重放
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ExecutionReceipt'
+          $ref: '#/components/responses/ExecutionResult'
         '400':
-          description: 请求校验失败
+          $ref: '#/components/responses/BadRequest'
         '401':
-          description: 鉴权失败
+          $ref: '#/components/responses/Unauthorized'
         '409':
-          description: 执行端忙碌或幂等冲突
+          $ref: '#/components/responses/Conflict'
   /v1/exec/create-app:
     post:
       operationId: createApp
-      summary: 提交创建应用任务
+      summary: 同步完成应用创建、上线和分组并返回最终结果
+      parameters:
+        - $ref: '#/components/parameters/ContractVersion'
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CreateAppExecutionRequest'
+              $ref: '#/components/schemas/CreateAppRequest'
       responses:
         '200':
-          description: 已受理或幂等重放
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ExecutionReceipt'
+          $ref: '#/components/responses/ExecutionResult'
         '400':
-          description: 请求校验失败
+          $ref: '#/components/responses/BadRequest'
         '401':
-          description: 鉴权失败
+          $ref: '#/components/responses/Unauthorized'
         '409':
-          description: 执行端忙碌或幂等冲突
+          $ref: '#/components/responses/Conflict'
   /v1/exec/query:
     post:
       operationId: queryExecution
-      summary: 查询原始执行任务
+      summary: 查询原始执行结果，不产生业务副作用
+      parameters:
+        - $ref: '#/components/parameters/ContractVersion'
       requestBody:
         required: true
         content:
@@ -77,42 +81,111 @@ paths:
               $ref: '#/components/schemas/QueryRequest'
       responses:
         '200':
-          description: 原始任务状态
+          $ref: '#/components/responses/ExecutionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: 未找到原始执行记录
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ExecutionReceipt'
-        '400':
-          description: 查询条件错误或任务不存在
-        '401':
-          description: 鉴权失败
+                $ref: '#/components/schemas/ErrorReceipt'
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
+  parameters:
+    ContractVersion:
+      name: X-Contract-Version
+      in: header
+      required: true
+      schema:
+        type: string
+        enum: [http-executor.v1]
+  responses:
+    ExecutionResult:
+      description: 同步最终回执或同幂等键的原始回执
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ExecutionReceipt'
+    BadRequest:
+      description: 契约、字段或查询关联校验失败
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorReceipt'
+    Unauthorized:
+      description: Bearer Token 缺失或不正确
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorReceipt'
+    Conflict:
+      description: 执行端正忙或幂等键冲突
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorReceipt'
   schemas:
-    ExecutionRequest:
+    CreateChannelRequest:
       type: object
-      required: [contract_version, task_id, operation, environment, idempotency_key, input]
+      additionalProperties: false
+      required: [task_id, operation, environment, snapshot_version, idempotency_key, input]
       properties:
-        contract_version: {type: string, example: http-executor.v1}
-        task_id: {type: string, example: HERMES-20260828-0001}
-        operation: {type: string, enum: [exec.create_channel, exec.create_app]}
-        environment: {type: string, example: TEST}
-        idempotency_key: {type: string, example: HERMES-20260828-0001-create-channel}
-        input: {type: object, additionalProperties: true}
-    CreateAppExecutionRequest:
-      allOf:
-        - $ref: '#/components/schemas/ExecutionRequest'
-        - type: object
+        task_id:
+          type: string
+          minLength: 1
+        operation:
+          type: string
+          enum: [create_channel]
+        environment:
+          type: string
+          example: TEST
+        snapshot_version:
+          type: string
+          minLength: 1
+        idempotency_key:
+          type: string
+          minLength: 1
+        input:
+          type: object
+          additionalProperties: false
+          required: [requested_channel_name]
           properties:
-            operation: {type: string, enum: [exec.create_app]}
-            input:
-              $ref: '#/components/schemas/CreateAppInput'
+            requested_channel_name:
+              type: string
+              minLength: 1
+            base_platform:
+              type: string
+    CreateAppRequest:
+      type: object
+      additionalProperties: false
+      required: [task_id, operation, environment, snapshot_version, idempotency_key, input]
+      properties:
+        task_id:
+          type: string
+          minLength: 1
+        operation:
+          type: string
+          enum: [create_app]
+        environment:
+          type: string
+          example: TEST
+        snapshot_version:
+          type: string
+          minLength: 1
+        idempotency_key:
+          type: string
+          minLength: 1
+        input:
+          $ref: '#/components/schemas/CreateAppInput'
     CreateAppInput:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       required:
         - application_type
         - business_object
@@ -122,54 +195,190 @@ components:
         - settlement_type
         - group_name
       properties:
-        application_type: {type: string, example: 云盘}
-        business_object: {type: string, example: 中国移动云盘}
-        actual_channel_name: {type: string, example: 甘肃体验有礼掌厅瀑布流-1}
-        jump_address: {type: string}
-        resource_fallback_page: {type: string, format: uri}
-        settlement_type: {type: string, example: 云盘}
-        group_name: {type: string, example: '10086'}
-        download_link: {type: string, format: uri}
-        fixed_fields: {type: object, additionalProperties: true}
+        application_type:
+          type: string
+          enum: [云盘, 掌厅]
+        business_object:
+          type: string
+          minLength: 1
+        actual_channel_name:
+          type: string
+          minLength: 1
+        jump_address:
+          type: string
+          minLength: 1
+        resource_fallback_page:
+          type: string
+          minLength: 1
+        settlement_type:
+          type: string
+          minLength: 1
+        group_name:
+          type: string
+          minLength: 1
+        ref_cloud_app_link:
+          type: string
+          description: 可选；未传时执行端按 application_type 使用内置参考应用长链接。
     QueryRequest:
       type: object
-      required: [contract_version]
+      additionalProperties: false
       properties:
-        contract_version: {type: string, example: http-executor.v1}
-        execution_id: {type: string, nullable: true}
-        task_id: {type: string, nullable: true}
-        operation: {type: string, nullable: true}
-        environment: {type: string, nullable: true}
-        idempotency_key: {type: string, nullable: true}
+        execution_correlation_id:
+          type: string
+        idempotency_key:
+          type: string
+        task_id:
+          type: string
+        operation:
+          type: string
+          enum: [create_channel, create_app]
+        environment:
+          type: string
+        snapshot_version:
+          type: string
+      description: 提供 execution_correlation_id、idempotency_key，或 task_id + operation + environment。
     ExecutionReceipt:
       type: object
-      required: [contract_version, accepted, execution_state, business_status, next_action]
+      additionalProperties: false
+      required:
+        - contract_version
+        - accepted
+        - execution_correlation_id
+        - task_id
+        - operation
+        - environment
+        - snapshot_version
+        - idempotency_key
+        - state
+        - status
+        - late
+        - adjudicated
+        - data
+        - error
+        - evidence_ref
+        - next_action
+        - created_at
+        - updated_at
       properties:
-        contract_version: {type: string}
-        accepted: {type: boolean}
-        execution_id: {type: string, nullable: true}
-        task_id: {type: string, nullable: true}
-        operation: {type: string, nullable: true}
-        environment: {type: string, nullable: true}
-        idempotency_key: {type: string, nullable: true}
-        execution_state: {type: string, enum: [ACCEPTED, RUNNING, SUCCEEDED, FAILED, UNKNOWN, REJECTED]}
-        business_status: {type: string}
-        data: {type: object, nullable: true, additionalProperties: true}
-        error: {type: object, nullable: true, additionalProperties: true}
-        evidence_ref: {type: array, items: {type: string}}
-        next_action: {type: string, enum: [QUERY, STOP, MANUAL_CHECK]}
-        created_at: {type: string}
-        updated_at: {type: string}
+        contract_version:
+          type: string
+          enum: [http-executor.v1]
+        accepted:
+          type: boolean
+        execution_correlation_id:
+          type: string
+        task_id:
+          type: string
+        operation:
+          type: string
+          enum: [create_channel, create_app]
+        environment:
+          type: string
+        snapshot_version:
+          type: string
+        idempotency_key:
+          type: string
+        state:
+          type: string
+          enum: [ACCEPTED, RUNNING, SUCCEEDED, FAILED, UNKNOWN, REJECTED]
+        status:
+          type: string
+          enum: [RUNNING, SUCCESS, BUSINESS_REJECT, TECH_FAIL, UNKNOWN, NOT_EXECUTED]
+        late:
+          type: boolean
+        adjudicated:
+          type: boolean
+        data:
+          type: object
+          nullable: true
+          additionalProperties: true
+        error:
+          $ref: '#/components/schemas/NullableError'
+        evidence_ref:
+          type: array
+          items:
+            type: string
+        next_action:
+          type: string
+          enum: [QUERY, STOP, MANUAL_CHECK]
+        created_at:
+          type: string
+        updated_at:
+          type: string
+    NullableError:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [error_code, error_stage, message, next_action]
+      properties:
+        error_code:
+          type: string
+        error_stage:
+          type: string
+        message:
+          type: string
+        next_action:
+          type: string
+          enum: [QUERY, STOP, MANUAL_CHECK]
+        details:
+          type: array
+          items: {}
+    ErrorReceipt:
+      type: object
+      additionalProperties: true
+      required: [contract_version, accepted, state, status, error, next_action]
+      properties:
+        contract_version:
+          type: string
+          enum: [http-executor.v1]
+        accepted:
+          type: boolean
+          enum: [false]
+        execution_correlation_id:
+          type: string
+          nullable: true
+        state:
+          type: string
+          enum: [REJECTED, UNKNOWN]
+        status:
+          type: string
+          enum: [NOT_EXECUTED, TECH_FAIL]
+        error:
+          $ref: '#/components/schemas/NullableError'
+        next_action:
+          type: string
+          enum: [QUERY, STOP, MANUAL_CHECK]
     InfoResponse:
       type: object
-      required: [contract_version, capabilities, environment, mode]
+      additionalProperties: false
+      required:
+        - contract_version
+        - service
+        - environment
+        - mode
+        - capabilities
+        - active_execution_correlation_id
+        - database_status
       properties:
-        contract_version: {type: string}
-        service: {type: string}
-        environment: {type: string}
-        mode: {type: string}
-        capabilities: {type: array, items: {type: string}}
-        browser_status: {type: string}
-        login_status: {type: string}
-        active_execution_id: {type: string, nullable: true}
-        database_status: {type: string}
+        contract_version:
+          type: string
+          enum: [http-executor.v1]
+        service:
+          type: string
+          enum: [hermes-real-executor]
+        environment:
+          type: string
+        mode:
+          type: string
+          enum: [REAL]
+        capabilities:
+          type: array
+          items:
+            type: string
+            enum: [get_info, create_channel, create_app, query_execution]
+        active_execution_correlation_id:
+          type: string
+          nullable: true
+        database_status:
+          type: string
+          enum: [AVAILABLE]

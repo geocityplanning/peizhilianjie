@@ -1,18 +1,17 @@
 {
-  "contract_version": "http-executor.v1",
-  "task_id": "HERMES-20260828-0001",
-  "operation": "exec.create_app",
+  "task_id": "HERMES-20260908-0001",
+  "operation": "create_app",
   "environment": "TEST",
-  "idempotency_key": "HERMES-20260828-0001-create-app",
+  "snapshot_version": "20260908-V1",
+  "idempotency_key": "HERMES-20260908-0001-create-app",
   "input": {
     "application_type": "云盘",
-    "business_object": "中国移动云盘",
-    "actual_channel_name": "甘肃体验有礼掌厅瀑布流-1",
-    "jump_address": "mcloud://main/webView?params=fake",
+    "business_object": "中国移动云盘-0908测试",
+    "actual_channel_name": "甘肃体验有礼-0908测试-1",
+    "jump_address": "mcloud://main/webView?params=test",
     "resource_fallback_page": "https://example.invalid/fallback",
     "settlement_type": "云盘",
     "group_name": "10086",
-    "download_link": "https://example.invalid/download",
-    "fixed_fields": {}
+    "ref_cloud_app_link": "https://plus.buy.139.com/mccloudgame/#/?i=KWcMvfaFlhw="
   }
 }

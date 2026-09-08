@@ -1,4 +1,6 @@
 {
-  "contract_version": "http-executor.v1",
-  "execution_id": "EXEC-REPLACE-ME"
+  "operation": "create_app",
+  "environment": "TEST",
+  "snapshot_version": "20260908-V1",
+  "execution_correlation_id": "EXEC-REPLACE-ME"
 }

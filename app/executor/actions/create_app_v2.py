@@ -15,9 +15,10 @@ from core.error_capture import capture_page_errors, build_error_message
 from core.error_codes import err, NEXT_STOP, NEXT_QUERY, NEXT_MANUAL
 from core import executor as ex
 from actions.ensure_login import ensure_login
+from actions.link_utils import extract_cloud_app_key
 
 OPERATION = "CREATE_APP"
-BASE_URL_H5 = "https://plus.buy.139.com/cloudappadmin/#/cloudAppManager"
+BASE_URL_H5 = "https://uat-cloud.139.com/cloudappadmin/#/cloudAppManager"
 DEFAULT_BASE = "华为底座2.0"
 STEP_TIMEOUT = 5000
 
@@ -360,7 +361,7 @@ def _search_by_link(page, ref_cloud_app_link):
         - clicked=False, uncertain=False, error="SEARCH_FAILED": 搜索组件缺失
         - clicked=True, uncertain=True: 不确定是否点了复制（不能进兜底）
     """
-    link_key = ref_cloud_app_link.split("i=")[-1] if "i=" in ref_cloud_app_link else ref_cloud_app_link
+    link_key = extract_cloud_app_key(ref_cloud_app_link)
 
     # 1. 精确查找 placeholder 包含"长链接"的可见输入框
     input_ok = page.evaluate("""

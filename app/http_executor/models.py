@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from pydantic import BaseModel, Field, VERSION
 
@@ -20,18 +20,18 @@ else:
 
 
 class ExecutionRequest(StrictModel):
-    contract_version: str
-    task_id: str
-    operation: str
-    environment: str
-    idempotency_key: str
-    input: Dict[str, Any] = Field(default_factory=dict)
+    task_id: str = Field(min_length=1)
+    operation: Literal["create_channel", "create_app"]
+    environment: str = "TEST"
+    snapshot_version: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    input: Dict[str, Any]
 
 
 class QueryRequest(StrictModel):
-    contract_version: str
     task_id: Optional[str] = None
-    operation: Optional[str] = None
+    operation: Optional[Literal["create_channel", "create_app"]] = None
     environment: Optional[str] = None
+    snapshot_version: Optional[str] = None
     idempotency_key: Optional[str] = None
-    execution_id: Optional[str] = None
+    execution_correlation_id: Optional[str] = None

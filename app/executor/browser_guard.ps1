@@ -1,7 +1,7 @@
 # browser_guard.ps1
 $ErrorActionPreference = "SilentlyContinue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$TargetUrl = "https://plus.buy.139.com/cloudappadmin/#/cloudAppChannelManager"
+$TargetUrl = "https://uat-cloud.139.com/cloudappadmin/#/cloudAppChannelManager"
 $profileDir = Join-Path $ScriptDir "browser-profile"
 
 $chromePaths = @("C:\Program Files\Google\Chrome\Application\chrome.exe", "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe")

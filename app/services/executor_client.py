@@ -14,6 +14,8 @@ BROWSER_REQUIRED_FUNCTIONS = {
     "locate_app",
 }
 
+HERMES_ALLOWED_FUNCTIONS = {"create_channel", "create_app"}
+
 
 def _ensure_executor_path() -> None:
     executor_path = str(settings.automation_executor_path)
@@ -65,3 +67,9 @@ def call_executor(name: str, **kwargs: Any) -> dict[str, Any]:
         ensure_browser_guard()
     func = _load_api_function(name)
     return func(**kwargs)
+
+
+def call_hermes_executor(name: str, **kwargs: Any) -> dict[str, Any]:
+    if name not in HERMES_ALLOWED_FUNCTIONS:
+        raise RuntimeError(f"Hermes HTTP 执行端不允许调用: {name}")
+    return call_executor(name, **kwargs)
