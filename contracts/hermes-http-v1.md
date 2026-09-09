@@ -125,6 +125,41 @@ Content-Type: application/json
 ## 回执
 
 判断顺序：先看 HTTP 状态，再看 `state` 和 `status`。HTTP 200 不等于执行成功。
+主要判断规则：
+
+| `state` | `status` | 含义 | 是否已调用真实自动化 | Hermes 处理规则 |
+|---|---|---|---|---|
+| `SUCCEEDED` | `SUCCESS` | 自动化完整成功 | 是 | 读取 `data`，结束当前动作；创建应用时必须确认 `data.app_id`、`data.app_link` 和 `data.completed_stages` 完整 |
+| `FAILED` | `TECH_FAIL` | 技术执行失败，例如页面、浏览器、网络或自动化步骤异常 | 是，可能已完成部分阶段 | 读取 `data.completed_stages` 和 `data.failed_stage`，转人工检查；不得直接重新创建 |
+| `FAILED` | `BUSINESS_REJECT` | 业务规则或后台校验拒绝 | 可能已调用，具体以阶段数据为准 | 展示 `error` 信息并修正业务数据；确认原任务状态前不得重新创建 |
+| `UNKNOWN` | `UNKNOWN` | 执行结果不确定，例如服务中断、浏览器异常或返回链路断开 | 可能已调用，不能判断最终结果 | 只能使用 `execution_correlation_id` 调用 `query`；禁止再次调用创建接口 |
+| `REJECTED` | `NOT_EXECUTED` | 当前请求在执行前被拒绝 | 否，本次请求没有进入真实自动化 | 根据 `error.error_code` 修正请求、等待执行端空闲或停止；修正后才可提交新的动作 |
+
+状态字段不能单独判断，必须同时读取 `state` 和 `status`。例如：
+
+- `SUCCEEDED + SUCCESS` 才代表自动化完整成功；只有 HTTP 200 不能代表成功。
+- `FAILED + TECH_FAIL` 不是“没有创建任何数据”的保证，必须查看 `completed_stages` 和后台实际状态。
+- `UNKNOWN + UNKNOWN` 不能当作失败重试，因为原操作可能已经在浏览器中生效。
+- `REJECTED + NOT_EXECUTED` 表示本次请求未进入真实自动化，但同一个幂等键是否已有原任务，仍应根据错误码和原执行记录判断。
+
+常用 `next_action`：
+
+| `next_action` | Hermes 行为 |
+|---|---|
+| `STOP` | 结束当前动作，不自动重试 |
+| `QUERY` | 使用原 `execution_correlation_id` 查询，不创建新任务 |
+| `MANUAL_CHECK` | 转人工检查浏览器、后台页面和执行证据 |
+
+创建应用完整成功的最低判断条件：
+
+```text
+HTTP 状态为 200
+state = SUCCEEDED
+status = SUCCESS
+data.app_id 有值
+data.app_link 有值，且为 http:// 或 https:// 开头
+data.completed_stages 包含 CREATE_SAVE、ENABLE、SET_GROUP、COMPLETED
+```
 
 - `state=SUCCEEDED` 且 `status=SUCCESS`：成功。
 - `state=FAILED`：自动化已明确失败。
