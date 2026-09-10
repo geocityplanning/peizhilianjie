@@ -114,9 +114,41 @@ class ExecutionService:
                 error.get("next_action", "STOP"),
             )
         if should_run:
-            self._run_real(record["execution_id"], request)
+            if self.settings.fake_mode:
+                self._run_fake(record["execution_id"], request)
+            else:
+                self._run_real(record["execution_id"], request)
             record = self.store.get_by_execution_id(record["execution_id"]) or record
         return self._envelope(record)
+
+    def _run_fake(self, execution_id: str, request: ExecutionRequest) -> None:
+        from .real_runner import map_real_success, run_fake_request
+
+        try:
+            self.store.mark_running(execution_id)
+            result = run_fake_request(request)
+            self.store.finish(
+                execution_id=execution_id,
+                execution_state="SUCCEEDED",
+                business_status="SUCCESS",
+                data=map_real_success(request, result),
+                error=None,
+                evidence_ref=[],
+            )
+        except Exception as exc:
+            self.store.finish(
+                execution_id=execution_id,
+                execution_state="UNKNOWN",
+                business_status="UNKNOWN",
+                data=None,
+                error={
+                    "error_code": "FAKE_EXECUTION_ERROR",
+                    "error_stage": "EXECUTE",
+                    "message": str(exc),
+                    "next_action": "QUERY",
+                },
+                evidence_ref=[],
+            )
 
     def _run_real(self, execution_id: str, request: ExecutionRequest) -> None:
         from .real_runner import map_real_failure, map_real_success, run_real_request
@@ -201,7 +233,7 @@ class ExecutionService:
             "contract_version": CONTRACT_VERSION,
             "service": "hermes-real-executor",
             "environment": self.settings.environment,
-            "mode": "REAL",
+            "mode": "FAKE" if self.settings.fake_mode else "REAL",
             "capabilities": ["get_info", "create_channel", "create_app", "query_execution"],
             "active_execution_correlation_id": self.store.active_execution_id(),
             "database_status": "AVAILABLE",

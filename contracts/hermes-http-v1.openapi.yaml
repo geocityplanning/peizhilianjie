@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Hermes REAL Executor
   version: 1.0.0
-  description: Hermes 调用真实浏览器自动化创建渠道和应用的唯一 HTTP 契约。
+  description: Hermes 调用 8001 执行端创建渠道和应用的唯一 HTTP 契约；执行端支持 REAL 和联调 FAKE 两种模式。
 servers:
   - url: http://127.0.0.1:8001
 security:
@@ -370,7 +370,7 @@ components:
           type: string
         mode:
           type: string
-          enum: [REAL]
+          enum: [REAL, FAKE]
         capabilities:
           type: array
           items:

@@ -19,10 +19,10 @@ HEADERS = {
 }
 
 
-def make_client(tmp_path: Path, *, real_caller=None) -> TestClient:
+def make_client(tmp_path: Path, *, real_caller=None, fake_mode: bool = False) -> TestClient:
     db_path = tmp_path / "executor.db"
     initialize_database(db_path)
-    settings = Settings(db_path=db_path, environment="TEST", auth_token="test-token")
+    settings = Settings(db_path=db_path, environment="TEST", auth_token="test-token", fake_mode=fake_mode)
 
     if real_caller is None:
         def real_caller(name, **kwargs):
@@ -111,6 +111,29 @@ def test_info_reports_real_mode(tmp_path: Path):
         "active_execution_correlation_id": None,
         "database_status": "AVAILABLE",
     }
+
+
+def test_info_reports_fake_mode(tmp_path: Path):
+    with make_client(tmp_path, fake_mode=True) as client:
+        response = client.post("/v1/exec/info", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "FAKE"
+
+
+def test_fake_mode_returns_receipts_without_calling_real_executor(tmp_path: Path):
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("fake mode must not call the real executor")
+
+    with make_client(tmp_path, real_caller=must_not_run, fake_mode=True) as client:
+        channel = client.post("/v1/exec/create-channel", headers=HEADERS, json=channel_request()).json()
+        app = client.post("/v1/exec/create-app", headers=HEADERS, json=app_request()).json()
+
+    assert channel["state"] == "SUCCEEDED"
+    assert "FAKE-" in channel["data"]["actual_channel_name"]
+    assert app["state"] == "SUCCEEDED"
+    assert app["data"]["app_id"].startswith("FAKE-")
+    assert app["data"]["app_link"].startswith("https://fake.invalid/")
 
 
 def test_every_route_requires_bearer_token_and_contract_header(tmp_path: Path):

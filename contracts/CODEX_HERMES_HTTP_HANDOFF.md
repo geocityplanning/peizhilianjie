@@ -7,7 +7,7 @@ Repository: https://github.com/geocityplanning/peizhilianjie.git
 Branch: feat/hermes-real-executor
 ```
 
-此分支交付 Hermes 所需的 8001 REAL HTTP 执行端和浏览器自动化。
+此分支交付 Hermes 所需的 8001 HTTP 执行端和浏览器自动化。默认是 REAL；联调时可通过 `HERMES_EXECUTOR_FAKE_MODE=true` 在同一端口启用假跑。
 
 ## 首次部署
 

@@ -13,6 +13,11 @@ class Settings:
     db_path: Path
     environment: str
     auth_token: str
+    fake_mode: bool = False
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_settings() -> Settings:
@@ -25,4 +30,5 @@ def load_settings() -> Settings:
         db_path=db_path,
         environment=os.getenv("HERMES_EXECUTOR_ENV", "TEST").upper(),
         auth_token=os.getenv("HERMES_EXECUTOR_TOKEN", "").strip(),
+        fake_mode=_env_flag("HERMES_EXECUTOR_FAKE_MODE"),
     )

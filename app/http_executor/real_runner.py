@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from typing import Any
 
@@ -7,6 +8,31 @@ from .models import ExecutionRequest
 
 
 ExecutorCaller = Callable[..., dict[str, Any]]
+
+
+def run_fake_request(request: ExecutionRequest) -> dict[str, Any]:
+    """Return a deterministic contract-shaped receipt without touching a browser."""
+    seed = f"{request.task_id}:{request.idempotency_key}:{request.operation}".encode("utf-8")
+    token = hashlib.sha256(seed).hexdigest()[:10].upper()
+
+    if request.operation == "create_channel":
+        requested_name = request.input["requested_channel_name"].strip()
+        return {
+            "success": True,
+            "actual_channel_name": f"{requested_name}-FAKE-{token[:6]}",
+            "channel_data": {"source": "fake", "mode": "FAKE", "task_id": request.task_id},
+        }
+
+    app_id = f"FAKE-{token}"
+    return {
+        "success": True,
+        "app_id": app_id,
+        "app_name": request.input["business_object"].strip(),
+        "cloud_app_link": f"https://fake.invalid/cloudapp/#/?i={app_id}",
+        "cloud_app_short_link": f"capp://{app_id}",
+        "completed_stages": ["CREATE_SAVE", "ENABLE", "SET_GROUP", "COMPLETED"],
+        "row_data": {"ID": app_id, "mode": "FAKE"},
+    }
 
 
 def run_real_request(

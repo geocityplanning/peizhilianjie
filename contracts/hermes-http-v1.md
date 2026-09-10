@@ -1,6 +1,8 @@
 # Hermes REAL Executor HTTP v1
 
-Hermes 调用本服务的 8001 端口，服务执行真实浏览器自动化。
+Hermes 调用本服务的 8001 端口。默认执行真实浏览器自动化；联调时可通过环境变量切换为同契约的 FAKE 假跑模式。
+
+`HERMES_EXECUTOR_FAKE_MODE` 默认为关闭（`false`）。开启后，四个 HTTP 地址、鉴权、请求字段和回执包络都不变，但 `create-channel`、`create-app` 只写入执行记录并返回可测的假成功数据，不启动浏览器。生产和真实验收必须保持关闭。
 
 ## 连接
 

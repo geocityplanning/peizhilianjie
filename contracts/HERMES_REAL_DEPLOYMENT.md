@@ -82,6 +82,23 @@ uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
 
 保持此 PowerShell 窗口和浏览器运行。
 
+## 5.1 Hermes 联调 FAKE 模式
+
+联调时仍使用同一个 8001 和同一套四个接口，只将假跑开关打开。默认值是关闭，生产和真实验收必须保持关闭：
+
+```powershell
+$env:HERMES_EXECUTOR_TOKEN = "<双方约定的Bearer Token>"
+$env:HERMES_EXECUTOR_ENV = "TEST"
+$env:HERMES_EXECUTOR_FAKE_MODE = "true"
+uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
+```
+
+此时先调用 `POST /v1/exec/info`，确认返回 `mode = FAKE`。`create-channel` 和 `create-app` 会写入现有执行记录并返回契约形状的假成功回执，不启动浏览器，也不调用真实后台。测试结束后关闭该 PowerShell 窗口，或重新启动并设置：
+
+```powershell
+$env:HERMES_EXECUTOR_FAKE_MODE = "false"
+```
+
 ## 6. 验证服务
 
 另开一个 PowerShell：
