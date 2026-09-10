@@ -193,7 +193,6 @@ components:
         - jump_address
         - resource_fallback_page
         - settlement_type
-        - group_name
       properties:
         application_type:
           type: string
@@ -215,7 +214,7 @@ components:
           minLength: 1
         group_name:
           type: string
-          minLength: 1
+          description: 可选；省略或传空字符串时不修改复制件原分组。
         ref_cloud_app_link:
           type: string
           description: 可选；未传时执行端按 application_type 使用内置参考应用长链接。

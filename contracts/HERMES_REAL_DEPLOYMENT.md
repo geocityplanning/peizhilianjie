@@ -162,5 +162,5 @@ state = SUCCEEDED
 status = SUCCESS
 data.app_id 有值
 data.app_link 有值
-data.completed_stages 包含 CREATE_SAVE、ENABLE、SET_GROUP、COMPLETED
+data.completed_stages 包含 CREATE_SAVE、ENABLE、COMPLETED；传入非空 group_name 时还必须包含 SET_GROUP
 ```

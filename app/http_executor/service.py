@@ -31,7 +31,6 @@ REQUIRED_FIELDS = {
         "jump_address",
         "resource_fallback_page",
         "settlement_type",
-        "group_name",
     },
 }
 

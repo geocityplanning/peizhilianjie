@@ -29,8 +29,12 @@ def run_fake_request(request: ExecutionRequest) -> dict[str, Any]:
         "app_id": app_id,
         "app_name": request.input["business_object"].strip(),
         "cloud_app_link": f"https://fake.invalid/cloudapp/#/?i={app_id}",
-        "cloud_app_short_link": f"capp://{app_id}",
-        "completed_stages": ["CREATE_SAVE", "ENABLE", "SET_GROUP", "COMPLETED"],
+        "completed_stages": [
+            "CREATE_SAVE",
+            "ENABLE",
+            *(["SET_GROUP"] if str(request.input.get("group_name") or "").strip() else []),
+            "COMPLETED",
+        ],
         "row_data": {"ID": app_id, "mode": "FAKE"},
     }
 
@@ -63,9 +67,11 @@ def run_real_request(
         "jump_address": input_data["jump_address"].strip(),
         "resource_fallback_page": input_data["resource_fallback_page"].strip(),
         "settlement_type": input_data["settlement_type"].strip(),
-        "group_name": input_data["group_name"].strip(),
         "task_id": request.task_id,
     }
+    group_name = str(input_data.get("group_name") or "").strip()
+    if group_name:
+        kwargs["group_name"] = group_name
     ref_cloud_app_link = str(input_data.get("ref_cloud_app_link") or "").strip()
     if ref_cloud_app_link:
         kwargs["ref_cloud_app_link"] = ref_cloud_app_link
@@ -80,11 +86,11 @@ def map_real_success(request: ExecutionRequest, result: dict[str, Any]) -> dict[
             "channel_data": result.get("channel_data") or {},
         }
 
-    row_data = result.get("row_data") or {}
+    raw_row_data = result.get("row_data") or {}
+    row_data = {key: value for key, value in raw_row_data.items() if key != "应用链接"}
     return {
         "app_id": result.get("app_id") or row_data.get("ID"),
         "app_link": result.get("cloud_app_link"),
-        "app_short_link": result.get("cloud_app_short_link"),
         "application_name": result.get("app_name") or request.input["business_object"],
         "actual_channel_name": request.input["actual_channel_name"],
         "completed_stages": result.get("completed_stages") or [],

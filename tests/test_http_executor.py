@@ -39,7 +39,7 @@ def make_client(tmp_path: Path, *, real_caller=None, fake_mode: bool = False) ->
                 "cloud_app_link": "https://example.invalid/#/?i=12008",
                 "cloud_app_short_link": "capp://12008",
                 "completed_stages": ["CREATE_SAVE", "ENABLE", "SET_GROUP", "COMPLETED"],
-                "row_data": {"ID": "12008"},
+                "row_data": {"ID": "12008", "长连接": "https://example.invalid/long", "应用链接": "https://example.invalid/short"},
             }
 
     service = ExecutionService(settings, ExecutorStore(db_path), real_caller=real_caller)
@@ -134,6 +134,19 @@ def test_fake_mode_returns_receipts_without_calling_real_executor(tmp_path: Path
     assert app["state"] == "SUCCEEDED"
     assert app["data"]["app_id"].startswith("FAKE-")
     assert app["data"]["app_link"].startswith("https://fake.invalid/")
+    assert "app_short_link" not in app["data"]
+
+    empty_group = app_request("key-app-empty-group")
+    del empty_group["input"]["group_name"]
+    with make_client(tmp_path / "empty-group", real_caller=must_not_run, fake_mode=True) as client:
+        empty_app_response = client.post(
+            "/v1/exec/create-app", headers=HEADERS, json=empty_group
+        )
+
+    empty_app = empty_app_response.json()
+    assert empty_app_response.status_code == 200
+    assert empty_app["state"] == "SUCCEEDED"
+    assert "SET_GROUP" not in empty_app["data"]["completed_stages"]
 
 
 def test_every_route_requires_bearer_token_and_contract_header(tmp_path: Path):
@@ -212,7 +225,7 @@ def test_create_app_maps_exact_real_result_fields(tmp_path: Path):
             "cloud_app_link": "https://example.invalid/#/?i=12008",
             "cloud_app_short_link": "capp://12008",
             "completed_stages": ["CREATE_SAVE", "ENABLE", "SET_GROUP", "COMPLETED"],
-            "row_data": {"ID": "12008"},
+            "row_data": {"ID": "12008", "长连接": "https://example.invalid/long", "应用链接": "https://example.invalid/short"},
         }
 
     with make_client(tmp_path, real_caller=caller) as client:
@@ -224,6 +237,8 @@ def test_create_app_maps_exact_real_result_fields(tmp_path: Path):
     assert body["status"] == "SUCCESS"
     assert body["data"]["app_id"] == "12008"
     assert body["data"]["app_link"] == "https://example.invalid/#/?i=12008"
+    assert "app_short_link" not in body["data"]
+    assert "应用链接" not in body["data"]["row_data"]
     assert "application_id" not in body["data"]
     assert "long_link" not in body["data"]
     assert calls[0][0] == "create_app"
@@ -250,8 +265,8 @@ def test_request_schema_and_operation_input_are_strict(tmp_path: Path):
     assert body_response.json()["error"]["error_code"] == "SCHEMA_INVALID"
     assert unknown_response.status_code == 400
     assert unknown_response.json()["error"]["error_code"] == "UNKNOWN_INPUT_FIELD"
-    assert missing_response.status_code == 400
-    assert missing_response.json()["error"]["error_code"] == "MISSING_REQUIRED_FIELD"
+    assert missing_response.status_code == 200
+    assert missing_response.json()["state"] == "SUCCEEDED"
 
 
 def test_query_uses_correlation_id_and_checks_snapshot(tmp_path: Path):

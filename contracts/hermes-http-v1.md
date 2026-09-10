@@ -123,7 +123,7 @@ Content-Type: application/json
 | `input.jump_address` | 应用配置调起路径/跳转地址 | Excel 中的跳转地址字段 |
 | `input.resource_fallback_page` | 资源不足兜底页 | Excel 中的资源兜底页字段 |
 | `input.settlement_type` | 结算类型 | Excel 中的结算类型字段 |
-| `input.group_name` | 应用上线后的分组 | 例如 `10086` |
+| `input.group_name` | 应用上线后的分组，可选 | 有值时例如 `10086`；省略或为空时不修改复制件原分组 |
 | `input.ref_cloud_app_link` | 复制源应用的长链接 | Excel 中的参考应用长链接/复制源长链接，可选 |
 
 创建应用请求结构：
@@ -149,11 +149,10 @@ Content-Type: application/json
 | JSON 字段 | 含义 | Excel/业务对应 |
 |---|---|---|
 | `data.app_id` | 新创建应用的后台 ID | 自动化在应用列表中识别到的新应用 ID |
-| `data.app_link` | 新创建应用的 HTTP/HTTPS 长链接 | 自动化生成的新应用长链接，不是 Excel 中的参考复制源链接 |
-| `data.app_short_link` | 新创建应用的短链接 | `capp://...` 形式的短链接 |
+| `data.app_link` | 新创建应用后台“长连接”列的 HTTP/HTTPS 值 | 自动化从应用列表“长连接”列读取；用于回填待配置链接表 |
 | `data.application_name` | 新创建应用名称 | 通常等于请求中的 `input.business_object` |
 | `data.actual_channel_name` | 新应用所属的实际渠道名 | 创建渠道接口返回的最终渠道名 |
-| `data.completed_stages` | 已完成的自动化阶段 | `CREATE_SAVE`、`ENABLE`、`SET_GROUP`、`COMPLETED` |
+| `data.completed_stages` | 已完成的自动化阶段 | `CREATE_SAVE`、`ENABLE`、`COMPLETED`；只有传入非空 `group_name` 时才包含 `SET_GROUP` |
 | `data.row_data` | 创建应用的后台列表行数据 | 自动化校验证据，Hermes 主要使用 `app_id` 和 `app_link` |
 | `data.channel_data` | 创建渠道的底层结果 | 自动化返回的渠道附加信息，Hermes 主要使用 `actual_channel_name` |
 
@@ -164,8 +163,8 @@ Excel 参考应用长链接
   → input.ref_cloud_app_link
   → 自动化搜索并复制参考应用
   → 创建新应用
-  → data.app_link              http:// 或 https:// 新应用长链接
-  → data.app_short_link        capp://... 新应用短链接
+  → data.app_link              http:// 或 https:// 后台“长连接”列的值，用于回填
+  → 后台“应用链接”列              仅内部读取，不放入 8001 HTTP 回执
 ```
 
 ### 当前不使用的字段
@@ -176,6 +175,9 @@ Excel 参考应用长链接
 | `ref_app_id` | 旧的参考应用 ID | 当前不使用，应改用 `input.ref_cloud_app_link` |
 | `download_link` | 下载链接 | 当前 B01 `create_app` 不接收，不能放进 `input` |
 | `fixed_fields` | 任意扩展字段 | 当前 B01 不接收，不能放进 `input` |
+| `original_link` | 原链接 | 本轮不接收，不能放进 `input` |
+| `app_download_link` | 应用下载链接 | 本轮不接收，不能放进 `input` |
+| `settlement_province` | 结算省份 | 本轮不接收，不能放进 `input` |
 查询：
 
 ```json
@@ -225,7 +227,7 @@ state = SUCCEEDED
 status = SUCCESS
 data.app_id 有值
 data.app_link 有值，且为 http:// 或 https:// 开头
-data.completed_stages 包含 CREATE_SAVE、ENABLE、SET_GROUP、COMPLETED
+data.completed_stages 包含 CREATE_SAVE、ENABLE、COMPLETED；传入非空 group_name 时还必须包含 SET_GROUP
 ```
 
 - `state=SUCCEEDED` 且 `status=SUCCESS`：成功。
@@ -249,7 +251,6 @@ data.completed_stages 包含 CREATE_SAVE、ENABLE、SET_GROUP、COMPLETED
 {
   "app_id": "12008",
   "app_link": "https://example.invalid/#/?i=12008",
-  "app_short_link": "capp://12008",
   "application_name": "中国移动云盘-0908测试",
   "actual_channel_name": "甘肃体验有礼-0908测试-1",
   "completed_stages": ["CREATE_SAVE", "ENABLE", "SET_GROUP", "COMPLETED"],
