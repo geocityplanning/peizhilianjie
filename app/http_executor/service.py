@@ -63,10 +63,12 @@ class ExecutionService:
         settings: Settings,
         store: ExecutorStore,
         real_caller: Callable[..., dict[str, Any]] | None = None,
+        login_checker: Callable[[], bool] | None = None,
     ):
         self.settings = settings
         self.store = store
         self.real_caller = real_caller
+        self.login_checker = login_checker
 
     def _validate_common(self, request: ExecutionRequest, operation: str) -> None:
         if request.operation != operation:
@@ -226,16 +228,36 @@ class ExecutionService:
             )
         return self._envelope(record)
 
+    def _login_valid(self) -> bool:
+        if self.settings.fake_mode:
+            return True
+        checker = self.login_checker
+        if checker is None:
+            from .login_probe import probe_real_login
+
+            checker = probe_real_login
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
     def info(self) -> Dict[str, Any]:
         self.store.assert_ready()
+        active_execution_id = self.store.active_execution_id()
+        login_valid = self._login_valid()
+        unknown_inflight = active_execution_id is not None
         return {
             "contract_version": CONTRACT_VERSION,
             "service": "hermes-real-executor",
             "environment": self.settings.environment,
             "mode": "FAKE" if self.settings.fake_mode else "REAL",
             "capabilities": ["get_info", "create_channel", "create_app", "query_execution"],
-            "active_execution_correlation_id": self.store.active_execution_id(),
+            "active_execution_correlation_id": active_execution_id,
             "database_status": "AVAILABLE",
+            "status": "SUCCESS",
+            "acceptable": not unknown_inflight and login_valid,
+            "login_valid": login_valid,
+            "unknown_inflight": unknown_inflight,
         }
 
     @staticmethod

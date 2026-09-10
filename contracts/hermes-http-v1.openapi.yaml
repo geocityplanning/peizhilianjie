@@ -358,6 +358,10 @@ components:
         - capabilities
         - active_execution_correlation_id
         - database_status
+        - status
+        - acceptable
+        - login_valid
+        - unknown_inflight
       properties:
         contract_version:
           type: string
@@ -381,3 +385,11 @@ components:
         database_status:
           type: string
           enum: [AVAILABLE]
+        status:
+          type: string
+        acceptable:
+          type: boolean
+        login_valid:
+          type: boolean
+        unknown_inflight:
+          type: boolean

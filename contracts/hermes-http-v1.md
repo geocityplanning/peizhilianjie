@@ -22,7 +22,26 @@ Content-Type: application/json
 | 创建应用、上线、分组 | `POST /v1/exec/create-app` |
 | 查询原任务 | `POST /v1/exec/query` |
 
+## GATE-08 探活
+
+调用 `POST /v1/exec/info` 时，执行端在同一层返回以下探活字段：
+
+```json
+{
+  "status": "SUCCESS",
+  "acceptable": true,
+  "login_valid": true,
+  "unknown_inflight": false
+}
+```
+
+- `status=SUCCESS` 表示探活请求和数据库检查成功，不代表创建业务成功。
+- `acceptable=true` 表示当前可以接收新的创建任务；执行端忙碌或 REAL 登录无效时为 `false`。
+- FAKE 模式的 `login_valid` 固定为 `true`；REAL 模式会检查已运行的 139 浏览器会话和只读渠道列表探测，不会自动启动浏览器或执行登录。
+- `unknown_inflight=true` 表示 `active_execution_correlation_id` 有值，此时 `acceptable` 必须为 `false`。
+- `info` 请求体可以带 `environment`、`run_id`，执行端不因这两个字段返回 400。
 ## 调用顺序
+
 
 1. Hermes 调用 `create-channel`。
 2. 读取成功回执中的 `data.actual_channel_name`。

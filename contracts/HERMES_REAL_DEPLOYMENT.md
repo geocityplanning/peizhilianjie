@@ -118,8 +118,13 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8001/v1/exec/info" -Header
 service = hermes-real-executor
 mode = REAL
 database_status = AVAILABLE
+status = SUCCESS
+acceptable = true/false（取决于 REAL 登录状态和是否有未决任务）
+login_valid = true（REAL 会话有效时）
+unknown_inflight = false（当前无未决任务时）
 ```
 
+其中，`status = SUCCESS` 只表示执行端探活和数据库检查成功，不代表创建渠道或创建应用已经成功。`acceptable = true` 才表示当前可以接受新的创建请求；REAL 模式下还必须满足浏览器已有有效登录会话，且不存在未决执行。若 `unknown_inflight = true`，应先用 `active_execution_correlation_id` 查询原任务，不要提交新的创建请求。
 ## 7. 配置 Hermes
 
 ```text

@@ -19,7 +19,7 @@ HEADERS = {
 }
 
 
-def make_client(tmp_path: Path, *, real_caller=None, fake_mode: bool = False) -> TestClient:
+def make_client(tmp_path: Path, *, real_caller=None, fake_mode: bool = False, login_checker=None) -> TestClient:
     db_path = tmp_path / "executor.db"
     initialize_database(db_path)
     settings = Settings(db_path=db_path, environment="TEST", auth_token="test-token", fake_mode=fake_mode)
@@ -42,7 +42,7 @@ def make_client(tmp_path: Path, *, real_caller=None, fake_mode: bool = False) ->
                 "row_data": {"ID": "12008", "长连接": "https://example.invalid/long", "应用链接": "https://example.invalid/short"},
             }
 
-    service = ExecutionService(settings, ExecutorStore(db_path), real_caller=real_caller)
+    service = ExecutionService(settings, ExecutorStore(db_path), real_caller=real_caller, login_checker=login_checker or (lambda: False))
     return TestClient(create_app(service))
 
 
@@ -110,15 +110,60 @@ def test_info_reports_real_mode(tmp_path: Path):
         "capabilities": ["get_info", "create_channel", "create_app", "query_execution"],
         "active_execution_correlation_id": None,
         "database_status": "AVAILABLE",
+        "status": "SUCCESS",
+        "acceptable": False,
+        "login_valid": False,
+        "unknown_inflight": False,
     }
 
 
 def test_info_reports_fake_mode(tmp_path: Path):
     with make_client(tmp_path, fake_mode=True) as client:
-        response = client.post("/v1/exec/info", headers=HEADERS)
+        response = client.post(
+            "/v1/exec/info",
+            headers=HEADERS,
+            json={"environment": "TEST", "run_id": "GATE-08-FAKE"},
+        )
 
     assert response.status_code == 200
     assert response.json()["mode"] == "FAKE"
+    assert response.json()["status"] == "SUCCESS"
+    assert response.json()["acceptable"] is True
+    assert response.json()["login_valid"] is True
+    assert response.json()["unknown_inflight"] is False
+
+
+def test_info_real_mode_uses_login_checker(tmp_path: Path):
+    with make_client(tmp_path, login_checker=lambda: True) as client:
+        response = client.post("/v1/exec/info", headers=HEADERS)
+
+    body = response.json()
+    assert body["mode"] == "REAL"
+    assert body["login_valid"] is True
+    assert body["acceptable"] is True
+
+
+def test_info_reports_inflight_execution_as_unacceptable(tmp_path: Path):
+    db_path = tmp_path / "executor.db"
+    initialize_database(db_path)
+    store = ExecutorStore(db_path)
+    record, should_run = store.reserve(
+        task_id="GATE-08-INFLIGHT",
+        operation="create_app",
+        environment="TEST",
+        idempotency_key="gate-08-inflight-key",
+        request_fingerprint="gate-08-inflight-fingerprint",
+        request={"task_id": "GATE-08-INFLIGHT"},
+    )
+    assert should_run is True
+
+    with make_client(tmp_path, fake_mode=True) as client:
+        response = client.post("/v1/exec/info", headers=HEADERS)
+
+    body = response.json()
+    assert body["active_execution_correlation_id"] == record["execution_id"]
+    assert body["unknown_inflight"] is True
+    assert body["acceptable"] is False
 
 
 def test_fake_mode_returns_receipts_without_calling_real_executor(tmp_path: Path):
