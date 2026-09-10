@@ -1,43 +1,23 @@
-# 139云应用平台自动配链接编排层
+# Hermes REAL Executor
 
-这是 FastAPI 编排层项目，负责解析和管理批次任务，并直接调用现有自动化执行端：
+This branch contains the dedicated FastAPI execution service for the Hermes and browser workstation.
 
-```text
-F:\卓望\配链接项目\codex\app\executor
-```
-
-## 启动
+## Start
 
 ```powershell
-cd F:\卓望\配链接项目\codex
 uv sync
-uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+uv run python -m app.http_executor.init_db
+uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
 ```
 
-## 当前接口
+The service exposes only the four Hermes POST endpoints under `/v1/exec`. It requires the bearer token and `X-Contract-Version: http-executor.v1` header described in the contract.
 
-- `GET /api/health`：编排层健康检查
-- `GET /api/status`：检查浏览器、登录、执行锁状态
-- `POST /api/login`：触发自动登录
-- `POST /api/channels`：创建渠道
-- `POST /api/apps`：同步创建应用
-- `POST /api/apps/async`：提交异步创建应用任务
-- `GET /api/jobs`：查看任务列表
-- `GET /api/jobs/{job_id}`：查看任务状态
-- `POST /api/jobs/{job_id}/cancel`：取消尚未执行的任务
-- `PATCH /api/apps`：修改应用
-- `POST /api/apps/locate`：定位历史应用
-- `GET /api/fields`：读取可修改字段列表
+## Documents
 
-## 说明
+- `contracts/HERMES_REAL_DEPLOYMENT.md`: deployment steps for the dedicated workstation.
+- `contracts/hermes-http-v1.md`: request and response contract, field mapping, status rules, and retry rules.
+- `contracts/CODEX_HERMES_HTTP_HANDOFF.md`: concise handoff for Hermes integration.
 
-- 现有执行端是同步阻塞调用，API 层已放入线程池执行，避免阻塞 FastAPI 事件循环。
-- 图片文件后续可放到 `data/files`，通过 `/files/...` 暴露给执行端上传。
-- SQLite 默认位置是 `data/orchestrator.sqlite3`。
+## Scope
 
-## 任务恢复
-
-- 任务状态、请求参数、执行阶段、重试次数和结果保存在 data/orchestrator.sqlite3 的 jobs 表。
-- 后端重启后，尚未开始的 QUEUED / WAITING 任务会按原顺序恢复排队。
-- 重启时仍为 RUNNING 的任务不会自动重跑，而是标记为 BACKEND_RESTARTED 失败并放行后续任务，避免重复创建应用。
-- 自动化运行中的阶段变化会持续同步到 SQLite，前端仍通过 /api/jobs/{job_id} 查询。
+The branch keeps the REAL HTTP executor, browser automation actions, configuration templates, and tests. The legacy 8000 frontend, MCP server, old orchestration entrypoint, job manager, and their documentation are excluded. They remain available on `archive/hermes-real-pre-prune`.
