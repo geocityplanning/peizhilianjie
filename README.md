@@ -1,10 +1,10 @@
 # Hermes REAL Executor
 
-This branch contains the dedicated FastAPI execution service for the Hermes and browser workstation.
+This branch contains the dedicated cross-platform FastAPI execution service for the Hermes and browser workstation (Windows and macOS).
 
 ## Start
 
-```powershell
+```text
 uv sync
 uv run python -m app.http_executor.init_db
 uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001

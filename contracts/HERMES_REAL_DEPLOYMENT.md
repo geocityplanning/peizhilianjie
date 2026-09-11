@@ -1,19 +1,25 @@
-# Hermes REAL 专用电脑部署说明
+# Hermes REAL 执行端跨平台部署说明
 
-适用环境：Hermes、FastAPI 执行端和浏览器运行在同一台 Windows 专用电脑。
+适用环境：Hermes、FastAPI 执行端和浏览器运行在同一台 Windows 或 macOS 专用电脑。
+
+HTTP 地址、端口、认证方式和四个 Hermes POST 接口在两个系统上完全一致：
+
+```text
+http://127.0.0.1:8001
+```
 
 ## 1. 拉取代码
 
-首次部署：
+Windows PowerShell 和 macOS Terminal 都可以执行：
 
-```powershell
+```text
 git clone -b feat/hermes-real-executor https://github.com/geocityplanning/peizhilianjie.git
 cd peizhilianjie
 ```
 
 已有仓库：
 
-```powershell
+```text
 git fetch origin
 git switch feat/hermes-real-executor
 git pull --ff-only
@@ -21,70 +27,144 @@ git pull --ff-only
 
 ## 2. 安装依赖
 
-电脑需安装 Git、uv，以及 Chrome 或 Edge。然后在仓库根目录执行：
+电脑需安装 Git、uv，以及 Chrome、Edge 或 Chromium。
+
+Windows：
 
 ```powershell
 uv sync
 ```
 
+macOS：
+
+```bash
+uv sync
+```
+
+项目使用 Python 跨平台浏览器守护器 `app/executor/browser_guard.py`，不要求 macOS 安装 PowerShell。Windows 仍保留旧的 `browser_guard.ps1`，但 REAL HTTP 执行路径不再依赖它。
+
 ## 3. 配置自动化登录
 
-创建本机配置：
+Windows：
 
 ```powershell
 Copy-Item app\executor\config.example.json app\executor\config.json
 ```
 
-生成一次 Fernet 密钥：
+macOS：
 
-```powershell
+```bash
+cp app/executor/config.example.json app/executor/config.json
+```
+
+生成一次 Fernet 密钥（两个系统命令相同）：
+
+```text
 uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-安全保存该密钥，并在当前 PowerShell 设置：
+Windows PowerShell 设置：
 
 ```powershell
 $env:AMOO_SECRET_KEY = "<刚生成的Fernet密钥>"
-$env:PYTHONPATH = (Resolve-Path app\executor).Path
+```
+
+macOS Terminal 设置：
+
+```bash
+export AMOO_SECRET_KEY='<刚生成的Fernet密钥>'
 ```
 
 加密登录密码：
+
+Windows：
 
 ```powershell
 uv run python app\executor\actions\ensure_login.py encrypt "<登录密码>"
 ```
 
-编辑 `app\executor\config.json`：
+macOS：
+
+```bash
+uv run python app/executor/actions/ensure_login.py encrypt '<登录密码>'
+```
+
+将输出的密文写入对应的 `app/executor/config.json`：
 
 - `username` 填登录账号。
-- `password_encrypted` 填上一步输出的密文。
+- `password_encrypted` 填加密密码。
 
 不要提交 `config.json`。以后启动服务必须继续使用同一个 `AMOO_SECRET_KEY`，不能重新生成。
 
-## 4. 初始化数据库
+## 4. 浏览器和 CDP
+
+REAL 执行端使用本机浏览器的 CDP `9222` 端口。每次真实创建前，Python 浏览器守护器会：
+
+1. 检查 `127.0.0.1:9222` 是否已可用。
+2. 如果不可用，按系统寻找 Chrome、Edge 或 Chromium 并启动。
+3. 使用独立的 `app/executor/browser-profile` 保存登录会话。
+4. 打开测试环境后台地址，并等待 139 页面可用。
+
+如浏览器安装在非默认路径，可手动配置：
+
+Windows PowerShell：
 
 ```powershell
+$env:HERMES_BROWSER_EXECUTABLE = "D:\Apps\Chrome\chrome.exe"
+$env:HERMES_BROWSER_PROFILE_DIR = "D:\hermes-browser-profile"
+```
+
+macOS：
+
+```bash
+export HERMES_BROWSER_EXECUTABLE="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+export HERMES_BROWSER_PROFILE_DIR="$HOME/hermes-browser-profile"
+```
+
+也可以设置自定义目标地址或 CDP 地址：
+
+```text
+HERMES_BROWSER_TARGET_URL=https://uat-cloud.139.com/cloudappadmin/#/cloudAppChannelManager
+HERMES_CDP_URL=http://127.0.0.1:9222
+```
+
+## 5. 初始化数据库
+
+Windows 和 macOS 命令相同：
+
+```text
 uv run python -m app.http_executor.init_db
 ```
 
 只需首次部署时执行一次。
 
-## 5. 启动 REAL 执行端
+## 6. 启动 REAL 执行端
 
-设置由 Hermes 和执行端共同约定的 Token：
+Windows PowerShell：
 
 ```powershell
 $env:HERMES_EXECUTOR_TOKEN = "<双方约定的Bearer Token>"
 $env:HERMES_EXECUTOR_ENV = "TEST"
-$env:AMOO_SECRET_KEY = "<第3步保存的Fernet密钥>"
+$env:HERMES_EXECUTOR_FAKE_MODE = "false"
 uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
 ```
 
-保持此 PowerShell 窗口和浏览器运行。
+macOS Terminal：
 
-## 5.1 Hermes 联调 FAKE 模式
+```bash
+export HERMES_EXECUTOR_TOKEN='<双方约定的Bearer Token>'
+export HERMES_EXECUTOR_ENV='TEST'
+export HERMES_EXECUTOR_FAKE_MODE='false'
+uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
+```
 
-联调时仍使用同一个 8001 和同一套四个接口，只将假跑开关打开。默认值是关闭，生产和真实验收必须保持关闭：
+REAL 模式不要设置为 `true`。Hermes、FastAPI 和浏览器必须运行在同一台电脑，Hermes 调用地址固定为 `127.0.0.1:8001`。
+
+## 7. FAKE 联调模式
+
+FAKE 仅用于联调，不执行网页自动化。Windows 和 macOS 只需设置相同的环境变量后启动：
+
+Windows PowerShell：
 
 ```powershell
 $env:HERMES_EXECUTOR_TOKEN = "<双方约定的Bearer Token>"
@@ -93,79 +173,77 @@ $env:HERMES_EXECUTOR_FAKE_MODE = "true"
 uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
 ```
 
-此时先调用 `POST /v1/exec/info`，确认返回 `mode = FAKE`。`create-channel` 和 `create-app` 会写入现有执行记录并返回契约形状的假成功回执，不启动浏览器，也不调用真实后台。测试结束后关闭该 PowerShell 窗口，或重新启动并设置：
+macOS Terminal：
 
-```powershell
-$env:HERMES_EXECUTOR_FAKE_MODE = "false"
+```bash
+export HERMES_EXECUTOR_TOKEN='<双方约定的Bearer Token>'
+export HERMES_EXECUTOR_ENV='TEST'
+export HERMES_EXECUTOR_FAKE_MODE='true'
+uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
 ```
 
-## 6. 验证服务
-
-另开一个 PowerShell：
-
-```powershell
-$token = "<双方约定的Bearer Token>"
-$headers = @{
-    Authorization = "Bearer $token"
-    "X-Contract-Version" = "http-executor.v1"
-}
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8001/v1/exec/info" -Headers $headers
-```
-
-成功结果应包含：
+FAKE 探活应返回：
 
 ```text
-service = hermes-real-executor
+mode = FAKE
+status = SUCCESS
+acceptable = true
+login_valid = true
+unknown_inflight = false
+```
+
+## 8. 探活和 REAL 验收
+
+另开一个终端调用：
+
+```bash
+curl -X POST http://127.0.0.1:8001/v1/exec/info \
+  -H "Authorization: Bearer <双方约定的Bearer Token>" \
+  -H "X-Contract-Version: http-executor.v1" \
+  -H "Content-Type: application/json" \
+  -d '{"environment":"TEST","run_id":"C2-INFO-001"}'
+```
+
+REAL 空闲且已登录时应包含：
+
+```text
 mode = REAL
 database_status = AVAILABLE
 status = SUCCESS
-acceptable = true/false（取决于 REAL 登录状态和是否有未决任务）
-login_valid = true（REAL 会话有效时）
-unknown_inflight = false（当前无未决任务时）
+login_valid = true
+unknown_inflight = false
+acceptable = true
 ```
 
-其中，`status = SUCCESS` 只表示执行端探活和数据库检查成功，不代表创建渠道或创建应用已经成功。`acceptable = true` 才表示当前可以接受新的创建请求；REAL 模式下还必须满足浏览器已有有效登录会话，且不存在未决执行。若 `unknown_inflight = true`，应先用 `active_execution_correlation_id` 查询原任务，不要提交新的创建请求。
-## 7. 配置 Hermes
+`status=SUCCESS` 只表示探活和数据库检查成功，不代表业务创建成功。`acceptable=true` 才表示当前可以接受新的创建任务。登录失效、数据库不可用或存在未决任务时不要创建。
+
+## 9. Hermes 调用顺序
 
 ```text
-Base URL: http://127.0.0.1:8001
-Authorization: Bearer <双方约定的Token>
-X-Contract-Version: http-executor.v1
-Content-Type: application/json
-```
-
-调用顺序：
-
-```text
+POST /v1/exec/info
 POST /v1/exec/create-channel
 POST /v1/exec/create-app
 POST /v1/exec/query
 ```
 
-`create-app` 的 `actual_channel_name` 必须使用 `create-channel` 返回的 `data.actual_channel_name`。超时、断线或返回 `UNKNOWN` 时调用 `query` 查询原任务，不能重新创建。
+`create-app` 的 `actual_channel_name` 必须使用 `create-channel` 返回的 `data.actual_channel_name`。
 
-请求字段见：
+超时、断线或返回 `UNKNOWN` 时，必须使用原 `execution_correlation_id` 调用 `query`，不能重新创建。
 
-```text
-contracts/examples/create-channel-request.json
-contracts/examples/create-app-request.json
-contracts/examples/query-request.json
-contracts/hermes-http-v1.openapi.yaml
-```
-
-## 8. 正式验收
+## 10. 正式验收
 
 使用带日期和“测试”后缀的唯一数据，依次执行：
 
 1. 一条云盘渠道和应用。
 2. 一条掌厅渠道和应用。
 
-每条应用的成功条件：
+创建应用成功最低条件：
 
 ```text
 state = SUCCEEDED
 status = SUCCESS
 data.app_id 有值
-data.app_link 有值
-data.completed_stages 包含 CREATE_SAVE、ENABLE、COMPLETED；传入非空 group_name 时还必须包含 SET_GROUP
+data.app_link 有值，且为 http:// 或 https:// 开头
 ```
+
+第一轮 C1/C2 真跑按双方冻结口径，以后台“长连接”对应的 `data.app_link` 为成功依据；不把短链接或 `completed_stages` 完整性作为第一轮最低成功门槛。

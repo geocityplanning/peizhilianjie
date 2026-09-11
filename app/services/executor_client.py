@@ -24,19 +24,12 @@ def _ensure_executor_path() -> None:
 
 
 def ensure_browser_guard() -> None:
-    guard = settings.automation_executor_path / "browser_guard.ps1"
+    guard = settings.automation_executor_path / "browser_guard.py"
     if not guard.exists():
-        raise RuntimeError(f"找不到浏览器守护脚本: {guard}")
+        raise RuntimeError(f"找不到跨平台浏览器守护脚本: {guard}")
 
     completed = subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(guard),
-        ],
+        [sys.executable, str(guard)],
         cwd=str(settings.automation_executor_path),
         capture_output=True,
         text=True,
