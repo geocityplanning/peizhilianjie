@@ -373,3 +373,42 @@ def test_hermes_executor_call_is_allowlisted(monkeypatch):
         assert "不允许调用" in str(exc)
     else:
         raise AssertionError("update_app must not be callable through Hermes HTTP")
+
+def test_orchestrator_settings_ignore_executor_environment_variables(tmp_path: Path):
+    from app.core.config import Settings as OrchestratorSettings
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "app_env=test\n"
+        "AMOO_SECRET_KEY=local-fernet-key\n"
+        "HERMES_EXECUTOR_TOKEN=local-hermes-token\n"
+        "HERMES_EXECUTOR_FAKE_MODE=false\n",
+        encoding="utf-8",
+    )
+
+    settings = OrchestratorSettings(_env_file=env_file)
+
+    assert settings.app_env == "test"
+    assert settings.automation_executor_path == Path("app/executor")
+
+
+def test_unknown_real_exception_is_redacted_from_receipt_and_database(tmp_path: Path):
+    secret = "AMOO_SECRET_KEY=do-not-leak-HERMES_EXECUTOR_TOKEN=also-secret"
+
+    def raising_caller(*args, **kwargs):
+        raise ValueError(f"pydantic validation failed input_value={secret!r}")
+
+    with make_client(tmp_path, real_caller=raising_caller) as client:
+        response = client.post("/v1/exec/create-channel", headers=HEADERS, json=channel_request("redaction-key"))
+
+    body = response.json()
+    execution_id = body["execution_correlation_id"]
+    stored = ExecutorStore(tmp_path / "executor.db").get_by_execution_id(execution_id)
+    serialized = json.dumps({"response": body, "stored": stored}, ensure_ascii=False)
+
+    assert response.status_code == 200
+    assert body["state"] == "UNKNOWN"
+    assert body["error"]["error_code"] == "REAL_EXECUTION_UNKNOWN"
+    assert body["error"]["message"] == "执行自动化异常，结果未知，请查询原任务"
+    assert secret not in serialized
+    assert "input_value" not in serialized

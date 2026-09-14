@@ -103,7 +103,10 @@ def create_app(service: ExecutionService) -> FastAPI:
             next_action="STOP",
             adjudicated=True,
         )
-        payload["error"]["details"] = exc.errors()
+        payload["error"]["details"] = [
+            {"loc": list(error.get("loc", [])), "type": error.get("type", "validation_error")}
+            for error in exc.errors()
+        ]
         return JSONResponse(status_code=400, content=payload)
 
     @app.exception_handler(DatabaseUnavailable)
@@ -115,7 +118,7 @@ def create_app(service: ExecutionService) -> FastAPI:
                 status="TECH_FAIL",
                 code="EXECUTOR_DATABASE_UNAVAILABLE",
                 stage="INIT",
-                message=str(exc),
+                message="执行端数据库不可用，请人工检查",
                 next_action="MANUAL_CHECK",
                 adjudicated=False,
             ),

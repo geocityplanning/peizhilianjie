@@ -95,6 +95,9 @@ uv run python app/executor/actions/ensure_login.py encrypt '<登录密码>'
 - `password_encrypted` 填加密密码。
 
 不要提交 `config.json`。以后启动服务必须继续使用同一个 `AMOO_SECRET_KEY`，不能重新生成。
+根目录 `.env` 可以同时放置 HTTP 执行端和自动化模块的环境变量，例如 `HERMES_EXECUTOR_TOKEN`、`HERMES_EXECUTOR_ENV`、`HERMES_EXECUTOR_FAKE_MODE`、`HERMES_EXECUTOR_DB` 和 `AMOO_SECRET_KEY`。配置类按自身字段分域读取，会忽略其他子系统的合法变量；不需要为了消除冲突删除这些启动变量。
+
+执行端发生未知异常时，只返回稳定错误码和脱敏说明，不会把 Bearer Token、Fernet 密钥、登录密码、密文或 Pydantic 原始 `input_value` 写入 HTTP 回执和 SQLite。
 
 ## 4. 浏览器和 CDP
 

@@ -145,7 +145,7 @@ class ExecutionService:
                 error={
                     "error_code": "FAKE_EXECUTION_ERROR",
                     "error_stage": "EXECUTE",
-                    "message": str(exc),
+                    "message": "执行自动化异常，结果未知，请查询原任务",
                     "next_action": "QUERY",
                 },
                 evidence_ref=[],
@@ -186,7 +186,7 @@ class ExecutionService:
                 error={
                     "error_code": "REAL_EXECUTION_UNKNOWN",
                     "error_stage": "EXECUTE",
-                    "message": str(exc),
+                    "message": "执行自动化异常，结果未知，请查询原任务",
                     "next_action": "QUERY",
                 },
                 evidence_ref=[],

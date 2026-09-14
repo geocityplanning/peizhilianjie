@@ -11,7 +11,11 @@ class Settings(BaseSettings):
     automation_executor_path: Path = Path("app/executor")
     static_files_dir: Path = Path("./data/files")
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     def resolve_from_project(self, path: Path) -> Path:
         if path.is_absolute():
