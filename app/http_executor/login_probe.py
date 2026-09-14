@@ -28,17 +28,35 @@ def _request_headers(token: str) -> dict[str, str]:
     }
 
 
+HEARTBEAT_TIMEOUT_MS = 10_000
+
+
 def _heartbeat(page: Any, token: str) -> bool:
     result = page.evaluate(
         """
-        async ({path, headers, body}) => {
-          const response = await fetch(path, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(body),
-            credentials: 'include'
-          });
-          return {status: response.status, json: await response.json()};
+        async ({path, headers, body, timeoutMs}) => {
+          const controller = new AbortController();
+          const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const response = await fetch(path, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify(body),
+              credentials: 'include',
+              signal: controller.signal
+            });
+            let json = null;
+            try {
+              json = await response.json();
+            } catch (_) {
+              json = null;
+            }
+            return {status: response.status, json};
+          } catch (_) {
+            return {status: 0, json: null};
+          } finally {
+            clearTimeout(timeoutHandle);
+          }
         }
         """,
         {
@@ -53,11 +71,11 @@ def _heartbeat(page: Any, token: str) -> bool:
                 "startTime": None,
                 "endTime": None,
             },
+            "timeoutMs": HEARTBEAT_TIMEOUT_MS,
         },
     )
     header = (result.get("json") or {}).get("header") or {}
     return result.get("status") == 200 and str(header.get("status")) == "200"
-
 
 def probe_real_login(cdp_url: str = CDP_URL) -> bool:
     """Check an existing 139 browser session without launching or creating a page."""

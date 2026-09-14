@@ -40,6 +40,7 @@ Content-Type: application/json
 - FAKE 模式的 `login_valid` 固定为 `true`；REAL 模式会检查已运行的 139 浏览器会话和只读渠道列表探测，不会自动启动浏览器或执行登录。
 - `unknown_inflight=true` 表示 `active_execution_correlation_id` 有值，此时 `acceptable` 必须为 `false`。
 - `info` 请求体可以带 `environment`、`run_id`，执行端不因这两个字段返回 400。
+- REAL 登录心跳使用有限超时（约 10 秒）；超时、网络异常或响应解析异常均按登录不可确认处理，返回 HTTP 200、`login_valid=false`、`acceptable=false`，不会让 `info` 无限等待。
 ## 调用顺序
 
 
