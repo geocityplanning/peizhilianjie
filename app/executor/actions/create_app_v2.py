@@ -637,11 +637,155 @@ def _click_next_page_and_wait(page):
     return True
 
 
-def _search_list_by_channel(page, channel_name):
+class _ListRequestObserver(list):
+    """记录列表请求的观察结果，并持有 CDP 会话引用避免被回收。"""
+
+    keepalive = None
+
+
+# 后台列表接口的实际路径是 /backend/cloudTrial/appInfo/getAppInfoList，
+# 不含 getList；只匹配 getList 会把真实请求全部漏掉。
+_LIST_URL_MARKERS = ("getAppInfoList", "getList")
+
+
+def _is_list_request_url(url):
+    raw = url or ""
+    if any(marker in raw for marker in _LIST_URL_MARKERS):
+        return True
+    return "/backend/" in raw and raw.split("?")[0].endswith("List")
+
+
+def _detach_list_response_observer(observations):
+    """用完即释放 CDP 会话，避免长时间占用调试通道。"""
+    sidecar = getattr(observations, "keepalive", None)
+    detach = getattr(sidecar, "detach", None)
+    if callable(detach):
+        try:
+            detach()
+        except Exception:
+            pass
+    if observations is not None:
+        try:
+            observations.keepalive = None
+        except Exception:
+            pass
+
+
+def _attach_list_response_observer(page):
+    """只读网络观察器：列表类请求是否发出、HTTP 状态。
+
+    只记录"是否发出请求"和 HTTP 状态码，不保留 URL 参数、请求体、响应正文
+    或任何会话信息，符合只读定位自证的口径。
+
+    通过 CDP 接入的既有页面上，显式开一个 CDP 会话并启用 Network 域最可靠；
+    失败再退回 Playwright 页面事件监听。两者都不可用时返回 None，调用方据此
+    给出"未观察到请求"而不是失败。
+    """
+    observations = _ListRequestObserver()
+    request_urls = {}
+
+    def _record(url, status):
+        try:
+            if not _is_list_request_url(url):
+                return
+            observations.append(int(status or 0))
+        except Exception:
+            pass
+
+    try:
+        session = page.context.new_cdp_session(page)
+        session.send("Network.enable")
+
+        def _on_request(params):
+            try:
+                data = params or {}
+                request_urls[data.get("requestId")] = (data.get("request") or {}).get("url")
+            except Exception:
+                pass
+
+        def _on_response(params):
+            try:
+                response = (params or {}).get("response") or {}
+                _record(response.get("url"), response.get("status"))
+            except Exception:
+                pass
+
+        def _on_failed(params):
+            try:
+                data = params or {}
+                _record(request_urls.get(data.get("requestId")), 0)
+            except Exception:
+                pass
+
+        session.on("Network.requestWillBeSent", _on_request)
+        session.on("Network.responseReceived", _on_response)
+        session.on("Network.loadingFailed", _on_failed)
+        observations.keepalive = session
+        return observations
+    except Exception:
+        pass
+
+    try:
+        def _on_response(response):
+            _record(getattr(response, "url", ""), getattr(response, "status", 0))
+
+        def _on_request_failed(request):
+            _record(getattr(request, "url", ""), 0)
+
+        page.on("response", _on_response)
+        page.on("requestfailed", _on_request_failed)
+    except Exception:
+        return None
+    return observations
+
+
+def _dismiss_stray_dropdowns(page):
+    """用"点击外部"这个官方关闭路径收起残留下拉。
+
+    不要直接改 style：那样会让 Element UI 内部的 visible 与 DOM 失步，
+    下一次点 select 反而把下拉关掉，表现为"选了但列表没反应"。
+    """
+    try:
+        page.evaluate("""() => {
+          const event = new MouseEvent('click', {bubbles: true});
+          document.dispatchEvent(event);
+          document.body.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+          return true;
+        }""")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+
+def _search_list_by_channel(page, channel_name, return_detail=False):
     """Select an exact channel in the list filter and verify the table refresh."""
     _reset_list_filters(page)
     previous_state = _read_pagination_state(page)
-    opened = page.evaluate("""
+    detail = {
+        "reset": True,
+        "opened": False,
+        "selected": False,
+        "verify": False,
+        "search_clicked": False,
+        "search_scope": None,
+        "filter_stable": False,
+        "list_requests_before": None,
+        "list_requests_after": None,
+        "last_http_status": None,
+        "elapsed_ms": None,
+        "previous_row_count": previous_state.get("row_count"),
+        "final_row_count": None,
+        "table_changed": False,
+        "reader_sees_target_channel": None,
+        "reader_distinct_channels": None,
+    }
+    opened = None
+    selected = None
+    # 有界重试：只重试"展开下拉 / 选中选项"这两步。上一次调用可能残留一个已
+    # 展开的下拉，本次点击会被 Element UI 当成"再次点击"而收起，表现为
+    # "选中值看着对、点搜索却没反应"。重试不改变任何匹配与稳定判定门槛。
+    for attempt in range(2):
+        opened = page.evaluate("""
     (channelName) => {
       const selects = Array.from(document.querySelectorAll('.el-select'))
         .filter(select => select.offsetParent !== null &&
@@ -678,11 +822,13 @@ def _search_list_by_channel(page, channel_name):
       return {opened: true, select_index: targetIndex};
     }
     """, channel_name)
-    if not opened or not opened.get("opened"):
-        return False
+        if not opened or not opened.get("opened"):
+            _dismiss_stray_dropdowns(page)
+            continue
+        detail["opened"] = True
 
-    page.wait_for_timeout(300)
-    selected = page.evaluate("""
+        page.wait_for_timeout(300)
+        selected = page.evaluate("""
     (channelName) => {
       const dropdowns = Array.from(document.querySelectorAll('.el-select-dropdown'))
         .filter(dropdown => dropdown.offsetParent !== null && dropdown.style.display !== 'none');
@@ -697,8 +843,18 @@ def _search_list_by_channel(page, channel_name):
       return {selected: true};
     }
     """, channel_name)
+        if not selected or not selected.get("selected"):
+            detail.update(selected or {})
+            _dismiss_stray_dropdowns(page)
+            continue
+        break
+
+    if not opened or not opened.get("opened"):
+        detail.update(opened or {})
+        return detail if return_detail else False
     if not selected or not selected.get("selected"):
-        return False
+        return detail if return_detail else False
+    detail["selected"] = True
 
     page.wait_for_timeout(300)
     verified = page.evaluate("""
@@ -715,20 +871,97 @@ def _search_list_by_channel(page, channel_name):
     }
     """, {"channelName": channel_name, "selectIndex": opened.get("select_index")})
     if not verified:
-        return False
+        return detail if return_detail else False
+    detail["verify"] = True
 
-    clicked = page.evaluate("""() => {
+    # 观察器只在"点搜索"这一步打开，用完即释放，少占用一条 CDP 通道。
+    observations = _attach_list_response_observer(page)
+    if observations is not None:
+        detail["list_requests_before"] = len(observations)
+    click_result = page.evaluate("""
+    () => {
+      // 页面上可能有多个"搜索"（列表筛选、其它工具栏、卡片内）。点错按钮会
+      // 出现"渠道已选中但列表没有刷新"的假象，因此优先点与渠道筛选同一表单
+      // 容器内的那个；容器内没有时再退回全页第一个可见"搜索"，保持原行为。
+      const selects = Array.from(document.querySelectorAll('.el-select'))
+        .filter(select => select.offsetParent !== null &&
+          !select.closest('.el-dialog, .el-dialog__wrapper'));
+      const channelSelect = selects.find(select => {
+        const item = select.closest('.el-form-item');
+        const label = item && item.querySelector('.el-form-item__label');
+        const input = select.querySelector('input');
+        const metadata = input
+          ? `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}`
+          : '';
+        return /渠道/.test(metadata) || Boolean(label && /渠道/.test(label.innerText || ''));
+      });
+
+      const containers = [];
+      if (channelSelect) {
+        const form = channelSelect.closest('.el-form');
+        const item = channelSelect.closest('.el-form-item');
+        containers.push(form);
+        containers.push(item && item.parentElement);
+        containers.push(channelSelect.parentElement && channelSelect.parentElement.parentElement);
+      }
+      for (const container of containers) {
+        if (!container) continue;
+        for (const button of container.querySelectorAll('button')) {
+          if (button.offsetParent === null) continue;
+          const label = (button.innerText || '').replace(/\\s/g, '').trim();
+          if (label === '搜索') { button.click(); return {clicked: true, scope: 'channel-form'}; }
+        }
+      }
+
       const buttons = document.querySelectorAll('button');
       for (const button of buttons) {
         if (button.offsetParent === null) continue;
         const label = (button.innerText || '').replace(/\\s/g, '').trim();
-        if (label === '搜索') { button.click(); return true; }
+        if (label === '搜索') { button.click(); return {clicked: true, scope: 'global'}; }
       }
-      return false;
-    }""")
-    if not clicked:
-        return False
-    return wait_for_table_update(page, previous_state, _read_pagination_state)
+      return {clicked: false, scope: 'none'};
+    }
+    """)
+    clicked_ok = (
+        click_result.get("clicked")
+        if isinstance(click_result, dict)
+        else bool(click_result)
+    )
+    if not clicked_ok:
+        _detach_list_response_observer(observations)
+        return detail if return_detail else False
+    detail["search_clicked"] = True
+    detail["search_scope"] = click_result.get("scope") if isinstance(click_result, dict) else None
+
+    started = time.monotonic()
+    stable = wait_for_table_update(page, previous_state, _read_pagination_state)
+    detail["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+    detail["filter_stable"] = bool(stable)
+
+    final_state = _read_pagination_state(page)
+    detail["final_row_count"] = final_state.get("row_count")
+    detail["table_changed"] = (
+        final_state.get("table_signature") != previous_state.get("table_signature")
+    )
+    try:
+        visible_rows = _read_current_page_app_rows(page)
+        detail["reader_row_count"] = len(visible_rows)
+        detail["reader_sees_target_channel"] = any(
+            row.get("channel_name") == channel_name for row in visible_rows
+        )
+        detail["reader_distinct_channels"] = len(
+            {row.get("channel_name") for row in visible_rows}
+        )
+    except Exception:
+        pass
+    if observations is not None:
+        detail["list_requests_after"] = len(observations)
+        if len(observations) > detail.get("list_requests_before", 0):
+            detail["last_http_status"] = observations[-1]
+    _detach_list_response_observer(observations)
+    if not stable:
+        print(f"[create_app] 渠道筛选未稳定: {detail}")
+    return detail if return_detail else bool(stable)
 
 
 def _read_current_page_app_rows(page):
@@ -839,7 +1072,10 @@ def _identify_new_app(page, before_ids, actual_channel_name, app_name):
 
     # Narrow the post-save lookup by channel and app name first. Exact ID
     # difference and channel verification remain the identity/safety checks.
-    if _search_list_by_channel(page, actual_channel_name):
+    channel_filter = _search_list_by_channel(page, actual_channel_name, return_detail=True)
+    if isinstance(channel_filter, dict) and not channel_filter.get("filter_stable"):
+        print(f"[create_app] 渠道筛选未生效，回退全量扫描: {channel_filter}")
+    if channel_filter is True or (isinstance(channel_filter, dict) and channel_filter.get("filter_stable")):
         filtered_rows = _collect_all_app_rows(page, reset_filters=False)
         if filtered_rows is None:
             return {
