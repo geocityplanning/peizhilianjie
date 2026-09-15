@@ -48,3 +48,37 @@ def wait_for_page_change(
             return True
 
     return False
+
+
+def wait_for_table_update(
+    page,
+    previous_state,
+    read_state,
+    timeout_ms=6000,
+    poll_interval_ms=250,
+):
+    """Wait for a changed table signature to remain stable after a filter/search."""
+    previous_table = previous_state.get("table_signature")
+    stable_candidate = None
+    stable_reads = 0
+    polls = max(1, math.ceil(timeout_ms / poll_interval_ms))
+
+    for _ in range(polls):
+        page.wait_for_timeout(poll_interval_ms)
+        current = read_state(page)
+        table_signature = current.get("table_signature")
+        if table_signature == previous_table or current.get("row_count", 0) <= 0:
+            stable_candidate = None
+            stable_reads = 0
+            continue
+
+        candidate = (table_signature, current.get("row_count", 0))
+        if candidate == stable_candidate:
+            stable_reads += 1
+        else:
+            stable_candidate = candidate
+            stable_reads = 1
+        if stable_reads >= 2:
+            return True
+
+    return False

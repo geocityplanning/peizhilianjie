@@ -16,7 +16,7 @@ from core.error_codes import err, NEXT_STOP, NEXT_QUERY, NEXT_MANUAL
 from core import executor as ex
 from actions.ensure_login import ensure_login
 from actions.link_utils import extract_cloud_app_key
-from actions.pagination import wait_for_page_change
+from actions.pagination import wait_for_page_change, wait_for_table_update
 
 OPERATION = "CREATE_APP"
 BASE_URL_H5 = "https://uat-cloud.139.com/cloudappadmin/#/cloudAppManager"
@@ -638,36 +638,85 @@ def _click_next_page_and_wait(page):
 
 
 def _search_list_by_channel(page, channel_name):
-    """Use an editable channel filter when it can be identified unambiguously."""
+    """Select an exact channel in the list filter and verify the table refresh."""
     _reset_list_filters(page)
-    filled = page.evaluate("""
+    previous_state = _read_pagination_state(page)
+    opened = page.evaluate("""
     (channelName) => {
-      const inputs = Array.from(document.querySelectorAll('input.el-input__inner'))
-        .filter(input => input.offsetParent !== null &&
-          !input.readOnly && !input.disabled &&
-          (!input.type || input.type === 'text') &&
-          !input.closest('.el-dialog, .el-dialog__wrapper'));
-      const channelInputs = inputs.filter(input => {
-        const metadata = `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}`;
-        const item = input.closest('.el-form-item');
+      const selects = Array.from(document.querySelectorAll('.el-select'))
+        .filter(select => select.offsetParent !== null &&
+          !select.closest('.el-dialog, .el-dialog__wrapper'));
+      const labeled = selects.filter(select => {
+        const item = select.closest('.el-form-item');
         const label = item && item.querySelector('.el-form-item__label');
+        const input = select.querySelector('input');
+        const metadata = input
+          ? `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}`
+          : '';
         return /渠道/.test(metadata) || Boolean(label && /渠道/.test(label.innerText || ''));
       });
-      const target = channelInputs.length === 1
-        ? channelInputs[0]
-        : (channelInputs.length === 0 && inputs.length === 1 ? inputs[0] : null);
-      if (!target) return {filled: false, editable_count: inputs.length, channel_count: channelInputs.length};
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-      setter.call(target, channelName);
-      target.dispatchEvent(new Event('input', {bubbles: true}));
-      target.dispatchEvent(new Event('change', {bubbles: true}));
-      return {filled: target.value === channelName};
+      const editableSelects = selects.filter(select => select.querySelector('input.el-select__input'));
+      const candidates = labeled.length === 1 ? labeled : (labeled.length === 0 ? editableSelects : []);
+      if (candidates.length !== 1) {
+        return {opened: false, labeled_count: labeled.length, candidate_count: candidates.length};
+      }
+
+      const target = candidates[0];
+      const targetIndex = selects.indexOf(target);
+      const visibleInput = target.querySelector('input.el-select__input') ||
+        target.querySelector('input.el-input__inner');
+      if (!visibleInput || visibleInput.disabled) return {opened: false};
+      visibleInput.click();
+
+      const searchInput = target.querySelector('input.el-select__input');
+      if (searchInput && !searchInput.readOnly) {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(searchInput, channelName);
+        searchInput.dispatchEvent(new Event('input', {bubbles: true}));
+        searchInput.dispatchEvent(new Event('change', {bubbles: true}));
+      }
+      return {opened: true, select_index: targetIndex};
     }
     """, channel_name)
-    if not filled or not filled.get("filled"):
+    if not opened or not opened.get("opened"):
         return False
 
-    page.wait_for_timeout(250)
+    page.wait_for_timeout(300)
+    selected = page.evaluate("""
+    (channelName) => {
+      const dropdowns = Array.from(document.querySelectorAll('.el-select-dropdown'))
+        .filter(dropdown => dropdown.offsetParent !== null && dropdown.style.display !== 'none');
+      if (dropdowns.length !== 1) return {selected: false, visible_dropdown_count: dropdowns.length};
+      const options = dropdowns.flatMap(dropdown =>
+        Array.from(dropdown.querySelectorAll('.el-select-dropdown__item'))
+          .filter(option => option.offsetParent !== null && !option.className.includes('is-disabled'))
+          .filter(option => (option.innerText || '').trim() === channelName)
+      );
+      if (options.length !== 1) return {selected: false, exact_option_count: options.length};
+      options[0].click();
+      return {selected: true};
+    }
+    """, channel_name)
+    if not selected or not selected.get("selected"):
+        return False
+
+    page.wait_for_timeout(300)
+    verified = page.evaluate("""
+    ({channelName, selectIndex}) => {
+      const selects = Array.from(document.querySelectorAll('.el-select'))
+        .filter(select => select.offsetParent !== null &&
+          !select.closest('.el-dialog, .el-dialog__wrapper'));
+      const target = selects[selectIndex];
+      if (!target) return false;
+      const input = target.querySelector('input.el-input__inner');
+      const tags = Array.from(target.querySelectorAll('.el-tag__content, .el-select__tags-text'))
+        .map(tag => (tag.innerText || '').trim());
+      return Boolean((input && (input.value || '').trim() === channelName) || tags.includes(channelName));
+    }
+    """, {"channelName": channel_name, "selectIndex": opened.get("select_index")})
+    if not verified:
+        return False
+
     clicked = page.evaluate("""() => {
       const buttons = document.querySelectorAll('button');
       for (const button of buttons) {
@@ -679,8 +728,7 @@ def _search_list_by_channel(page, channel_name):
     }""")
     if not clicked:
         return False
-    page.wait_for_timeout(800)
-    return True
+    return wait_for_table_update(page, previous_state, _read_pagination_state)
 
 
 def _read_current_page_app_rows(page):

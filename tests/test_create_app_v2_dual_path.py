@@ -202,10 +202,15 @@ def test_post_save_channel_search_skips_readonly_select_inputs():
     tree = ast.parse(src)
     search = _function(tree, "_search_list_by_channel")
     search_src = ast.get_source_segment(src, search) or ""
-    assert "!input.readOnly" in search_src
-    assert "!input.disabled" in search_src
+    assert "input.el-select__input" in search_src
+    assert "input.el-input__inner" in search_src
+    assert "searchInput.readOnly" in search_src
+    assert "visibleInput.disabled" in search_src
     assert "_reset_list_filters(page)" in search_src
     assert "label === '搜索'" in search_src
+    assert "el-select-dropdown__item" in search_src
+    assert "visible_dropdown_count" in search_src
+    assert "wait_for_table_update" in search_src
 
 
 def test_post_save_fast_path_still_requires_exact_identity_fields():

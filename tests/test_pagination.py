@@ -1,4 +1,4 @@
-from app.executor.actions.pagination import wait_for_page_change
+from app.executor.actions.pagination import wait_for_page_change, wait_for_table_update
 
 
 class FakePage:
@@ -61,3 +61,36 @@ def test_previous_page_transition_requires_page_and_table_change():
     assert wait_for_page_change(
         page, state(3, "C"), -1, read_state, timeout_ms=1000, poll_interval_ms=1
     ) is True
+
+
+def test_table_update_requires_changed_nonempty_rows_to_stabilize():
+    page = FakePage([
+        state(1, "A"),
+        state(1, "B"),
+        state(1, "B"),
+    ])
+    assert wait_for_table_update(
+        page, state(1, "A"), read_state, timeout_ms=1000, poll_interval_ms=1
+    ) is True
+
+
+def test_table_update_rejects_unchanged_or_empty_result():
+    page = FakePage([
+        state(1, "A"),
+        state(1, "B", row_count=0),
+        state(1, "B", row_count=0),
+    ])
+    assert wait_for_table_update(
+        page, state(1, "A"), read_state, timeout_ms=5, poll_interval_ms=1
+    ) is False
+
+
+def test_table_update_does_not_accept_page_number_change_alone():
+    page = FakePage([
+        state(1, "A"),
+        state(2, "A"),
+        state(2, "A"),
+    ])
+    assert wait_for_table_update(
+        page, state(1, "A"), read_state, timeout_ms=5, poll_interval_ms=1
+    ) is False
