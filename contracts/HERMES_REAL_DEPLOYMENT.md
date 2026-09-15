@@ -219,7 +219,7 @@ acceptable = true
 ```
 
 `status=SUCCESS` 只表示探活和数据库检查成功，不代表业务创建成功。`acceptable=true` 才表示当前可以接受新的创建任务。登录失效、数据库不可用或存在未决任务时不要创建。
-REAL 登录心跳有约 10 秒的有限超时。浏览器接口挂起、网络异常或响应解析失败时，`info` 会安全返回 `login_valid=false`、`acceptable=false`，不会无限等待。
+REAL 登录探活有约 10 秒的端到端总预算，覆盖 Playwright 启动、CDP 连接、页面 Token 读取和心跳请求。浏览器接口挂起、网络异常或响应解析失败时，`info` 会安全返回 `login_valid=false`、`acceptable=false`，不会无限等待。
 
 ## 9. Hermes 调用顺序
 
