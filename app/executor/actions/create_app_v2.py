@@ -637,6 +637,52 @@ def _click_next_page_and_wait(page):
     return True
 
 
+def _search_list_by_channel(page, channel_name):
+    """Use an editable channel filter when it can be identified unambiguously."""
+    _reset_list_filters(page)
+    filled = page.evaluate("""
+    (channelName) => {
+      const inputs = Array.from(document.querySelectorAll('input.el-input__inner'))
+        .filter(input => input.offsetParent !== null &&
+          !input.readOnly && !input.disabled &&
+          (!input.type || input.type === 'text') &&
+          !input.closest('.el-dialog, .el-dialog__wrapper'));
+      const channelInputs = inputs.filter(input => {
+        const metadata = `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}`;
+        const item = input.closest('.el-form-item');
+        const label = item && item.querySelector('.el-form-item__label');
+        return /渠道/.test(metadata) || Boolean(label && /渠道/.test(label.innerText || ''));
+      });
+      const target = channelInputs.length === 1
+        ? channelInputs[0]
+        : (channelInputs.length === 0 && inputs.length === 1 ? inputs[0] : null);
+      if (!target) return {filled: false, editable_count: inputs.length, channel_count: channelInputs.length};
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(target, channelName);
+      target.dispatchEvent(new Event('input', {bubbles: true}));
+      target.dispatchEvent(new Event('change', {bubbles: true}));
+      return {filled: target.value === channelName};
+    }
+    """, channel_name)
+    if not filled or not filled.get("filled"):
+        return False
+
+    page.wait_for_timeout(250)
+    clicked = page.evaluate("""() => {
+      const buttons = document.querySelectorAll('button');
+      for (const button of buttons) {
+        if (button.offsetParent === null) continue;
+        const label = (button.innerText || '').replace(/\\s/g, '').trim();
+        if (label === '搜索') { button.click(); return true; }
+      }
+      return false;
+    }""")
+    if not clicked:
+        return False
+    page.wait_for_timeout(800)
+    return True
+
+
 def _read_current_page_app_rows(page):
     return page.evaluate("""() => {
       const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
@@ -675,26 +721,33 @@ def _read_current_page_app_rows(page):
         if (row.offsetParent === null) continue;
         const cells = Array.from(row.querySelectorAll('td'));
         let appId = '';
+        let appName = '';
+        let channelName = '';
         for (let i = 0; i < cells.length && i < headers.length; i++) {
           const header = headers[i];
           if (header === 'ID' || header.includes('应用ID')) {
             appId = (cells[i].textContent || '').trim();
-            break;
           }
+          if (/应用名称|应用名/.test(header)) appName = (cells[i].textContent || '').trim();
+          if (/渠道/.test(header)) channelName = (cells[i].textContent || '').trim();
         }
+        const detail = expandedRowFor(row);
         if (!appId) {
-          const detail = expandedRowFor(row);
           appId = labeledValue(detail, /^(应用)?ID$/i);
           if (!appId && detail) {
             const match = (detail.textContent || '').match(/(?:应用)?ID\\s*[:：]\\s*([A-Za-z0-9_-]+)/i);
             appId = match ? match[1] : '';
           }
         }
+        if (!appName) appName = labeledValue(detail, /^应用(名称|名)?$/);
+        if (!channelName) channelName = labeledValue(detail, /^(所属)?渠道(名称)?$/);
         if (!appId) continue;
         result.push({
           app_id: appId,
           row_idx: rowIdx,
-          row_text: (row.textContent || '').trim()
+          row_text: (row.textContent || '').trim(),
+          app_name: appName,
+          channel_name: channelName
         });
       }
       return result;
@@ -732,9 +785,43 @@ def _collect_all_app_rows(page, reset_filters=False):
     return records
 
 
-def _identify_new_app(page, before_ids, actual_channel_name):
+def _identify_new_app(page, before_ids, actual_channel_name, app_name):
     """Find the row created by this save using an ID set difference."""
     last_candidates = []
+
+    # Narrow the post-save lookup by channel and app name first. Exact ID
+    # difference and channel verification remain the identity/safety checks.
+    if _search_list_by_channel(page, actual_channel_name):
+        filtered_rows = _collect_all_app_rows(page, reset_filters=False)
+        if filtered_rows is None:
+            return {
+                "success": False,
+                "error": err(
+                    "APP_ID_SNAPSHOT_FAILED",
+                    "VERIFY",
+                    "渠道筛选后的应用列表分页未稳定，不能安全识别新增应用ID",
+                    NEXT_MANUAL,
+                ),
+            }
+        fast_candidates = [
+            row for app_id, row in filtered_rows.items()
+            if app_id not in before_ids
+            and row.get("app_name") == app_name
+            and row.get("channel_name") == actual_channel_name
+        ]
+        if len(fast_candidates) == 1:
+            return {"success": True, "app_id": fast_candidates[0]["app_id"]}
+        if len(fast_candidates) > 1:
+            return {
+                "success": False,
+                "error": err(
+                    "NEW_APP_ID_AMBIGUOUS",
+                    "VERIFY",
+                    "按渠道和应用名筛选后仍有多个新增应用ID，停止自动选择",
+                    NEXT_MANUAL,
+                ),
+            }
+
     for attempt in range(5):
         after_rows = _collect_all_app_rows(page, reset_filters=True)
         if after_rows is None:
@@ -944,13 +1031,23 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
     _set_stage(execution_id, "正在填写体验配置")
     if not _go_tab(page, "体验配置"):
         return {"success": False, "error": err("TAB_SWITCH_FAILED", "FILL", f"无法切换到体验配置Tab", NEXT_MANUAL)}
-    if not _js_fill(page, "应用名称", app_name):
+    app_name_filled = _js_fill(page, "应用名称", app_name)
+    if not app_name_filled:
         print("[create_app] WARN: 应用名称 填写失败")
+    else:
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(300)
     _bp = data.get("base_platform", "")
     if _bp:
         _js_select(page, "底座", _bp)
-    if not _js_channel_popover(page, "所属渠道", data["actual_channel_name"]):
+    channel_selected = _js_channel_popover(page, "所属渠道", data["actual_channel_name"])
+    if not channel_selected:
+        channel_selected = _js_channel_popover(page, "渠道", data["actual_channel_name"])
+    if not channel_selected:
         print(f"[create_app] WARN: 所属渠道 选择失败")
+    else:
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(300)
     page.wait_for_timeout(500)
     page.evaluate("""() => {
       const pops = document.querySelectorAll('.el-popover, .el-popper, [id^="el-popover-"]');
@@ -1058,7 +1155,7 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
         pass
 
     _set_stage(execution_id, "正在识别新增应用ID")
-    identified = _identify_new_app(page, before_ids, data["actual_channel_name"])
+    identified = _identify_new_app(page, before_ids, data["actual_channel_name"], app_name)
     if not identified["success"]:
         return identified
     target_app_id = identified["app_id"]

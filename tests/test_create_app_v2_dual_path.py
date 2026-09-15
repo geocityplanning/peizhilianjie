@@ -195,3 +195,26 @@ def test_target_relocation_checks_expanded_detail_separately():
     assert "channelIndex" in locate_src
     assert "detailChannel" in locate_src
     assert "channelValue === expectedChannel" in locate_src
+
+
+def test_post_save_channel_search_skips_readonly_select_inputs():
+    src = _source()
+    tree = ast.parse(src)
+    search = _function(tree, "_search_list_by_channel")
+    search_src = ast.get_source_segment(src, search) or ""
+    assert "!input.readOnly" in search_src
+    assert "!input.disabled" in search_src
+    assert "_reset_list_filters(page)" in search_src
+    assert "label === '搜索'" in search_src
+
+
+def test_post_save_fast_path_still_requires_exact_identity_fields():
+    src = _source()
+    tree = ast.parse(src)
+    identify = _function(tree, "_identify_new_app")
+    identify_src = ast.get_source_segment(src, identify) or ""
+    assert "_search_list_by_channel" in identify_src
+    assert "app_id not in before_ids" in identify_src
+    assert "row.get(\"app_name\") == app_name" in identify_src
+    assert "row.get(\"channel_name\") == actual_channel_name" in identify_src
+    assert "_collect_all_app_rows(page, reset_filters=True)" in identify_src
