@@ -521,23 +521,9 @@ def _locate_by_app_id(page, ref_app_id):
             print(f"[create_app] 兜底结果：成功 (page={_page_num+1}, row_idx={found.get('row_idx')})")
             return {"clicked": True, "error": None}
 
-        # 检查是否有下一页
-        has_next = page.evaluate("""
-        () => {
-          const next = document.querySelector('.el-pagination .btn-next');
-          if (!next) return false;
-          return !next.className.includes('disabled');
-        }
-        """)
-        if not has_next:
+        # 翻页前记录当前内容，确认下一页真实渲染后再继续匹配。
+        if not _click_next_page_and_wait(page):
             break
-
-        # 翻到下一页
-        page.evaluate("""() => {
-          const next = document.querySelector('.el-pagination .btn-next');
-          if (next) next.click();
-        }""")
-        page.wait_for_timeout(2000)
 
     print(f"[create_app] 兜底结果：失败 (app_id={ref_app_id} 在所有页都未找到)")
     return {"clicked": False, "error": "COPY_FAILED"}
@@ -571,6 +557,7 @@ def _reset_list_filters(page):
 
 def _go_to_first_page(page):
     for _ in range(50):
+        previous_signature = _page_signature(page)
         moved = page.evaluate("""() => {
           const prev = document.querySelector('.el-pagination .btn-prev');
           if (!prev || prev.disabled || prev.className.includes('disabled')) return false;
@@ -579,7 +566,9 @@ def _go_to_first_page(page):
         }""")
         if not moved:
             break
-        page.wait_for_timeout(500)
+        if not _wait_for_page_change(page, previous_signature):
+            print("[create_app] 返回第一页时页面未稳定，停止继续翻页")
+            break
 
 
 def _expand_visible_rows(page):
@@ -597,6 +586,59 @@ def _expand_visible_rows(page):
     }""")
     if expanded:
         page.wait_for_timeout(600)
+
+
+def _page_signature(page):
+    """Return a lightweight signature for the currently rendered page."""
+    return page.evaluate("""() => {
+      const active = document.querySelector('.el-pagination .el-pager li.active');
+      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
+      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const rowText = Array.from(rows)
+        .filter(row => row.offsetParent !== null)
+        .map(row => (row.textContent || '').trim())
+        .join('||');
+      return `${active ? active.innerText.trim() : '1'}|${rowText}`;
+    }""")
+
+
+def _wait_for_page_change(page, previous_signature, timeout_ms=6000):
+    """Wait until pagination has rendered a different, stable page."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    candidate = None
+    stable_reads = 0
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(250)
+        current = _page_signature(page)
+        if current == previous_signature:
+            candidate = None
+            stable_reads = 0
+            continue
+        if current == candidate:
+            stable_reads += 1
+        else:
+            candidate = current
+            stable_reads = 1
+        if stable_reads >= 2:
+            return True
+    return False
+
+
+def _click_next_page_and_wait(page):
+    """Move one page only when the next page is enabled and actually rendered."""
+    previous_signature = _page_signature(page)
+    moved = page.evaluate("""() => {
+      const next = document.querySelector('.el-pagination .btn-next');
+      if (!next || next.disabled || next.className.includes('disabled')) return false;
+      next.click();
+      return true;
+    }""")
+    if not moved:
+        return False
+    if not _wait_for_page_change(page, previous_signature):
+        print("[create_app] 分页切换后页面未稳定，停止继续翻页")
+        return False
+    return True
 
 
 def _read_current_page_app_rows(page):
@@ -641,28 +683,17 @@ def _collect_all_app_rows(page, reset_filters=False):
     seen_pages = set()
 
     for _ in range(50):
-        page.wait_for_timeout(300)
         _expand_visible_rows(page)
-        active_page = page.evaluate("""() => {
-          const active = document.querySelector('.el-pagination .el-pager li.active');
-          return active ? active.innerText.trim() : '1';
-        }""")
-        if active_page in seen_pages:
+        page_signature = _page_signature(page)
+        if page_signature in seen_pages:
             break
-        seen_pages.add(active_page)
+        seen_pages.add(page_signature)
 
         for row in _read_current_page_app_rows(page):
             records[row["app_id"]] = row
 
-        moved = page.evaluate("""() => {
-          const next = document.querySelector('.el-pagination .btn-next');
-          if (!next || next.disabled || next.className.includes('disabled')) return false;
-          next.click();
-          return true;
-        }""")
-        if not moved:
+        if not _click_next_page_and_wait(page):
             break
-        page.wait_for_timeout(700)
 
     return records
 
@@ -679,23 +710,16 @@ def _identify_new_app(page, before_ids, actual_channel_name):
         if len(candidates) == 1:
             return {"success": True, "app_id": candidates[0]["app_id"]}
         if len(candidates) > 1:
-            channel_matches = [
-                row for row in candidates
-                if actual_channel_name and actual_channel_name in row.get("row_text", "")
-            ]
-            if len(channel_matches) == 1:
-                return {"success": True, "app_id": channel_matches[0]["app_id"]}
-            if len(channel_matches) > 1:
-                return {
-                    "success": False,
-                    "error": err(
-                        "NEW_APP_ID_AMBIGUOUS",
-                        "VERIFY",
-                        f"保存后出现多个属于渠道 {actual_channel_name} 的新增应用ID: "
-                        f"{[row['app_id'] for row in channel_matches]}",
-                        NEXT_MANUAL,
-                    ),
-                }
+            return {
+                "success": False,
+                "error": err(
+                    "NEW_APP_ID_AMBIGUOUS",
+                    "VERIFY",
+                    f"保存后出现多个新增应用ID，无法安全确定目标: "
+                    f"{[row['app_id'] for row in candidates]}",
+                    NEXT_MANUAL,
+                ),
+            }
         page.wait_for_timeout(1500)
 
     if last_candidates:
@@ -709,10 +733,10 @@ def _identify_new_app(page, before_ids, actual_channel_name):
 
 
 def _find_target_row_by_id(page, app_id, expected_channel_name=""):
-    """Locate an existing application by exact ID and leave its page visible."""
+    """Locate by exact ID, then verify the channel from the row or expanded detail."""
     _reset_list_filters(page)
     _go_to_first_page(page)
-    mismatch = None
+    channel_error = None
 
     for _ in range(50):
         _expand_visible_rows(page)
@@ -720,6 +744,17 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
         ({appId, expectedChannel}) => {
           const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
           const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+
+          const expandedTextFor = (row) => {
+            const next = row.nextElementSibling;
+            if (next && (next.className.includes('el-table__expanded-row') ||
+                         next.querySelector('.el-table__expanded-cell'))) {
+              return (next.textContent || '').trim();
+            }
+            const nested = row.querySelector('.el-table__expanded-cell');
+            return nested ? (nested.textContent || '').trim() : '';
+          };
+
           for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
             const row = rows[rowIdx];
             if (row.offsetParent === null) continue;
@@ -728,11 +763,15 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
             );
             if (!exactId) continue;
             const rowText = (row.textContent || '').trim();
+            const detailText = expandedTextFor(row);
+            const channelInMain = Boolean(expectedChannel) && rowText.includes(expectedChannel);
+            const channelInDetail = Boolean(expectedChannel) && detailText.includes(expectedChannel);
+            const channelVerified = !expectedChannel || channelInMain || channelInDetail;
             return {
-              found: !expectedChannel || rowText.includes(expectedChannel),
-              channel_mismatch: Boolean(expectedChannel) && !rowText.includes(expectedChannel),
-              row_idx: rowIdx,
-              row_text: rowText
+              found: channelVerified,
+              channel_mismatch: Boolean(expectedChannel) && Boolean(detailText) && !channelInMain && !channelInDetail,
+              channel_unverified: Boolean(expectedChannel) && !channelVerified && !detailText,
+              row_idx: rowIdx
             };
           }
           return {found: false, channel_mismatch: false, row_idx: -1};
@@ -741,21 +780,17 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
         if found.get("found"):
             return found
         if found.get("channel_mismatch"):
-            mismatch = found
+            channel_error = "channel_mismatch"
+            break
+        if found.get("channel_unverified"):
+            channel_error = "channel_unverified"
             break
 
-        moved = page.evaluate("""() => {
-          const next = document.querySelector('.el-pagination .btn-next');
-          if (!next || next.disabled || next.className.includes('disabled')) return false;
-          next.click();
-          return true;
-        }""")
-        if not moved:
+        if not _click_next_page_and_wait(page):
             break
-        page.wait_for_timeout(700)
 
-    if mismatch:
-        return {"found": False, "reason": "channel_mismatch", "row_text": mismatch.get("row_text", "")}
+    if channel_error:
+        return {"found": False, "reason": channel_error}
     return {"found": False, "reason": "not_found"}
 
 
@@ -941,7 +976,7 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
     if save_err["dialog_open"]:
         return {"success": False, "error": err("SAVE_FAILED", "SAVE", build_error_message(save_err, "保存失败(对话框未关闭)"), NEXT_MANUAL)}
 
-    # 清空搜索框，用新应用名搜索
+    # 保存后不按应用名称定位；通过前后快照得到的新 ID 继续定位。
     try:
         page.wait_for_selector("table tbody tr", timeout=STEP_TIMEOUT)
     except Exception:
@@ -954,14 +989,19 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
     target_app_id = identified["app_id"]
     located = _find_target_row_by_id(page, target_app_id, data["actual_channel_name"])
     if not located.get("found"):
+        location_reason = located.get("reason")
+        if location_reason == "channel_mismatch":
+            location_code = "CHANNEL_MISMATCH"
+            location_message = f"应用ID={target_app_id}存在，但渠道归属不匹配"
+        elif location_reason == "channel_unverified":
+            location_code = "CHANNEL_UNVERIFIED"
+            location_message = f"应用ID={target_app_id}已找到，但无法从主行或展开详情核验渠道"
+        else:
+            location_code = "NEW_APP_ID_NOT_FOUND"
+            location_message = f"已识别新增应用ID={target_app_id}，但无法按ID重新定位"
         return {
             "success": False,
-            "error": err(
-                "NEW_APP_ID_NOT_FOUND",
-                "VERIFY",
-                f"已识别新增应用ID={target_app_id}，但无法按ID和渠道重新定位",
-                NEXT_MANUAL,
-            ),
+            "error": err(location_code, "VERIFY", location_message, NEXT_MANUAL),
         }
     _shot(page, "07_created")
     return {"success": True, "target_app_id": target_app_id}

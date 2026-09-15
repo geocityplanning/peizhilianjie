@@ -91,10 +91,13 @@ def test_fallback_has_pagination_loop():
     # _locate_by_app_id 函数应存在
     func = _function(tree, "_locate_by_app_id")
     func_src = ast.get_source_segment(src, func) or ""
-    # 必须有分页逻辑：btn-next 和翻页循环
-    assert "btn-next" in func_src, "兜底路径必须检查分页 btn-next"
+    # 分页按钮由共享辅助函数检查，兜底路径负责循环调用它。
+    assert "_click_next_page_and_wait" in func_src, "兜底路径必须调用稳定翻页辅助函数"
     assert "for " in func_src, "兜底路径必须有循环"
-    assert "click" in func_src, "兜底路径必须点击翻页"
+    helper = _function(tree, "_click_next_page_and_wait")
+    helper_src = ast.get_source_segment(src, helper) or ""
+    assert "btn-next" in helper_src, "稳定翻页辅助函数必须检查分页 btn-next"
+    assert "click" in helper_src, "稳定翻页辅助函数必须点击翻页"
 
 
 # ====== 7. execute_create_app() 仍只有一个定义 ======
@@ -158,3 +161,36 @@ def test_primary_blocks_fallback_when_clicked():
     # 主路径 clicked=True 后不应执行兜底
     assert "if not copy_clicked:" in stage_src, "必须有条件判断控制兜底入口"
     assert "_locate_by_app_id" in stage_src, "兜底函数必须被调用"
+
+
+def test_post_save_relocation_waits_for_stable_pagination():
+    src = _source()
+    tree = ast.parse(src)
+    collect = _function(tree, "_collect_all_app_rows")
+    collect_src = ast.get_source_segment(src, collect) or ""
+    assert "_page_signature" in src
+    assert "_wait_for_page_change" in src
+    assert "_click_next_page_and_wait" in collect_src
+    assert "seen_pages" in collect_src
+
+
+def test_multiple_new_ids_stop_without_guessing_by_channel_text():
+    src = _source()
+    tree = ast.parse(src)
+    identify = _function(tree, "_identify_new_app")
+    identify_src = ast.get_source_segment(src, identify) or ""
+    assert "NEW_APP_ID_AMBIGUOUS" in identify_src
+    assert "channel_matches" not in identify_src
+
+
+def test_target_relocation_checks_expanded_detail_separately():
+    src = _source()
+    tree = ast.parse(src)
+    locate = _function(tree, "_find_target_row_by_id")
+    locate_src = ast.get_source_segment(src, locate) or ""
+    assert "el-table__expanded-row" in locate_src
+    assert "el-table__expanded-cell" in locate_src
+    assert "channel_unverified" in locate_src
+    assert "channel_mismatch" in locate_src
+    assert "rowText.includes(expectedChannel)" in locate_src
+    assert "detailText.includes(expectedChannel)" in locate_src
