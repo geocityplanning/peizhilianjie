@@ -57,6 +57,7 @@ $env:HERMES_EXECUTOR_TOKEN = "<Hermes与执行端约定的Bearer Token>"
 $env:HERMES_EXECUTOR_ENV = "TEST"
 $env:AMOO_SECRET_KEY = "<执行电脑保存的Fernet密钥>"
 $env:HERMES_EXECUTOR_FAKE_MODE = "false"
+$env:HERMES_EXECUTOR_AUTO_LOGIN = "true"  # 真实全流程测试时开启
 uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
 ```
 
@@ -67,10 +68,13 @@ export HERMES_EXECUTOR_TOKEN='<Hermes与执行端约定的Bearer Token>'
 export HERMES_EXECUTOR_ENV='TEST'
 export AMOO_SECRET_KEY='<执行电脑保存的Fernet密钥>'
 export HERMES_EXECUTOR_FAKE_MODE='false'
+export HERMES_EXECUTOR_AUTO_LOGIN='true'  # 真实全流程测试时开启
 uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
 ```
 
 服务未配置 `HERMES_EXECUTOR_TOKEN` 时会拒绝启动。
+
+`HERMES_EXECUTOR_AUTO_LOGIN` 默认是 `false`。设置为 `true` 后，服务启动阶段会使用本机 `config.json` 自动登录测试后台；登录失败时不会执行创建，`/v1/exec/info` 会返回 `login_valid=false` 和 `acceptable=false`。
 
 ## Hermes 调用
 

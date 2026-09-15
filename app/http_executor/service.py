@@ -70,6 +70,18 @@ class ExecutionService:
         self.real_caller = real_caller
         self.login_checker = login_checker
 
+    def prepare_real_session(self) -> bool:
+        """Optionally ensure the browser has a valid REAL login before serving."""
+        if self.settings.fake_mode or not self.settings.auto_login:
+            return True
+        try:
+            from app.services.executor_client import call_executor
+
+            result = call_executor("login")
+            return bool(result.get("success"))
+        except Exception:
+            return False
+
     def _validate_common(self, request: ExecutionRequest, operation: str) -> None:
         if request.operation != operation:
             raise ServiceError("OPERATION_MISMATCH", "VALIDATE", f"operation 必须是 {operation}")

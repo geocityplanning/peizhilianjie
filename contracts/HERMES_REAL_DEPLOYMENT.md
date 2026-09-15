@@ -149,6 +149,7 @@ Windows PowerShell：
 $env:HERMES_EXECUTOR_TOKEN = "<双方约定的Bearer Token>"
 $env:HERMES_EXECUTOR_ENV = "TEST"
 $env:HERMES_EXECUTOR_FAKE_MODE = "false"
+$env:HERMES_EXECUTOR_AUTO_LOGIN = "true"
 uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
 ```
 
@@ -158,10 +159,25 @@ macOS Terminal：
 export HERMES_EXECUTOR_TOKEN='<双方约定的Bearer Token>'
 export HERMES_EXECUTOR_ENV='TEST'
 export HERMES_EXECUTOR_FAKE_MODE='false'
+export HERMES_EXECUTOR_AUTO_LOGIN='true'
 uv run uvicorn app.http_executor.main:app --host 127.0.0.1 --port 8001
 ```
 
 REAL 模式不要设置为 `true`。Hermes、FastAPI 和浏览器必须运行在同一台电脑，Hermes 调用地址固定为 `127.0.0.1:8001`。
+
+真实全流程测试时可显式开启自动登录。Windows PowerShell：
+
+```powershell
+$env:HERMES_EXECUTOR_AUTO_LOGIN = "true"
+```
+
+macOS Terminal：
+
+```bash
+export HERMES_EXECUTOR_AUTO_LOGIN='true'
+```
+
+开启后，服务启动阶段会启动或连接浏览器，并使用本机 `config.json` 中的账号和加密密码执行一次自动登录。默认值为 `false`；未开启时仍要求人工先登录。自动登录失败不会继续创建，`/v1/exec/info` 会返回 `login_valid=false`、`acceptable=false`。
 
 ## 7. FAKE 联调模式
 

@@ -14,6 +14,7 @@ class Settings:
     environment: str
     auth_token: str
     fake_mode: bool = False
+    auto_login: bool = False
 
 
 def _env_flag(name: str) -> bool:
@@ -31,4 +32,5 @@ def load_settings() -> Settings:
         environment=os.getenv("HERMES_EXECUTOR_ENV", "TEST").upper(),
         auth_token=os.getenv("HERMES_EXECUTOR_TOKEN", "").strip(),
         fake_mode=_env_flag("HERMES_EXECUTOR_FAKE_MODE"),
+        auto_login=_env_flag("HERMES_EXECUTOR_AUTO_LOGIN"),
     )

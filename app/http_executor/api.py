@@ -18,6 +18,8 @@ def create_app(service: ExecutionService) -> FastAPI:
         service.store.assert_ready()
         if not service.settings.auth_token:
             raise RuntimeError("HERMES_EXECUTOR_TOKEN 未配置，REAL 执行端拒绝启动")
+        if service.settings.auto_login and not service.settings.fake_mode:
+            service.prepare_real_session()
         yield
 
     app = FastAPI(

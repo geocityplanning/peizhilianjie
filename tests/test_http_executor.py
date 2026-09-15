@@ -412,3 +412,47 @@ def test_unknown_real_exception_is_redacted_from_receipt_and_database(tmp_path: 
     assert body["error"]["message"] == "执行自动化异常，结果未知，请查询原任务"
     assert secret not in serialized
     assert "input_value" not in serialized
+
+
+def test_auto_login_is_opt_in_at_service_startup(tmp_path: Path):
+    db_path = tmp_path / "executor.db"
+    initialize_database(db_path)
+    settings = Settings(
+        db_path=db_path,
+        environment="TEST",
+        auth_token="test-token",
+        fake_mode=False,
+        auto_login=True,
+    )
+    service = ExecutionService(
+        settings,
+        ExecutorStore(db_path),
+        login_checker=lambda: True,
+    )
+    calls = []
+    service.prepare_real_session = lambda: calls.append("login") or True
+
+    with TestClient(create_app(service)):
+        pass
+
+    assert calls == ["login"]
+
+
+def test_fake_mode_does_not_auto_login_at_service_startup(tmp_path: Path):
+    db_path = tmp_path / "executor.db"
+    initialize_database(db_path)
+    settings = Settings(
+        db_path=db_path,
+        environment="TEST",
+        auth_token="test-token",
+        fake_mode=True,
+        auto_login=True,
+    )
+    service = ExecutionService(settings, ExecutorStore(db_path))
+    calls = []
+    service.prepare_real_session = lambda: calls.append("login") or True
+
+    with TestClient(create_app(service)):
+        pass
+
+    assert calls == []
