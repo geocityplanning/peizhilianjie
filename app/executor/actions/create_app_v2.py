@@ -16,6 +16,7 @@ from core.error_codes import err, NEXT_STOP, NEXT_QUERY, NEXT_MANUAL
 from core import executor as ex
 from actions.ensure_login import ensure_login
 from actions.link_utils import extract_cloud_app_key
+from actions.pagination import wait_for_page_change
 
 OPERATION = "CREATE_APP"
 BASE_URL_H5 = "https://uat-cloud.139.com/cloudappadmin/#/cloudAppManager"
@@ -284,8 +285,9 @@ def _set_stage(execution_id, stage):
 def _open_group_dialog(page, row_idx):
     return page.evaluate("""
     (rowIdx) => {
-      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const allRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
+      const sourceRows = allRows.length ? allRows : document.querySelectorAll('table tbody tr');
+      const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
       if (rowIdx < 0 || rowIdx >= rows.length) return false;
       const row = rows[rowIdx];
       // 只匹配 BUTTON 元素（排除 SPAN），行里有两个"设置"按钮：
@@ -557,7 +559,9 @@ def _reset_list_filters(page):
 
 def _go_to_first_page(page):
     for _ in range(50):
-        previous_signature = _page_signature(page)
+        previous_state = _read_pagination_state(page)
+        if previous_state.get("page_number") == 1:
+            return True
         moved = page.evaluate("""() => {
           const prev = document.querySelector('.el-pagination .btn-prev');
           if (!prev || prev.disabled || prev.className.includes('disabled')) return false;
@@ -565,10 +569,11 @@ def _go_to_first_page(page):
           return true;
         }""")
         if not moved:
-            break
-        if not _wait_for_page_change(page, previous_signature):
+            return False
+        if not wait_for_page_change(page, previous_state, -1, _read_pagination_state):
             print("[create_app] 返回第一页时页面未稳定，停止继续翻页")
-            break
+            return False
+    return _read_pagination_state(page).get("page_number") == 1
 
 
 def _expand_visible_rows(page):
@@ -588,45 +593,36 @@ def _expand_visible_rows(page):
         page.wait_for_timeout(600)
 
 
-def _page_signature(page):
-    """Return a lightweight signature for the currently rendered page."""
+def _read_pagination_state(page):
+    """Read active page and a signature of visible primary rows separately."""
     return page.evaluate("""() => {
       const active = document.querySelector('.el-pagination .el-pager li.active');
       const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
-      const rowText = Array.from(rows)
-        .filter(row => row.offsetParent !== null)
-        .map(row => (row.textContent || '').trim())
-        .join('||');
-      return `${active ? active.innerText.trim() : '1'}|${rowText}`;
+      const allRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const headerNodes = document.querySelectorAll('.el-table__header-wrapper th');
+      const headers = Array.from(headerNodes).map(th => (th.innerText || '').trim());
+      const rows = Array.from(allRows).filter(row =>
+        row.offsetParent !== null && !row.classList.contains('el-table__expanded-row')
+      );
+      const rowSignature = rows.map(row => {
+        const cells = Array.from(row.querySelectorAll('td'));
+        const idIndex = headers.findIndex(header => header === 'ID' || header.includes('应用ID'));
+        const id = idIndex >= 0 && cells[idIndex] ? (cells[idIndex].textContent || '').trim() : '';
+        return `${id}|${(row.textContent || '').trim()}`;
+      });
+      const pageText = active ? active.innerText.trim() : '';
+      const pageNumber = /^\\d+$/.test(pageText) ? Number(pageText) : 1;
+      return {
+        page_number: pageNumber,
+        table_signature: JSON.stringify(rowSignature),
+        row_count: rows.length
+      };
     }""")
-
-
-def _wait_for_page_change(page, previous_signature, timeout_ms=6000):
-    """Wait until pagination has rendered a different, stable page."""
-    deadline = time.monotonic() + timeout_ms / 1000
-    candidate = None
-    stable_reads = 0
-    while time.monotonic() < deadline:
-        page.wait_for_timeout(250)
-        current = _page_signature(page)
-        if current == previous_signature:
-            candidate = None
-            stable_reads = 0
-            continue
-        if current == candidate:
-            stable_reads += 1
-        else:
-            candidate = current
-            stable_reads = 1
-        if stable_reads >= 2:
-            return True
-    return False
 
 
 def _click_next_page_and_wait(page):
     """Move one page only when the next page is enabled and actually rendered."""
-    previous_signature = _page_signature(page)
+    previous_state = _read_pagination_state(page)
     moved = page.evaluate("""() => {
       const next = document.querySelector('.el-pagination .btn-next');
       if (!next || next.disabled || next.className.includes('disabled')) return false;
@@ -635,21 +631,44 @@ def _click_next_page_and_wait(page):
     }""")
     if not moved:
         return False
-    if not _wait_for_page_change(page, previous_signature):
+    if not wait_for_page_change(page, previous_state, 1, _read_pagination_state):
         print("[create_app] 分页切换后页面未稳定，停止继续翻页")
-        return False
+        return None
     return True
 
 
 def _read_current_page_app_rows(page):
     return page.evaluate("""() => {
       const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
       const primaryHeaders = document.querySelectorAll('.el-table__header-wrapper th');
       const headerNodes = primaryHeaders.length ? primaryHeaders : document.querySelectorAll('th');
       const headers = Array.from(headerNodes).map(
         th => (th.innerText || '').trim()
       );
+      const expandedRowFor = row => {
+        const next = row.nextElementSibling;
+        return next && next.classList.contains('el-table__expanded-row') ? next : null;
+      };
+      const labeledValue = (root, labelPattern) => {
+        if (!root) return '';
+        const labels = root.querySelectorAll(
+          '.el-form-item__label, .el-descriptions-item__label, th, dt'
+        );
+        for (const label of labels) {
+          const name = (label.innerText || label.textContent || '')
+            .replace(/[ *:：\\s]/g, '').trim();
+          if (!labelPattern.test(name)) continue;
+          const item = label.closest('.el-form-item, .el-descriptions-item, tr, li, dt');
+          if (!item) continue;
+          const value = item.querySelector(
+            '.el-form-item__content, .el-descriptions-item__content, td, dd'
+          );
+          if (value) return (value.innerText || value.textContent || '').trim();
+        }
+        return '';
+      };
       const result = [];
       for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
         const row = rows[rowIdx];
@@ -661,6 +680,14 @@ def _read_current_page_app_rows(page):
           if (header === 'ID' || header.includes('应用ID')) {
             appId = (cells[i].textContent || '').trim();
             break;
+          }
+        }
+        if (!appId) {
+          const detail = expandedRowFor(row);
+          appId = labeledValue(detail, /^(应用)?ID$/i);
+          if (!appId && detail) {
+            const match = (detail.textContent || '').match(/(?:应用)?ID\\s*[:：]\\s*([A-Za-z0-9_-]+)/i);
+            appId = match ? match[1] : '';
           }
         }
         if (!appId) continue;
@@ -678,22 +705,29 @@ def _collect_all_app_rows(page, reset_filters=False):
     """Collect app rows across pagination, keyed by the exact application ID."""
     if reset_filters:
         _reset_list_filters(page)
-    _go_to_first_page(page)
+    if not _go_to_first_page(page):
+        return None
     records = {}
     seen_pages = set()
 
     for _ in range(50):
         _expand_visible_rows(page)
-        page_signature = _page_signature(page)
-        if page_signature in seen_pages:
-            break
-        seen_pages.add(page_signature)
+        page_state = _read_pagination_state(page)
+        active_page = page_state.get("page_number")
+        if active_page is None or active_page in seen_pages or page_state.get("row_count", 0) <= 0:
+            return None
+        seen_pages.add(active_page)
 
         for row in _read_current_page_app_rows(page):
             records[row["app_id"]] = row
 
-        if not _click_next_page_and_wait(page):
+        moved = _click_next_page_and_wait(page)
+        if moved is None:
+            return None
+        if not moved:
             break
+    else:
+        return None
 
     return records
 
@@ -703,6 +737,16 @@ def _identify_new_app(page, before_ids, actual_channel_name):
     last_candidates = []
     for attempt in range(5):
         after_rows = _collect_all_app_rows(page, reset_filters=True)
+        if after_rows is None:
+            return {
+                "success": False,
+                "error": err(
+                    "APP_ID_SNAPSHOT_FAILED",
+                    "VERIFY",
+                    "保存后应用列表分页未稳定，不能安全识别新增应用ID",
+                    NEXT_MANUAL,
+                ),
+            }
         candidates = [row for app_id, row in after_rows.items() if app_id not in before_ids]
         last_candidates = candidates
         print(f"[create_app] 新增ID识别 attempt={attempt + 1}: {[row['app_id'] for row in candidates]}")
@@ -735,7 +779,8 @@ def _identify_new_app(page, before_ids, actual_channel_name):
 def _find_target_row_by_id(page, app_id, expected_channel_name=""):
     """Locate by exact ID, then verify the channel from the row or expanded detail."""
     _reset_list_filters(page)
-    _go_to_first_page(page)
+    if not _go_to_first_page(page):
+        return {"found": False, "reason": "pagination_unstable"}
     channel_error = None
 
     for _ in range(50):
@@ -743,16 +788,33 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
         found = page.evaluate("""
         ({appId, expectedChannel}) => {
           const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-          const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+          const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+          const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
+          const headerNodes = document.querySelectorAll('.el-table__header-wrapper th');
+          const headers = Array.from(headerNodes).map(th => (th.innerText || '').trim());
 
-          const expandedTextFor = (row) => {
+          const expandedRowFor = (row) => {
             const next = row.nextElementSibling;
-            if (next && (next.className.includes('el-table__expanded-row') ||
-                         next.querySelector('.el-table__expanded-cell'))) {
-              return (next.textContent || '').trim();
+            return next && next.classList.contains('el-table__expanded-row') ? next : null;
+          };
+
+          const labeledValue = (root, labelPattern) => {
+            if (!root) return '';
+            const labels = root.querySelectorAll(
+              '.el-form-item__label, .el-descriptions-item__label, th, dt'
+            );
+            for (const label of labels) {
+              const name = (label.innerText || label.textContent || '')
+                .replace(/[ *:：\\s]/g, '').trim();
+              if (!labelPattern.test(name)) continue;
+              const item = label.closest('.el-form-item, .el-descriptions-item, tr, li, dt');
+              if (!item) continue;
+              const value = item.querySelector(
+                '.el-form-item__content, .el-descriptions-item__content, td, dd'
+              );
+              if (value) return (value.innerText || value.textContent || '').trim();
             }
-            const nested = row.querySelector('.el-table__expanded-cell');
-            return nested ? (nested.textContent || '').trim() : '';
+            return '';
           };
 
           for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
@@ -761,20 +823,30 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
             const exactId = Array.from(row.querySelectorAll('td')).some(
               cell => (cell.textContent || '').trim() === appId
             );
-            if (!exactId) continue;
+            const detail = expandedRowFor(row);
+            const detailId = labeledValue(detail, /^(应用)?ID$/i);
+            const fallbackIdMatch = detail && (detail.textContent || '').match(
+              /(?:应用)?ID\\s*[:：]\\s*([A-Za-z0-9_-]+)/i
+            );
+            if (!exactId && detailId !== appId && (!fallbackIdMatch || fallbackIdMatch[1] !== appId)) continue;
+
             const rowText = (row.textContent || '').trim();
-            const detailText = expandedTextFor(row);
-            const channelInMain = Boolean(expectedChannel) && rowText.includes(expectedChannel);
-            const channelInDetail = Boolean(expectedChannel) && detailText.includes(expectedChannel);
-            const channelVerified = !expectedChannel || channelInMain || channelInDetail;
+            const channelIndex = headers.findIndex(header => /渠道/.test(header));
+            const cells = Array.from(row.querySelectorAll('td'));
+            const mainChannel = channelIndex >= 0 && cells[channelIndex]
+              ? (cells[channelIndex].textContent || '').trim()
+              : '';
+            const detailChannel = labeledValue(detail, /^(所属)?渠道(名称)?$/);
+            const channelValue = mainChannel || detailChannel;
+            const channelVerified = !expectedChannel || channelValue === expectedChannel;
             return {
               found: channelVerified,
-              channel_mismatch: Boolean(expectedChannel) && Boolean(detailText) && !channelInMain && !channelInDetail,
-              channel_unverified: Boolean(expectedChannel) && !channelVerified && !detailText,
+              channel_mismatch: Boolean(expectedChannel) && Boolean(channelValue) && channelValue !== expectedChannel,
+              channel_unverified: Boolean(expectedChannel) && !channelValue,
               row_idx: rowIdx
             };
           }
-          return {found: false, channel_mismatch: false, row_idx: -1};
+          return {found: false, channel_mismatch: false, channel_unverified: false, row_idx: -1};
         }
         """, {"appId": str(app_id), "expectedChannel": expected_channel_name})
         if found.get("found"):
@@ -786,7 +858,10 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
             channel_error = "channel_unverified"
             break
 
-        if not _click_next_page_and_wait(page):
+        moved = _click_next_page_and_wait(page)
+        if moved is None:
+            return {"found": False, "reason": "pagination_unstable"}
+        if not moved:
             break
 
     if channel_error:
@@ -1024,7 +1099,8 @@ def _stage_enable(page, execution_id, target_app_id, app_name, actual_channel_na
     status_check = page.evaluate("""
     (rowIdx) => {
       const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
       if (rowIdx < 0 || rowIdx >= rows.length) return {error: 'row not found'};
       const sw = rows[rowIdx].querySelector('.el-switch');
       if (!sw) return {error: 'no switch'};
@@ -1044,7 +1120,8 @@ def _stage_enable(page, execution_id, target_app_id, app_name, actual_channel_na
     publish_result = page.evaluate("""
     (rowIdx) => {
       const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
       if (rowIdx < 0 || rowIdx >= rows.length) return {error: 'row not found'};
       const sw = rows[rowIdx].querySelector('.el-switch');
       if (!sw) return {error: 'no switch'};
@@ -1081,7 +1158,8 @@ def _stage_enable(page, execution_id, target_app_id, app_name, actual_channel_na
     is_on = page.evaluate("""
     (rowIdx) => {
       const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-      const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+      const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
       if (rowIdx < 0 || rowIdx >= rows.length) return false;
       const sw = rows[rowIdx].querySelector('.el-switch');
       return sw ? sw.className.includes('is-checked') : false;
@@ -1255,7 +1333,8 @@ def _stage_collect_result(page, execution_id, target_app_id, app_name, actual_ch
         row_data = page.evaluate("""
         (rowIdx) => {
           const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-          const rows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+          const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
+          const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
           if (rowIdx < 0 || rowIdx >= rows.length) return {};
           const row = rows[rowIdx];
           const primaryHeaders = document.querySelectorAll('.el-table__header-wrapper th');

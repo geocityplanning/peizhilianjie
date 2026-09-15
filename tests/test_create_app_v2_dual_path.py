@@ -168,8 +168,8 @@ def test_post_save_relocation_waits_for_stable_pagination():
     tree = ast.parse(src)
     collect = _function(tree, "_collect_all_app_rows")
     collect_src = ast.get_source_segment(src, collect) or ""
-    assert "_page_signature" in src
-    assert "_wait_for_page_change" in src
+    assert "_read_pagination_state" in src
+    assert "wait_for_page_change" in src
     assert "_click_next_page_and_wait" in collect_src
     assert "seen_pages" in collect_src
 
@@ -189,8 +189,9 @@ def test_target_relocation_checks_expanded_detail_separately():
     locate = _function(tree, "_find_target_row_by_id")
     locate_src = ast.get_source_segment(src, locate) or ""
     assert "el-table__expanded-row" in locate_src
-    assert "el-table__expanded-cell" in locate_src
+    assert "el-table__expanded-row" in locate_src
     assert "channel_unverified" in locate_src
     assert "channel_mismatch" in locate_src
-    assert "rowText.includes(expectedChannel)" in locate_src
-    assert "detailText.includes(expectedChannel)" in locate_src
+    assert "channelIndex" in locate_src
+    assert "detailChannel" in locate_src
+    assert "channelValue === expectedChannel" in locate_src
