@@ -346,6 +346,67 @@ def test_request_carries_target_filter_matches_body_and_encoded_url():
     assert cap._request_carries_target_filter(LIST_URL, SECRET_CHANNEL, "") is False
 
 
+def test_locate_correct_channel_json_field():
+    cap = _stub_login_and_import()
+    located = cap._locate_target_filter_field(
+        LIST_URL,
+        f'{{"channelName":"{SECRET_CHANNEL}","pageNum":1}}',
+        SECRET_CHANNEL,
+    )
+    assert located == {"field": "channelName", "is_channel": True}
+    assert SECRET_CHANNEL not in str(located)
+
+
+def test_locate_unrelated_json_field():
+    cap = _stub_login_and_import()
+    located = cap._locate_target_filter_field(
+        LIST_URL,
+        f'{{"appName":"{SECRET_CHANNEL}"}}',
+        SECRET_CHANNEL,
+    )
+    assert located == {"field": "appName", "is_channel": False}
+
+
+def test_locate_url_query_channel_key():
+    cap = _stub_login_and_import()
+    located = cap._locate_target_filter_field(
+        f"{LIST_URL}?channelName={quote(SECRET_CHANNEL, safe='')}",
+        "",
+        SECRET_CHANNEL,
+    )
+    assert located == {"field": "query.channelName", "is_channel": True}
+
+
+def test_locate_unrelated_url_query_key():
+    cap = _stub_login_and_import()
+    located = cap._locate_target_filter_field(
+        f"{LIST_URL}?name={quote(SECRET_CHANNEL, safe='')}",
+        "",
+        SECRET_CHANNEL,
+    )
+    assert located == {"field": "query.name", "is_channel": False}
+
+
+def test_locate_raw_text_only_fallback():
+    cap = _stub_login_and_import()
+    located = cap._locate_target_filter_field(
+        LIST_URL,
+        f"prefix {SECRET_CHANNEL} suffix",
+        SECRET_CHANNEL,
+    )
+    assert located == {"field": "raw_text_only", "is_channel": False}
+
+
+def test_locate_nested_channel_json_path():
+    cap = _stub_login_and_import()
+    located = cap._locate_target_filter_field(
+        LIST_URL,
+        f'{{"filter":{{"channelName":"{SECRET_CHANNEL}"}}}}',
+        SECRET_CHANNEL,
+    )
+    assert located == {"field": "filter.channelName", "is_channel": True}
+
+
 def test_observer_marks_request_missing_target_filter():
     cap = _stub_login_and_import()
     session = FakeCdpSession()
@@ -658,3 +719,83 @@ def test_search_case_no_response_body(monkeypatch):
     )
     assert detail["request_carried_target_filter"] is True
     assert detail["response_contains_target_channel"] is None
+
+
+def test_observer_records_channel_field_path_without_value():
+    cap = _stub_login_and_import()
+    session = FakeCdpSession()
+    page = FakePage(session=session)
+    observations = cap._attach_list_response_observer(page, target_filter=SECRET_CHANNEL)
+    session.emit(
+        "Network.requestWillBeSent",
+        {
+            "requestId": "r1",
+            "request": {
+                "url": LIST_URL,
+                "postData": f'{{"channelName":"{SECRET_CHANNEL}"}}',
+            },
+        },
+    )
+    assert observations.carried_target_filter is True
+    assert observations.target_filter_field == "channelName"
+    assert observations.target_filter_field_is_channel is True
+    assert SECRET_CHANNEL not in str(vars(observations))
+
+
+def test_observer_records_unrelated_field_and_raw_text():
+    cap = _stub_login_and_import()
+    session = FakeCdpSession()
+    page = FakePage(session=session)
+    observations = cap._attach_list_response_observer(page, target_filter=SECRET_CHANNEL)
+    session.emit(
+        "Network.requestWillBeSent",
+        {
+            "requestId": "r1",
+            "request": {
+                "url": LIST_URL,
+                "postData": f'{{"appName":"{SECRET_CHANNEL}"}}',
+            },
+        },
+    )
+    assert observations.target_filter_field == "appName"
+    assert observations.target_filter_field_is_channel is False
+
+    raw_session = FakeCdpSession()
+    raw_page = FakePage(session=raw_session)
+    raw_obs = cap._attach_list_response_observer(raw_page, target_filter=SECRET_CHANNEL)
+    raw_session.emit(
+        "Network.requestWillBeSent",
+        {
+            "requestId": "r2",
+            "request": {"url": LIST_URL, "postData": f"prefix {SECRET_CHANNEL} suffix"},
+        },
+    )
+    assert raw_obs.target_filter_field == "raw_text_only"
+    assert raw_obs.target_filter_field_is_channel is False
+
+
+def test_search_copies_filter_field_into_detail(monkeypatch):
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver()
+
+    def on_wait():
+        observations.append(200)
+        observations.carried_target_filter = True
+        observations.target_filter_field = "channelName"
+        observations.target_filter_field_is_channel = True
+        observations.response_contains_target_channel = False
+
+    _install_search_mocks(
+        monkeypatch,
+        cap,
+        observations=observations,
+        stable=False,
+        on_wait=on_wait,
+        pagination=_unchanged_table(),
+        rows=[{"channel_name": "other"}],
+    )
+    detail = cap._search_list_by_channel(
+        FakeSearchPage(), "chan", return_detail=True
+    )
+    assert detail["target_filter_field"] == "channelName"
+    assert detail["target_filter_field_is_channel"] is True

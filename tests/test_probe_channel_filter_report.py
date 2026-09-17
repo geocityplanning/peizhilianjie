@@ -224,6 +224,66 @@ def test_dump_report_drops_payload_keys_and_keeps_booleans():
     assert payload["diagnosis"]["filter_path"] == "request_missing_target_filter"
 
 
+def test_diagnosis_reports_filter_field_without_values():
+    probe = _load_probe()
+    channel_field = {
+        "list_requests_before": 0,
+        "list_requests_after": 1,
+        "last_http_status": 200,
+        "request_carried_target_filter": True,
+        "target_filter_field": "channelName",
+        "target_filter_field_is_channel": True,
+        "response_contains_target_channel": False,
+        "table_changed": False,
+        "reader_sees_target_channel": False,
+    }
+    diagnosis = probe._build_diagnosis(channel_field)
+    assert diagnosis["target_filter_field"] == "channelName"
+    assert diagnosis["target_filter_field_is_channel"] is True
+    notes = "\n".join(probe._diagnosis_notes(channel_field))
+    assert "转人工核对 UAT 后端筛选行为" in notes
+    assert SECRET_CHANNEL not in notes
+
+    unrelated = dict(channel_field)
+    unrelated["target_filter_field"] = "appName"
+    unrelated["target_filter_field_is_channel"] = False
+    notes = "\n".join(probe._diagnosis_notes(unrelated))
+    assert "页面控件绑定" in notes
+
+    raw = dict(channel_field)
+    raw["target_filter_field"] = "raw_text_only"
+    raw["target_filter_field_is_channel"] = False
+    diagnosis = probe._build_diagnosis(raw)
+    assert diagnosis["target_filter_field"] == "raw_text_only"
+    assert "页面控件绑定" in "\n".join(probe._diagnosis_notes(raw))
+
+
+def test_dump_report_keeps_field_path_and_drops_values():
+    probe = _load_probe()
+    dumped = probe._dump_report(
+        {
+            "channel": SECRET_CHANNEL,
+            "diagnosis": {
+                "target_filter_field": "channelName",
+                "target_filter_field_is_channel": True,
+                "response_contains_target_channel": False,
+            },
+            "steps": {
+                "channel_filter": {
+                    "postData": f'{{"channelName":"{SECRET_CHANNEL}"}}',
+                    "body": SECRET_CHANNEL,
+                    "target_filter_field": "channelName",
+                }
+            },
+        }
+    )
+    payload = json.loads(dumped)
+    assert SECRET_CHANNEL not in dumped
+    assert payload["diagnosis"]["target_filter_field"] == "channelName"
+    assert "postData" not in payload["steps"]["channel_filter"]
+    assert "body" not in payload["steps"]["channel_filter"]
+
+
 def test_local_options_print_only_on_tty():
     probe = _load_probe()
     tty = TtyBuffer()

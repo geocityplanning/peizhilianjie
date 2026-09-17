@@ -105,6 +105,8 @@ def _build_diagnosis(detail):
     diagnosis = {
         "request_reached_backend": None,
         "request_carried_target_filter": None,
+        "target_filter_field": None,
+        "target_filter_field_is_channel": None,
         "response_contains_target_channel": None,
         "http_status_2xx_observed": None,
         "table_changed": None,
@@ -125,6 +127,8 @@ def _build_diagnosis(detail):
     else:
         diagnosis["request_reached_backend"] = after > before
     diagnosis["request_carried_target_filter"] = detail.get("request_carried_target_filter")
+    diagnosis["target_filter_field"] = detail.get("target_filter_field")
+    diagnosis["target_filter_field_is_channel"] = detail.get("target_filter_field_is_channel")
     diagnosis["response_contains_target_channel"] = detail.get("response_contains_target_channel")
     diagnosis["http_status_2xx_observed"] = _http_status_2xx_observed(
         detail.get("last_http_status")
@@ -162,6 +166,12 @@ def _diagnosis_notes(detail):
         )
     elif path == "dom_refreshed_with_target_channel":
         notes.append("行集已变化且读取见到目标渠道；仍不等于 S4 通过")
+    field = detail.get("target_filter_field") if isinstance(detail, dict) else None
+    is_channel = detail.get("target_filter_field_is_channel") if isinstance(detail, dict) else None
+    if field == "raw_text_only" or is_channel is False:
+        notes.append("目标文本未落在渠道筛选字段，优先核对页面控件绑定")
+    elif is_channel is True and path == "response_missing_target_channel":
+        notes.append("目标文本已落在渠道字段，但响应未含目标；转人工核对 UAT 后端筛选行为")
     if (
         isinstance(detail, dict)
         and detail.get("last_http_status")

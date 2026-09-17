@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from urllib.parse import quote, quote_plus
+from urllib.parse import parse_qsl, quote, quote_plus, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -650,6 +650,8 @@ class _ListRequestObserver(list):
         self.keepalive = None
         self.carried_target_filter = False
         self.response_contains_target_channel = None
+        self.target_filter_field = None
+        self.target_filter_field_is_channel = None
 
 
 # 后台列表接口的实际路径是 /backend/cloudTrial/appInfo/getAppInfoList，
@@ -664,30 +666,120 @@ def _is_list_request_url(url):
     return "/backend/" in raw and raw.split("?")[0].endswith("List")
 
 
+def _as_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", "ignore")
+    return str(value)
+
+
+def _text_contains_target(text, target):
+    if not target or not text:
+        return False
+    if target in text:
+        return True
+    encoded = quote(target, safe="")
+    if encoded and encoded in text:
+        return True
+    plus_encoded = quote_plus(target)
+    return bool(plus_encoded and plus_encoded in text)
+
+
+def _field_path_is_channel(path):
+    if not path or path == "raw_text_only":
+        return False
+    return "channel" in path.lower() or "渠道" in path
+
+
+def _json_paths_containing_target(obj, target, prefix=""):
+    hits = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            hits.extend(_json_paths_containing_target(value, target, path))
+    elif isinstance(obj, list):
+        list_path = f"{prefix}[]" if prefix else "[]"
+        for value in obj:
+            hits.extend(_json_paths_containing_target(value, target, list_path))
+    elif isinstance(obj, str) and prefix and _text_contains_target(obj, target):
+        hits.append(prefix)
+    return hits
+
+
+def _form_keys_containing_target(raw, target):
+    hits = []
+    try:
+        pairs = parse_qsl(_as_text(raw), keep_blank_values=True)
+    except Exception:
+        return hits
+    for key, value in pairs:
+        if _text_contains_target(value, target):
+            hits.append(str(key))
+    return hits
+
+
+def _pick_filter_location(json_paths, query_keys, raw_hit):
+    channel_json = [path for path in json_paths if _field_path_is_channel(path)]
+    if channel_json:
+        return {"field": channel_json[0], "is_channel": True}
+    channel_query = [key for key in query_keys if _field_path_is_channel(key)]
+    if channel_query:
+        return {"field": f"query.{channel_query[0]}", "is_channel": True}
+    if json_paths:
+        return {"field": json_paths[0], "is_channel": False}
+    if query_keys:
+        return {"field": f"query.{query_keys[0]}", "is_channel": False}
+    if raw_hit:
+        return {"field": "raw_text_only", "is_channel": False}
+    return None
+
+
+def _locate_target_filter_field(url, post_data, target_filter):
+    """Return field path / query key / raw_text_only, never the target value."""
+    target = (target_filter or "").strip() if isinstance(target_filter, str) else ""
+    if not target:
+        return None
+    url_text = _as_text(url)
+    body_text = _as_text(post_data)
+    query_keys = []
+    try:
+        query_keys = _form_keys_containing_target(urlparse(url_text).query, target)
+    except Exception:
+        query_keys = []
+    json_paths = []
+    if body_text:
+        try:
+            loaded = json.loads(body_text)
+        except Exception:
+            loaded = None
+        if loaded is not None:
+            json_paths = _json_paths_containing_target(loaded, target)
+        else:
+            json_paths = _form_keys_containing_target(body_text, target)
+    raw_hit = _text_contains_target(url_text + body_text, target)
+    return _pick_filter_location(json_paths, query_keys, raw_hit)
+
+
 def _request_carries_target_filter(url, post_data, target_filter):
     """Return whether a list request payload contains the target filter value.
 
     The function only returns a boolean. It does not keep or return the URL,
     query string, request body, or channel text.
     """
-    target = (target_filter or "").strip() if isinstance(target_filter, str) else ""
-    if not target:
-        return False
-    url_text = url if isinstance(url, str) else (url.decode("utf-8", "ignore") if isinstance(url, (bytes, bytearray)) else str(url or ""))
-    if isinstance(post_data, (bytes, bytearray)):
-        body_text = post_data.decode("utf-8", "ignore")
-    else:
-        body_text = post_data if isinstance(post_data, str) else str(post_data or "")
-    haystack = url_text + body_text
-    if target in haystack:
-        return True
-    encoded = quote(target, safe="")
-    if encoded and encoded in haystack:
-        return True
-    plus_encoded = quote_plus(target)
-    if plus_encoded and plus_encoded in haystack:
-        return True
-    return False
+    return _locate_target_filter_field(url, post_data, target_filter) is not None
+
+
+def _filter_field_rank(field, is_channel):
+    if not field:
+        return 0
+    if is_channel:
+        return 3
+    if field != "raw_text_only":
+        return 2
+    return 1
 
 
 def _detach_list_response_observer(observations):
@@ -726,6 +818,17 @@ def _attach_list_response_observer(page, target_filter=None):
         elif observations.response_contains_target_channel is not True:
             observations.response_contains_target_channel = False
 
+    def _note_filter_field(location):
+        field = location.get("field")
+        is_channel = bool(location.get("is_channel"))
+        if _filter_field_rank(field, is_channel) <= _filter_field_rank(
+            observations.target_filter_field,
+            observations.target_filter_field_is_channel,
+        ):
+            return
+        observations.target_filter_field = field
+        observations.target_filter_field_is_channel = is_channel
+
     def _body_contains_target(body):
         return _request_carries_target_filter("", body, target_filter)
 
@@ -734,8 +837,10 @@ def _attach_list_response_observer(page, target_filter=None):
             return False
         if request_id is not None:
             list_request_ids.add(request_id)
-        if _request_carries_target_filter(url, post_data, target_filter):
+        location = _locate_target_filter_field(url, post_data, target_filter)
+        if location is not None:
             observations.carried_target_filter = True
+            _note_filter_field(location)
             if request_id is not None:
                 carried_request_ids.add(request_id)
         return True
@@ -901,6 +1006,8 @@ def _search_list_by_channel(page, channel_name, return_detail=False):
         "reader_distinct_channels": None,
         "request_carried_target_filter": None,
         "response_contains_target_channel": None,
+        "target_filter_field": None,
+        "target_filter_field_is_channel": None,
     }
     opened = None
     selected = None
@@ -1088,11 +1195,21 @@ def _search_list_by_channel(page, channel_name, return_detail=False):
                 detail["response_contains_target_channel"] = getattr(
                     observations, "response_contains_target_channel", None
                 )
+                detail["target_filter_field"] = getattr(
+                    observations, "target_filter_field", None
+                )
+                detail["target_filter_field_is_channel"] = getattr(
+                    observations, "target_filter_field_is_channel", None
+                )
             else:
                 detail["response_contains_target_channel"] = None
+                detail["target_filter_field"] = None
+                detail["target_filter_field_is_channel"] = None
         else:
             detail["request_carried_target_filter"] = None
             detail["response_contains_target_channel"] = None
+            detail["target_filter_field"] = None
+            detail["target_filter_field_is_channel"] = None
     _detach_list_response_observer(observations)
     if not stable:
         print(f"[create_app] 渠道筛选未稳定: {detail}")
