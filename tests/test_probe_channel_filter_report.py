@@ -112,6 +112,87 @@ def test_dump_report_redacts_url_sample_ids_and_omits_raw_options():
     assert "response_ok" not in dumped
 
 
+def test_filter_path_distinguishes_three_requested_cases():
+    probe = _load_probe()
+    missing_detail = {
+        "list_requests_before": 0,
+        "list_requests_after": 1,
+        "last_http_status": 200,
+        "request_carried_target_filter": False,
+        "table_changed": False,
+        "reader_sees_target_channel": False,
+        "filter_stable": False,
+    }
+    missing = probe._build_diagnosis(missing_detail)
+    assert missing["filter_path"] == "request_missing_target_filter"
+    assert missing["request_carried_target_filter"] is False
+    assert missing["http_status_2xx_observed"] is True
+    assert "加长等待" in "\n".join(probe._diagnosis_notes(missing_detail))
+
+    has_filter = {
+        "list_requests_before": 0,
+        "list_requests_after": 1,
+        "last_http_status": 200,
+        "request_carried_target_filter": True,
+        "table_changed": False,
+        "reader_sees_target_channel": False,
+        "filter_stable": False,
+    }
+    diagnosis = probe._build_diagnosis(has_filter)
+    assert diagnosis["filter_path"] == "request_has_filter_dom_not_on_target"
+    notes = "\n".join(probe._diagnosis_notes(has_filter))
+    assert "已携带目标筛选" in notes
+    assert SECRET_CHANNEL not in notes
+
+    refreshed = probe._build_diagnosis(
+        {
+            "list_requests_before": 0,
+            "list_requests_after": 1,
+            "last_http_status": 200,
+            "request_carried_target_filter": True,
+            "table_changed": True,
+            "reader_sees_target_channel": True,
+            "filter_stable": True,
+            "reader_row_count": 2,
+            "reader_distinct_channels": 1,
+        }
+    )
+    assert refreshed["filter_path"] == "dom_refreshed_with_target_channel"
+    assert refreshed["table_changed"] is True
+    assert refreshed["reader_sees_target_channel"] is True
+
+
+def test_dump_report_drops_payload_keys_and_keeps_booleans():
+    probe = _load_probe()
+    dumped = probe._dump_report(
+        {
+            "channel": SECRET_CHANNEL,
+            "diagnosis": {
+                "request_carried_target_filter": False,
+                "table_changed": False,
+                "reader_sees_target_channel": False,
+                "filter_path": "request_missing_target_filter",
+            },
+            "steps": {
+                "channel_filter": {
+                    "postData": f'{{"channelName":"{SECRET_CHANNEL}"}}',
+                    "query": "channelName=" + SECRET_CHANNEL,
+                    "token": "secret-token",
+                    "request_carried_target_filter": False,
+                }
+            },
+        }
+    )
+    payload = json.loads(dumped)
+    assert SECRET_CHANNEL not in dumped
+    assert "secret-token" not in dumped
+    assert "postData" not in payload["steps"]["channel_filter"]
+    assert "query" not in payload["steps"]["channel_filter"]
+    assert "token" not in payload["steps"]["channel_filter"]
+    assert payload["diagnosis"]["request_carried_target_filter"] is False
+    assert payload["diagnosis"]["filter_path"] == "request_missing_target_filter"
+
+
 def test_local_options_print_only_on_tty():
     probe = _load_probe()
     tty = TtyBuffer()

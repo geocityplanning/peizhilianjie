@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """渠道筛选只读定位自证探针（REAL）。
 
-用途：在真实 UAT 页面上收窄"搜索已点击而行集未变"的原因，回答四个问题：
-  1. 点击搜索后是否观察到列表请求     -> list_requests_after / last_http_status
-  2. 观察到的列表请求是否 HTTP 2xx   -> http_status_2xx_observed（仅网络层，不等于业务成功）
-  3. 表格读取是否选对主行               -> reader_row_count / reader_sees_target_channel
-  4. 6 秒预算内是否完成稳定刷新         -> filter_stable / elapsed_ms / table_changed
+用途：在真实 UAT 页面上收窄"搜索已点击而行集未变"的原因，回答：
+  1. 点击搜索后是否观察到列表请求     -> request_reached_backend
+  2. 列表请求是否携带目标渠道筛选     -> request_carried_target_filter（仅布尔）
+  3. 观察到的列表请求是否 HTTP 2xx   -> http_status_2xx_observed（仅网络层，不等于业务成功）
+  4. 行集是否变化、读取是否见目标渠道 -> table_changed / reader_sees_target_channel
+  5. 6 秒预算内是否完成稳定刷新       -> filter_stable / elapsed_ms
 
 安全边界（重要）：
   - 只做只读操作：导航列表页、点"重置"、选渠道、点"搜索"、翻页、展开行。
@@ -82,14 +83,32 @@ def _http_status_2xx_observed(status):
     return 200 <= code < 300
 
 
+def _filter_path_case(detail):
+    if not isinstance(detail, dict):
+        return "unknown"
+    if detail.get("list_requests_before") is None or detail.get("list_requests_after") is None:
+        return "unknown_no_observer"
+    if not detail["list_requests_after"] > detail["list_requests_before"]:
+        return "no_list_request"
+    if detail.get("request_carried_target_filter") is not True:
+        return "request_missing_target_filter"
+    if detail.get("table_changed") and detail.get("reader_sees_target_channel"):
+        return "dom_refreshed_with_target_channel"
+    return "request_has_filter_dom_not_on_target"
+
+
 def _build_diagnosis(detail):
     diagnosis = {
         "request_reached_backend": None,
+        "request_carried_target_filter": None,
         "http_status_2xx_observed": None,
+        "table_changed": None,
+        "reader_sees_target_channel": None,
         "table_reader_looks_correct": None,
         "refresh_stable_within_budget": bool(
             isinstance(detail, dict) and detail.get("filter_stable")
         ),
+        "filter_path": _filter_path_case(detail),
         "http_2xx_is_not_business_success": True,
     }
     if not isinstance(detail, dict):
@@ -100,9 +119,12 @@ def _build_diagnosis(detail):
         diagnosis["request_reached_backend"] = "UNKNOWN_NO_OBSERVER"
     else:
         diagnosis["request_reached_backend"] = after > before
+    diagnosis["request_carried_target_filter"] = detail.get("request_carried_target_filter")
     diagnosis["http_status_2xx_observed"] = _http_status_2xx_observed(
         detail.get("last_http_status")
     )
+    diagnosis["table_changed"] = detail.get("table_changed")
+    diagnosis["reader_sees_target_channel"] = detail.get("reader_sees_target_channel")
     if detail.get("reader_row_count") is not None:
         diagnosis["table_reader_looks_correct"] = bool(
             detail.get("reader_distinct_channels") in (0, 1)
@@ -113,30 +135,44 @@ def _build_diagnosis(detail):
 
 def _diagnosis_notes(detail):
     notes = [HTTP_2XX_NOT_BUSINESS_SUCCESS_NOTE]
-    if not isinstance(detail, dict) or detail.get("filter_stable"):
-        return notes
-    if (
-        detail.get("list_requests_before") is not None
-        and detail.get("list_requests_after") is not None
-        and detail["list_requests_after"] <= detail["list_requests_before"]
-    ):
+    path = _filter_path_case(detail)
+    if path == "no_list_request":
         notes.append("点击搜索后没有观察到任何列表请求：优先怀疑点到了非渠道组的搜索按钮")
-    elif detail.get("last_http_status") and int(detail["last_http_status"]) >= 400:
-        notes.append("列表请求返回了非 2xx：优先怀疑会话/权限或参数被拒")
-    elif detail.get("elapsed_ms") is not None and detail["elapsed_ms"] >= 6000:
-        notes.append("6 秒预算内未完成稳定刷新：需要放宽预算或改判刷新条件")
-    else:
+    elif path == "request_missing_target_filter":
         notes.append(
-            "已观察到列表请求的 HTTP 状态，但表格行集未变化：优先怀疑筛选参数未随请求下发，"
-            "或表格读取选中的不是应用列表主表"
+            "列表请求已发出，但未携带目标渠道筛选；不要靠加长等待判断筛选是否生效"
         )
+    elif path == "request_has_filter_dom_not_on_target":
+        notes.append(
+            "列表请求已携带目标筛选，但行集未按目标刷新或读取未见目标渠道"
+        )
+    elif path == "dom_refreshed_with_target_channel":
+        notes.append("行集已变化且读取见到目标渠道；仍不等于 S4 通过")
+    if (
+        isinstance(detail, dict)
+        and detail.get("last_http_status")
+        and int(detail["last_http_status"]) >= 400
+    ):
+        notes.append("列表请求返回了非 2xx：优先怀疑会话/权限或参数被拒")
     return notes
 
 
 def _redact_obj(value):
+    drop_keys = {
+        "postData",
+        "post_data",
+        "request_body",
+        "response_body",
+        "query",
+        "token",
+        "authorization",
+        "cookie",
+    }
     if isinstance(value, dict):
         out = {}
         for key, item in value.items():
+            if key in drop_keys:
+                continue
             if key == "options" and isinstance(item, list):
                 out["options_redacted"] = True
                 if "option_count" not in value:

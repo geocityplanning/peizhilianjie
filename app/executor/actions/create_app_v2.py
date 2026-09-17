@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote, quote_plus
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -638,9 +639,15 @@ def _click_next_page_and_wait(page):
 
 
 class _ListRequestObserver(list):
-    """记录列表请求的观察结果，并持有 CDP 会话引用避免被回收。"""
+    """记录列表请求的 HTTP 状态，并持有 CDP 会话引用避免被回收。
 
-    keepalive = None
+    只保留状态码和“是否携带目标筛选”的布尔结果，不保存 URL、请求体或筛选原文。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.keepalive = None
+        self.carried_target_filter = False
 
 
 # 后台列表接口的实际路径是 /backend/cloudTrial/appInfo/getAppInfoList，
@@ -653,6 +660,32 @@ def _is_list_request_url(url):
     if any(marker in raw for marker in _LIST_URL_MARKERS):
         return True
     return "/backend/" in raw and raw.split("?")[0].endswith("List")
+
+
+def _request_carries_target_filter(url, post_data, target_filter):
+    """Return whether a list request payload contains the target filter value.
+
+    The function only returns a boolean. It does not keep or return the URL,
+    query string, request body, or channel text.
+    """
+    target = (target_filter or "").strip() if isinstance(target_filter, str) else ""
+    if not target:
+        return False
+    url_text = url if isinstance(url, str) else (url.decode("utf-8", "ignore") if isinstance(url, (bytes, bytearray)) else str(url or ""))
+    if isinstance(post_data, (bytes, bytearray)):
+        body_text = post_data.decode("utf-8", "ignore")
+    else:
+        body_text = post_data if isinstance(post_data, str) else str(post_data or "")
+    haystack = url_text + body_text
+    if target in haystack:
+        return True
+    encoded = quote(target, safe="")
+    if encoded and encoded in haystack:
+        return True
+    plus_encoded = quote_plus(target)
+    if plus_encoded and plus_encoded in haystack:
+        return True
+    return False
 
 
 def _detach_list_response_observer(observations):
@@ -671,22 +704,34 @@ def _detach_list_response_observer(observations):
             pass
 
 
-def _attach_list_response_observer(page):
-    """只读网络观察器：列表类请求是否发出、HTTP 状态。
+def _attach_list_response_observer(page, target_filter=None):
+    """只读网络观察器：列表类请求是否发出、HTTP 状态、是否携带目标筛选。
 
-    只记录"是否发出请求"和 HTTP 状态码，不保留 URL 参数、请求体、响应正文
-    或任何会话信息，符合只读定位自证的口径。
+    只记录状态码和布尔结果，不保留 URL 参数、请求体、响应正文、token
+    或筛选原文。target_filter 只在闭包里做包含判断，不写进观察结果。
 
     通过 CDP 接入的既有页面上，显式开一个 CDP 会话并启用 Network 域最可靠；
     失败再退回 Playwright 页面事件监听。两者都不可用时返回 None，调用方据此
     给出"未观察到请求"而不是失败。
     """
     observations = _ListRequestObserver()
-    request_urls = {}
+    list_request_ids = set()
 
-    def _record(url, status):
+    def _mark_list_request(url, post_data, request_id=None):
+        if not _is_list_request_url(url):
+            return False
+        if request_id is not None:
+            list_request_ids.add(request_id)
+        if _request_carries_target_filter(url, post_data, target_filter):
+            observations.carried_target_filter = True
+        return True
+
+    def _record_status(url, status, request_id=None):
         try:
-            if not _is_list_request_url(url):
+            if request_id is not None:
+                if request_id not in list_request_ids and not _is_list_request_url(url):
+                    return
+            elif not _is_list_request_url(url):
                 return
             observations.append(int(status or 0))
         except Exception:
@@ -699,21 +744,32 @@ def _attach_list_response_observer(page):
         def _on_request(params):
             try:
                 data = params or {}
-                request_urls[data.get("requestId")] = (data.get("request") or {}).get("url")
+                request = data.get("request") or {}
+                request_id = data.get("requestId")
+                url = request.get("url") or ""
+                post_data = request.get("postData") or ""
+                if not post_data and request.get("hasPostData") and request_id:
+                    try:
+                        extra = session.send("Network.getRequestPostData", {"requestId": request_id}) or {}
+                        post_data = extra.get("postData") or ""
+                    except Exception:
+                        post_data = ""
+                _mark_list_request(url, post_data, request_id)
             except Exception:
                 pass
 
         def _on_response(params):
             try:
-                response = (params or {}).get("response") or {}
-                _record(response.get("url"), response.get("status"))
+                data = params or {}
+                response = data.get("response") or {}
+                _record_status(response.get("url"), response.get("status"), data.get("requestId"))
             except Exception:
                 pass
 
         def _on_failed(params):
             try:
                 data = params or {}
-                _record(request_urls.get(data.get("requestId")), 0)
+                _record_status("", 0, data.get("requestId"))
             except Exception:
                 pass
 
@@ -726,12 +782,17 @@ def _attach_list_response_observer(page):
         pass
 
     try:
+        def _on_request(request):
+            post_data = getattr(request, "post_data", None) or ""
+            _mark_list_request(getattr(request, "url", ""), post_data)
+
         def _on_response(response):
-            _record(getattr(response, "url", ""), getattr(response, "status", 0))
+            _record_status(getattr(response, "url", ""), getattr(response, "status", 0))
 
         def _on_request_failed(request):
-            _record(getattr(request, "url", ""), 0)
+            _record_status(getattr(request, "url", ""), 0)
 
+        page.on("request", _on_request)
         page.on("response", _on_response)
         page.on("requestfailed", _on_request_failed)
     except Exception:
@@ -778,6 +839,7 @@ def _search_list_by_channel(page, channel_name, return_detail=False):
         "table_changed": False,
         "reader_sees_target_channel": None,
         "reader_distinct_channels": None,
+        "request_carried_target_filter": None,
     }
     opened = None
     selected = None
@@ -875,7 +937,7 @@ def _search_list_by_channel(page, channel_name, return_detail=False):
     detail["verify"] = True
 
     # 观察器只在"点搜索"这一步打开，用完即释放，少占用一条 CDP 通道。
-    observations = _attach_list_response_observer(page)
+    observations = _attach_list_response_observer(page, target_filter=channel_name)
     if observations is not None:
         detail["list_requests_before"] = len(observations)
     click_result = page.evaluate("""
@@ -958,6 +1020,11 @@ def _search_list_by_channel(page, channel_name, return_detail=False):
         detail["list_requests_after"] = len(observations)
         if len(observations) > detail.get("list_requests_before", 0):
             detail["last_http_status"] = observations[-1]
+            detail["request_carried_target_filter"] = bool(
+                getattr(observations, "carried_target_filter", False)
+            )
+        else:
+            detail["request_carried_target_filter"] = None
     _detach_list_response_observer(observations)
     if not stable:
         print(f"[create_app] 渠道筛选未稳定: {detail}")

@@ -8,8 +8,11 @@ from __future__ import annotations
 import sys
 import types
 
+from urllib.parse import quote
+
 LIST_URL = "https://example.invalid/backend/cloudTrial/appInfo/getAppInfoList"
 OTHER_URL = "https://example.invalid/static/app.js"
+SECRET_CHANNEL = "TARGET-CHANNEL-XYZ-机密"
 
 
 def _stub_login_and_import():
@@ -74,6 +77,12 @@ class FakeResponse:
         self.status = status
 
 
+class FakeRequest:
+    def __init__(self, url, post_data=""):
+        self.url = url
+        self.post_data = post_data
+
+
 class FakeSearchPage:
     def __init__(self, *, opened=True, selected=True, verified=True, click_result=None):
         self.opened = opened
@@ -109,10 +118,11 @@ def _install_search_mocks(
     stable=True,
     rows=None,
     on_wait=None,
+    pagination=None,
 ):
     monkeypatch.setattr(cap, "_reset_list_filters", lambda page: None)
     monkeypatch.setattr(cap, "_dismiss_stray_dropdowns", lambda page: None)
-    states = [
+    states = pagination or [
         {"page_number": 1, "table_signature": "A", "row_count": 5},
         {"page_number": 1, "table_signature": "B", "row_count": 2},
     ]
@@ -124,7 +134,11 @@ def _install_search_mocks(
         return states[idx]
 
     monkeypatch.setattr(cap, "_read_pagination_state", read_state)
-    monkeypatch.setattr(cap, "_attach_list_response_observer", lambda page: observations)
+    monkeypatch.setattr(
+        cap,
+        "_attach_list_response_observer",
+        lambda page, target_filter=None: observations,
+    )
 
     def wait_for_table_update(*args, **kwargs):
         if on_wait is not None:
@@ -305,3 +319,174 @@ def test_search_releases_session_even_when_search_click_fails(monkeypatch):
     assert detail["search_clicked"] is False
     assert session.detached is True
     assert observations.keepalive is None
+
+
+def test_request_carries_target_filter_matches_body_and_encoded_url():
+    cap = _stub_login_and_import()
+    assert cap._request_carries_target_filter(
+        LIST_URL, f'{{"channelName":"{SECRET_CHANNEL}"}}', SECRET_CHANNEL
+    ) is True
+    encoded_url = f"{LIST_URL}?name={quote(SECRET_CHANNEL, safe='')}"
+    assert cap._request_carries_target_filter(encoded_url, "", SECRET_CHANNEL) is True
+    assert cap._request_carries_target_filter(LIST_URL, "{\"pageNum\":1}", SECRET_CHANNEL) is False
+    assert cap._request_carries_target_filter(LIST_URL, SECRET_CHANNEL, "") is False
+
+
+def test_observer_marks_request_missing_target_filter():
+    cap = _stub_login_and_import()
+    session = FakeCdpSession()
+    page = FakePage(session=session)
+    observations = cap._attach_list_response_observer(page, target_filter=SECRET_CHANNEL)
+    session.emit(
+        "Network.requestWillBeSent",
+        {
+            "requestId": "r1",
+            "request": {"url": LIST_URL, "postData": '{"pageNum":1,"pageSize":10}'},
+        },
+    )
+    session.emit(
+        "Network.responseReceived",
+        {"requestId": "r1", "response": {"url": LIST_URL, "status": 200}},
+    )
+    assert list(observations) == [200]
+    assert observations.carried_target_filter is False
+    assert SECRET_CHANNEL not in str(vars(observations))
+    assert SECRET_CHANNEL not in str(list(observations))
+
+
+def test_observer_marks_request_carrying_target_filter_from_post_data():
+    cap = _stub_login_and_import()
+    session = FakeCdpSession()
+    page = FakePage(session=session)
+    observations = cap._attach_list_response_observer(page, target_filter=SECRET_CHANNEL)
+    session.emit(
+        "Network.requestWillBeSent",
+        {
+            "requestId": "r1",
+            "request": {
+                "url": LIST_URL,
+                "postData": f'{{"channelName":"{SECRET_CHANNEL}"}}',
+            },
+        },
+    )
+    session.emit(
+        "Network.responseReceived",
+        {"requestId": "r1", "response": {"url": LIST_URL, "status": 200}},
+    )
+    assert observations.carried_target_filter is True
+    assert not hasattr(observations, "target_filter")
+    assert SECRET_CHANNEL not in str(vars(observations))
+
+
+def test_observer_ignores_non_list_request_even_if_body_has_channel():
+    cap = _stub_login_and_import()
+    session = FakeCdpSession()
+    page = FakePage(session=session)
+    observations = cap._attach_list_response_observer(page, target_filter=SECRET_CHANNEL)
+    session.emit(
+        "Network.requestWillBeSent",
+        {
+            "requestId": "r1",
+            "request": {"url": OTHER_URL, "postData": SECRET_CHANNEL},
+        },
+    )
+    session.emit(
+        "Network.responseReceived",
+        {"requestId": "r1", "response": {"url": OTHER_URL, "status": 200}},
+    )
+    assert list(observations) == []
+    assert observations.carried_target_filter is False
+
+
+def test_page_event_fallback_reads_post_data_without_keeping_it():
+    cap = _stub_login_and_import()
+    page = FakePage(cdp_error=RuntimeError("no cdp"))
+    observations = cap._attach_list_response_observer(page, target_filter=SECRET_CHANNEL)
+    page.handlers["request"](FakeRequest(LIST_URL, SECRET_CHANNEL))
+    page.handlers["response"](FakeResponse(LIST_URL, 200))
+    assert list(observations) == [200]
+    assert observations.carried_target_filter is True
+    assert SECRET_CHANNEL not in str(vars(observations))
+
+
+def _unchanged_table():
+    return [
+        {"page_number": 1, "table_signature": "A", "row_count": 10},
+        {"page_number": 1, "table_signature": "A", "row_count": 10},
+    ]
+
+
+def test_search_case_request_missing_target_filter(monkeypatch):
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver()
+
+    def on_wait():
+        observations.append(200)
+        observations.carried_target_filter = False
+
+    _install_search_mocks(
+        monkeypatch,
+        cap,
+        observations=observations,
+        stable=False,
+        on_wait=on_wait,
+        pagination=_unchanged_table(),
+        rows=[{"channel_name": "other"}],
+    )
+    detail = cap._search_list_by_channel(
+        FakeSearchPage(), "chan", return_detail=True
+    )
+    assert detail["last_http_status"] == 200
+    assert detail["request_carried_target_filter"] is False
+    assert detail["table_changed"] is False
+    assert detail["reader_sees_target_channel"] is False
+
+
+def test_search_case_request_has_filter_dom_not_on_target(monkeypatch):
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver()
+
+    def on_wait():
+        observations.append(200)
+        observations.carried_target_filter = True
+
+    _install_search_mocks(
+        monkeypatch,
+        cap,
+        observations=observations,
+        stable=False,
+        on_wait=on_wait,
+        pagination=_unchanged_table(),
+        rows=[{"channel_name": "other"}],
+    )
+    detail = cap._search_list_by_channel(
+        FakeSearchPage(), "chan", return_detail=True
+    )
+    assert detail["request_carried_target_filter"] is True
+    assert detail["table_changed"] is False
+    assert detail["reader_sees_target_channel"] is False
+
+
+def test_search_case_dom_refreshed_with_target_channel(monkeypatch):
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver()
+
+    def on_wait():
+        observations.append(200)
+        observations.carried_target_filter = True
+
+    _install_search_mocks(
+        monkeypatch,
+        cap,
+        observations=observations,
+        stable=True,
+        on_wait=on_wait,
+        rows=[{"channel_name": "chan"}],
+    )
+    detail = cap._search_list_by_channel(
+        FakeSearchPage(), "chan", return_detail=True
+    )
+    assert detail["request_carried_target_filter"] is True
+    assert detail["table_changed"] is True
+    assert detail["reader_sees_target_channel"] is True
+    assert detail["filter_stable"] is True

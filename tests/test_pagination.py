@@ -1,3 +1,5 @@
+import inspect
+
 from app.executor.actions.pagination import wait_for_page_change, wait_for_table_update
 
 
@@ -94,3 +96,8 @@ def test_table_update_does_not_accept_page_number_change_alone():
     assert wait_for_table_update(
         page, state(1, "A"), read_state, timeout_ms=5, poll_interval_ms=1
     ) is False
+
+
+def test_table_update_default_timeout_remains_6000():
+    assert inspect.signature(wait_for_table_update).parameters["timeout_ms"].default == 6000
+    assert inspect.signature(wait_for_page_change).parameters["timeout_ms"].default == 6000
