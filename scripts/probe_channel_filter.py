@@ -94,13 +94,18 @@ def _filter_path_case(detail):
         return "request_missing_target_filter"
     if detail.get("table_changed") and detail.get("reader_sees_target_channel"):
         return "dom_refreshed_with_target_channel"
-    return "request_has_filter_dom_not_on_target"
+    if detail.get("response_contains_target_channel") is True:
+        return "response_has_target_dom_not_refreshed"
+    if detail.get("response_contains_target_channel") is False:
+        return "response_missing_target_channel"
+    return "unknown_no_response_body"
 
 
 def _build_diagnosis(detail):
     diagnosis = {
         "request_reached_backend": None,
         "request_carried_target_filter": None,
+        "response_contains_target_channel": None,
         "http_status_2xx_observed": None,
         "table_changed": None,
         "reader_sees_target_channel": None,
@@ -120,6 +125,7 @@ def _build_diagnosis(detail):
     else:
         diagnosis["request_reached_backend"] = after > before
     diagnosis["request_carried_target_filter"] = detail.get("request_carried_target_filter")
+    diagnosis["response_contains_target_channel"] = detail.get("response_contains_target_channel")
     diagnosis["http_status_2xx_observed"] = _http_status_2xx_observed(
         detail.get("last_http_status")
     )
@@ -142,9 +148,17 @@ def _diagnosis_notes(detail):
         notes.append(
             "列表请求已发出，但未携带目标渠道筛选；不要靠加长等待判断筛选是否生效"
         )
-    elif path == "request_has_filter_dom_not_on_target":
+    elif path == "response_missing_target_channel":
         notes.append(
-            "列表请求已携带目标筛选，但行集未按目标刷新或读取未见目标渠道"
+            "列表请求已携带目标筛选，但响应数据未含目标渠道；不要靠加长等待判断 DOM"
+        )
+    elif path == "response_has_target_dom_not_refreshed":
+        notes.append(
+            "响应数据已含目标渠道，但行集未刷新或读取未见目标渠道"
+        )
+    elif path == "unknown_no_response_body":
+        notes.append(
+            "列表请求已携带目标筛选，但未读到响应正文，无法判断响应是否含目标渠道"
         )
     elif path == "dom_refreshed_with_target_channel":
         notes.append("行集已变化且读取见到目标渠道；仍不等于 S4 通过")
@@ -163,6 +177,8 @@ def _redact_obj(value):
         "post_data",
         "request_body",
         "response_body",
+        "body",
+        "response_text",
         "query",
         "token",
         "authorization",

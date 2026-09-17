@@ -2,6 +2,7 @@
 """
 创建应用 — 契约版（v2，JS 直操 DOM，绕过 Playwright :visible 伪类）。
 """
+import base64
 import json
 import os
 import sys
@@ -641,13 +642,14 @@ def _click_next_page_and_wait(page):
 class _ListRequestObserver(list):
     """记录列表请求的 HTTP 状态，并持有 CDP 会话引用避免被回收。
 
-    只保留状态码和“是否携带目标筛选”的布尔结果，不保存 URL、请求体或筛选原文。
+    只保留状态码和布尔结果，不保存 URL、请求体、响应正文或筛选原文。
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.keepalive = None
         self.carried_target_filter = False
+        self.response_contains_target_channel = None
 
 
 # 后台列表接口的实际路径是 /backend/cloudTrial/appInfo/getAppInfoList，
@@ -705,10 +707,10 @@ def _detach_list_response_observer(observations):
 
 
 def _attach_list_response_observer(page, target_filter=None):
-    """只读网络观察器：列表类请求是否发出、HTTP 状态、是否携带目标筛选。
+    """只读网络观察器：列表请求、HTTP 状态、是否携带筛选、响应是否含目标。
 
-    只记录状态码和布尔结果，不保留 URL 参数、请求体、响应正文、token
-    或筛选原文。target_filter 只在闭包里做包含判断，不写进观察结果。
+    只记录状态码和布尔结果。响应正文只在内存中为已携带目标筛选的请求做
+    包含判断，随后丢弃；不写磁盘、日志、JSON 或观察器属性。
 
     通过 CDP 接入的既有页面上，显式开一个 CDP 会话并启用 Network 域最可靠；
     失败再退回 Playwright 页面事件监听。两者都不可用时返回 None，调用方据此
@@ -716,6 +718,16 @@ def _attach_list_response_observer(page, target_filter=None):
     """
     observations = _ListRequestObserver()
     list_request_ids = set()
+    carried_request_ids = set()
+
+    def _note_response_contains_target(contained):
+        if contained:
+            observations.response_contains_target_channel = True
+        elif observations.response_contains_target_channel is not True:
+            observations.response_contains_target_channel = False
+
+    def _body_contains_target(body):
+        return _request_carries_target_filter("", body, target_filter)
 
     def _mark_list_request(url, post_data, request_id=None):
         if not _is_list_request_url(url):
@@ -724,6 +736,8 @@ def _attach_list_response_observer(page, target_filter=None):
             list_request_ids.add(request_id)
         if _request_carries_target_filter(url, post_data, target_filter):
             observations.carried_target_filter = True
+            if request_id is not None:
+                carried_request_ids.add(request_id)
         return True
 
     def _record_status(url, status, request_id=None):
@@ -740,6 +754,23 @@ def _attach_list_response_observer(page, target_filter=None):
     try:
         session = page.context.new_cdp_session(page)
         session.send("Network.enable")
+
+        def _inspect_cdp_body(request_id):
+            if request_id not in carried_request_ids:
+                return
+            try:
+                result = session.send("Network.getResponseBody", {"requestId": request_id})
+            except Exception:
+                return
+            if not isinstance(result, dict) or "body" not in result:
+                return
+            body = result.get("body") or ""
+            try:
+                if result.get("base64Encoded") and isinstance(body, str):
+                    body = base64.b64decode(body).decode("utf-8", "ignore")
+                _note_response_contains_target(_body_contains_target(body))
+            finally:
+                body = None
 
         def _on_request(params):
             try:
@@ -766,6 +797,12 @@ def _attach_list_response_observer(page, target_filter=None):
             except Exception:
                 pass
 
+        def _on_finished(params):
+            try:
+                _inspect_cdp_body((params or {}).get("requestId"))
+            except Exception:
+                pass
+
         def _on_failed(params):
             try:
                 data = params or {}
@@ -775,6 +812,7 @@ def _attach_list_response_observer(page, target_filter=None):
 
         session.on("Network.requestWillBeSent", _on_request)
         session.on("Network.responseReceived", _on_response)
+        session.on("Network.loadingFinished", _on_finished)
         session.on("Network.loadingFailed", _on_failed)
         observations.keepalive = session
         return observations
@@ -787,7 +825,29 @@ def _attach_list_response_observer(page, target_filter=None):
             _mark_list_request(getattr(request, "url", ""), post_data)
 
         def _on_response(response):
-            _record_status(getattr(response, "url", ""), getattr(response, "status", 0))
+            url = getattr(response, "url", "") or ""
+            _record_status(url, getattr(response, "status", 0))
+            request = getattr(response, "request", None)
+            req_url = getattr(request, "url", url) if request is not None else url
+            post_data = getattr(request, "post_data", None) if request is not None else ""
+            if not _is_list_request_url(req_url or url):
+                return
+            if not _request_carries_target_filter(req_url or url, post_data or "", target_filter):
+                return
+            body = None
+            try:
+                if hasattr(response, "text"):
+                    body = response.text()
+                elif hasattr(response, "body"):
+                    raw = response.body()
+                    body = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else raw
+                if body is None:
+                    return
+                _note_response_contains_target(_body_contains_target(body))
+            except Exception:
+                return
+            finally:
+                body = None
 
         def _on_request_failed(request):
             _record_status(getattr(request, "url", ""), 0)
@@ -840,6 +900,7 @@ def _search_list_by_channel(page, channel_name, return_detail=False):
         "reader_sees_target_channel": None,
         "reader_distinct_channels": None,
         "request_carried_target_filter": None,
+        "response_contains_target_channel": None,
     }
     opened = None
     selected = None
@@ -1023,8 +1084,15 @@ def _search_list_by_channel(page, channel_name, return_detail=False):
             detail["request_carried_target_filter"] = bool(
                 getattr(observations, "carried_target_filter", False)
             )
+            if detail["request_carried_target_filter"]:
+                detail["response_contains_target_channel"] = getattr(
+                    observations, "response_contains_target_channel", None
+                )
+            else:
+                detail["response_contains_target_channel"] = None
         else:
             detail["request_carried_target_filter"] = None
+            detail["response_contains_target_channel"] = None
     _detach_list_response_observer(observations)
     if not stable:
         print(f"[create_app] 渠道筛选未稳定: {detail}")

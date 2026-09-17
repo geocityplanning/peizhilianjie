@@ -129,20 +129,51 @@ def test_filter_path_distinguishes_three_requested_cases():
     assert missing["http_status_2xx_observed"] is True
     assert "加长等待" in "\n".join(probe._diagnosis_notes(missing_detail))
 
-    has_filter = {
+    missing_response = {
         "list_requests_before": 0,
         "list_requests_after": 1,
         "last_http_status": 200,
         "request_carried_target_filter": True,
+        "response_contains_target_channel": False,
         "table_changed": False,
         "reader_sees_target_channel": False,
         "filter_stable": False,
     }
-    diagnosis = probe._build_diagnosis(has_filter)
-    assert diagnosis["filter_path"] == "request_has_filter_dom_not_on_target"
-    notes = "\n".join(probe._diagnosis_notes(has_filter))
-    assert "已携带目标筛选" in notes
+    diagnosis = probe._build_diagnosis(missing_response)
+    assert diagnosis["filter_path"] == "response_missing_target_channel"
+    assert diagnosis["response_contains_target_channel"] is False
+    notes = "\n".join(probe._diagnosis_notes(missing_response))
+    assert "响应数据未含目标渠道" in notes
     assert SECRET_CHANNEL not in notes
+
+    has_response = {
+        "list_requests_before": 0,
+        "list_requests_after": 1,
+        "last_http_status": 200,
+        "request_carried_target_filter": True,
+        "response_contains_target_channel": True,
+        "table_changed": False,
+        "reader_sees_target_channel": False,
+        "filter_stable": False,
+    }
+    diagnosis = probe._build_diagnosis(has_response)
+    assert diagnosis["filter_path"] == "response_has_target_dom_not_refreshed"
+    notes = "\n".join(probe._diagnosis_notes(has_response))
+    assert "响应数据已含目标渠道" in notes
+
+    no_body = {
+        "list_requests_before": 0,
+        "list_requests_after": 1,
+        "last_http_status": 200,
+        "request_carried_target_filter": True,
+        "response_contains_target_channel": None,
+        "table_changed": False,
+        "reader_sees_target_channel": False,
+        "filter_stable": False,
+    }
+    diagnosis = probe._build_diagnosis(no_body)
+    assert diagnosis["filter_path"] == "unknown_no_response_body"
+    assert diagnosis["response_contains_target_channel"] is None
 
     refreshed = probe._build_diagnosis(
         {
