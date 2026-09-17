@@ -2,15 +2,16 @@
 """渠道筛选只读定位自证探针（REAL）。
 
 用途：在真实 UAT 页面上收窄"搜索已点击而行集未变"的原因，回答四个问题：
-  1. 检索参数是否真正落到后台列表请求   -> list_requests_after / last_http_status
-  2. 响应是否成功                       -> last_http_status（2xx 视为已成功返回）
+  1. 点击搜索后是否观察到列表请求     -> list_requests_after / last_http_status
+  2. 观察到的列表请求是否 HTTP 2xx   -> http_status_2xx_observed（仅网络层，不等于业务成功）
   3. 表格读取是否选对主行               -> reader_row_count / reader_sees_target_channel
   4. 6 秒预算内是否完成稳定刷新         -> filter_stable / elapsed_ms / table_changed
 
 安全边界（重要）：
   - 只做只读操作：导航列表页、点"重置"、选渠道、点"搜索"、翻页、展开行。
   - 绝不调用 create_channel / create_app / 上线 / 分组 / 删除 / 恢复。
-  - 不读取或输出凭证；报告里渠道名与响应正文一律不落地。
+  - 不读取或输出凭证；默认 JSON 只输出脱敏后的渠道、页面和样本标识。
+  - 原始渠道选项只允许本机 TTY 查看，不写入交接文档、日志或可转发 JSON。
   - 登录模块在内存中被替换为桩，不会启动登录流程，也不需要 config.json。
 
 用法（先让 Chrome 以 9222 打开并登录 UAT 管理页）：
@@ -48,10 +49,131 @@ def _install_login_stub() -> None:
 
 
 def _mask(value: str) -> str:
-    raw = value or ""
+    raw = value if isinstance(value, str) else str(value or "")
     if len(raw) <= 4:
         return "*" * len(raw)
     return f"{raw[:2]}{'*' * (len(raw) - 4)}{raw[-2:]}"
+
+
+def _mask_url(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw:
+        return raw
+    fragment = ""
+    if "#" in raw:
+        fragment = raw.split("#", 1)[1].split("?", 1)[0]
+        fragment = f"#{fragment}" if fragment else ""
+    return f"[redacted-url]{fragment}"
+
+
+HTTP_2XX_NOT_BUSINESS_SUCCESS_NOTE = (
+    "http_status_2xx_observed 只表示观察到列表请求的 HTTP 2xx，"
+    "不等于业务查询成功、应用定位成功或 S4 通过"
+)
+
+
+def _http_status_2xx_observed(status):
+    if status is None:
+        return "NO_RESPONSE_OBSERVED"
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return "NO_RESPONSE_OBSERVED"
+    return 200 <= code < 300
+
+
+def _build_diagnosis(detail):
+    diagnosis = {
+        "request_reached_backend": None,
+        "http_status_2xx_observed": None,
+        "table_reader_looks_correct": None,
+        "refresh_stable_within_budget": bool(
+            isinstance(detail, dict) and detail.get("filter_stable")
+        ),
+        "http_2xx_is_not_business_success": True,
+    }
+    if not isinstance(detail, dict):
+        return diagnosis
+    before = detail.get("list_requests_before")
+    after = detail.get("list_requests_after")
+    if before is None or after is None:
+        diagnosis["request_reached_backend"] = "UNKNOWN_NO_OBSERVER"
+    else:
+        diagnosis["request_reached_backend"] = after > before
+    diagnosis["http_status_2xx_observed"] = _http_status_2xx_observed(
+        detail.get("last_http_status")
+    )
+    if detail.get("reader_row_count") is not None:
+        diagnosis["table_reader_looks_correct"] = bool(
+            detail.get("reader_distinct_channels") in (0, 1)
+            and detail.get("reader_sees_target_channel")
+        ) or bool(detail.get("reader_row_count"))
+    return diagnosis
+
+
+def _diagnosis_notes(detail):
+    notes = [HTTP_2XX_NOT_BUSINESS_SUCCESS_NOTE]
+    if not isinstance(detail, dict) or detail.get("filter_stable"):
+        return notes
+    if (
+        detail.get("list_requests_before") is not None
+        and detail.get("list_requests_after") is not None
+        and detail["list_requests_after"] <= detail["list_requests_before"]
+    ):
+        notes.append("点击搜索后没有观察到任何列表请求：优先怀疑点到了非渠道组的搜索按钮")
+    elif detail.get("last_http_status") and int(detail["last_http_status"]) >= 400:
+        notes.append("列表请求返回了非 2xx：优先怀疑会话/权限或参数被拒")
+    elif detail.get("elapsed_ms") is not None and detail["elapsed_ms"] >= 6000:
+        notes.append("6 秒预算内未完成稳定刷新：需要放宽预算或改判刷新条件")
+    else:
+        notes.append(
+            "已观察到列表请求的 HTTP 状态，但表格行集未变化：优先怀疑筛选参数未随请求下发，"
+            "或表格读取选中的不是应用列表主表"
+        )
+    return notes
+
+
+def _redact_obj(value):
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key == "options" and isinstance(item, list):
+                out["options_redacted"] = True
+                if "option_count" not in value:
+                    out["option_count"] = len(item)
+                continue
+            if key in {"url", "current_url", "url_before_navigate"}:
+                out[key] = _mask_url(item if isinstance(item, str) else str(item or ""))
+            elif key in {"current_value", "channel"} and item not in (None, ""):
+                text = str(item)
+                out[key] = text if "*" in text else _mask(text)
+            elif key == "sample_ids" and isinstance(item, list):
+                out[key] = [_mask(str(x)) for x in item]
+                out["sample_ids_redacted"] = True
+            elif key == "app_id" and item not in (None, ""):
+                out[key] = _mask(str(item))
+            else:
+                out[key] = _redact_obj(item)
+        return out
+    if isinstance(value, list):
+        return [_redact_obj(item) for item in value]
+    return value
+
+
+def _emit_local_channel_options(options, stream=None) -> bool:
+    stream = sys.stderr if stream is None else stream
+    isatty = getattr(stream, "isatty", None)
+    if not callable(isatty) or not isatty():
+        return False
+    stream.write("LOCAL-ONLY channel options; do not copy into handoff JSON or logs:\n")
+    for index, name in enumerate(options or []):
+        stream.write(f"  {index}\t{name}\n")
+    stream.flush()
+    return True
+
+
+def _dump_report(report) -> str:
+    return json.dumps(_redact_obj(report), ensure_ascii=False, indent=2)
 
 
 RECON_JS = """
@@ -168,13 +290,13 @@ def _navigate_to_list(page, url: str, report: dict) -> None:
     内部 visible 与 DOM 失步，下一次点击反而把下拉关掉，从而产出假的
     "控件打不开"结论。重新加载是只读 GET，代价可接受且结果可复现。
     """
-    report["url_before_navigate"] = page.url
+    report["url_before_navigate"] = _mask_url(page.url)
     page.goto(url, wait_until="domcontentloaded")
     try:
         page.wait_for_selector("table tbody tr", timeout=15000)
     except Exception:
         page.wait_for_timeout(3000)
-    report["current_url"] = page.url
+    report["current_url"] = _mask_url(page.url)
     report["notes"].append("已只读重新加载应用列表页，确保无残留筛选/下拉状态")
 
 
@@ -183,7 +305,7 @@ def _recon(page, report: dict) -> None:
     from actions import create_app_v2 as cap  # noqa: PLC0415
 
     structure = page.evaluate(RECON_JS)
-    report["steps"]["recon"] = structure
+    report["steps"]["recon"] = _redact_obj(structure)
 
     channel_index = None
     for item in structure.get("selects") or []:
@@ -215,10 +337,17 @@ def _recon(page, report: dict) -> None:
       .filter(dd => dd.offsetParent !== null && dd.style.display !== 'none').length""")
     if leftover:
         report["notes"].append(f"下拉未能自动收起（仍有 {leftover} 个可见），本次结果按现场原样记录")
-    report["steps"]["channel_options"] = options
+    raw_options = options.get("options") or []
+    shown_locally = _emit_local_channel_options(raw_options)
+    report["steps"]["channel_options"] = {
+        "opened": True,
+        "visible_dropdown_count": options.get("visible_dropdown_count"),
+        "option_count": options.get("option_count") or len(raw_options),
+        "options_redacted": True,
+        "options_shown_on_local_tty": shown_locally,
+    }
     report["notes"].append(
-        "channel_options.options 是 UAT 当前渠道下拉的原始选项，仅供本机挑选 --channel，"
-        "不要原样写进给编排端的报告"
+        "原始渠道选项只允许本机 TTY 查看，不写入 JSON、日志或交接文档"
     )
     report["diagnosis_hints"] = {
         "multiple_search_buttons": structure.get("search_button_count", 0) > 1,
@@ -257,7 +386,7 @@ def main() -> int:
     except Exception as exc:
         report["ok"] = False
         report["error"] = f"无法连接 CDP 浏览器: {type(exc).__name__}: {exc}"
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print(_dump_report(report))
         return 2
 
     try:
@@ -266,62 +395,22 @@ def main() -> int:
         if args.recon:
             _recon(page, report)
             report["ok"] = True
-            print(json.dumps(report, ensure_ascii=False, indent=2))
+            print(_dump_report(report))
             return 0
 
         from actions import create_app_v2 as cap  # noqa: PLC0415
 
         detail = cap._search_list_by_channel(page, args.channel, return_detail=True)
         report["steps"]["channel_filter"] = detail if isinstance(detail, dict) else {"result": detail}
-
-        report["diagnosis"] = {
-            "request_reached_backend": None,
-            "response_ok": None,
-            "table_reader_looks_correct": None,
-            "refresh_stable_within_budget": bool(
-                isinstance(detail, dict) and detail.get("filter_stable")
-            ),
-        }
-        if isinstance(detail, dict):
-            before = detail.get("list_requests_before")
-            after = detail.get("list_requests_after")
-            if before is None or after is None:
-                report["diagnosis"]["request_reached_backend"] = "UNKNOWN_NO_OBSERVER"
-            else:
-                report["diagnosis"]["request_reached_backend"] = after > before
-            status = detail.get("last_http_status")
-            if status is None:
-                report["diagnosis"]["response_ok"] = "NO_RESPONSE_OBSERVED"
-            else:
-                report["diagnosis"]["response_ok"] = 200 <= int(status) < 300
-            if detail.get("reader_row_count") is not None:
-                report["diagnosis"]["table_reader_looks_correct"] = bool(
-                    detail.get("reader_distinct_channels") in (0, 1)
-                    and detail.get("reader_sees_target_channel")
-                ) or bool(detail.get("reader_row_count"))
-            if not detail.get("filter_stable"):
-                if detail.get("list_requests_before") is not None and detail.get(
-                    "list_requests_after"
-                ) is not None and detail["list_requests_after"] <= detail["list_requests_before"]:
-                    report["notes"].append(
-                        "点击搜索后没有观察到任何列表请求：优先怀疑点到了非渠道组的搜索按钮"
-                    )
-                elif detail.get("last_http_status") and int(detail["last_http_status"]) >= 400:
-                    report["notes"].append("列表请求返回了非 2xx：优先怀疑会话/权限或参数被拒")
-                elif detail.get("elapsed_ms") is not None and detail["elapsed_ms"] >= 6000:
-                    report["notes"].append("6 秒预算内未完成稳定刷新：需要放宽预算或改判刷新条件")
-                else:
-                    report["notes"].append(
-                        "请求已发出且返回正常，但表格行集未变化：优先怀疑筛选参数未随请求下发，"
-                        "或表格读取选中的不是应用列表主表"
-                    )
+        report["diagnosis"] = _build_diagnosis(detail)
+        report["notes"].extend(_diagnosis_notes(detail))
 
         if args.app_id:
             located = cap._find_target_row_by_id(page, args.app_id, args.channel)
             report["steps"]["exact_app_id_lookup"] = {
                 "found": bool(located.get("found")),
                 "reason": located.get("reason"),
-                "app_id": args.app_id,
+                "app_id": _mask(args.app_id),
             }
             report["notes"].append("按 ID 未找到不等于不存在：筛选未生效时只能判定未验证")
 
@@ -335,7 +424,7 @@ def main() -> int:
         except Exception:
             pass
 
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(_dump_report(report))
     return 0 if report.get("ok") else 1
 
 
