@@ -111,13 +111,17 @@ class CloseProbePage:
         close_after_polls=0,
         click_returns=True,
         always_open=False,
-        raise_on_visible=False,
+        raise_on_initial_visible=False,
+        raise_after_click=False,
+        raise_on_click=False,
     ):
         self.initially_open = initially_open
         self.close_after_polls = close_after_polls
         self.click_returns = click_returns
         self.always_open = always_open
-        self.raise_on_visible = raise_on_visible
+        self.raise_on_initial_visible = raise_on_initial_visible
+        self.raise_after_click = raise_after_click
+        self.raise_on_click = raise_on_click
         self.click_count = 0
         self.polls_after_click = 0
         self.clicked = False
@@ -127,15 +131,19 @@ class CloseProbePage:
         text = script if isinstance(script, str) else ""
         self.scripts.append(text)
         if "COPY_DIALOG_VISIBLE" in text:
-            if self.raise_on_visible:
-                raise RuntimeError("visible boom")
             if not self.clicked:
+                if self.raise_on_initial_visible:
+                    raise RuntimeError("visible boom")
                 return self.initially_open
+            if self.raise_after_click:
+                raise RuntimeError("visible boom")
             self.polls_after_click += 1
             if self.always_open:
                 return True
             return self.polls_after_click <= self.close_after_polls
         if "COPY_DIALOG_CLICK" in text:
+            if self.raise_on_click:
+                raise RuntimeError("click boom")
             self.click_count += 1
             self.clicked = True
             return self.click_returns
@@ -189,11 +197,33 @@ def test_visibility_predicate_covers_hidden_states():
 
 def test_close_exception_path_does_not_click_or_save():
     probe = _load_probe()
-    page = CloseProbePage(raise_on_visible=True)
-    # A visibility-check exception is treated as "not open", so nothing is clicked.
-    assert probe._close_copy_dialog(page) is True
+    page = CloseProbePage(raise_on_initial_visible=True)
+    # Unreadable visibility cannot prove the dialog is closed: fail closed.
+    assert probe._close_copy_dialog(page) is False
     assert page.click_count == 0
     assert not any("保存" in script for script in page.scripts)
+
+
+def test_close_poll_exception_fails_closed_no_save():
+    probe = _load_probe()
+    page = CloseProbePage(initially_open=True, raise_after_click=True)
+    assert probe._close_copy_dialog(page) is False
+    assert page.click_count == 1
+    assert not any("保存" in script for script in page.scripts)
+
+
+def test_close_click_exception_fails_closed_no_save():
+    probe = _load_probe()
+    page = CloseProbePage(initially_open=True, raise_on_click=True)
+    assert probe._close_copy_dialog(page) is False
+    assert page.click_count == 0
+    assert not any("保存" in script for script in page.scripts)
+
+
+def test_copy_dialog_open_still_reports_not_open_on_read_failure():
+    probe = _load_probe()
+    page = CloseProbePage(initially_open=True, raise_on_initial_visible=True)
+    assert probe._copy_dialog_open(page) is False
 
 
 def test_close_failure_in_acceptance_report_zero_save_no_write(monkeypatch):

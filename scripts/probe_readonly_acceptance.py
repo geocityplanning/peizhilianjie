@@ -211,14 +211,21 @@ _COPY_DIALOG_CLICK_JS = """() => {
 }"""
 
 
+def _copy_dialog_visible(page) -> bool:
+    """Strict visibility read that raises when the page cannot be inspected."""
+    return bool(page.evaluate(_COPY_DIALOG_VISIBLE_JS))
+
+
 def _copy_dialog_open(page) -> bool:
     """True only when a copy dialog wrapper is actually visible.
 
     Uses computed style, aria-hidden and real geometry instead of the inline
-    `style.display` alone, so a closing animation is not reported as open.
+    `style.display` alone, so a closing animation is not reported as open. A
+    read failure is reported as not open for the pre-flight probe; the close
+    path uses the strict reader so it can fail closed instead.
     """
     try:
-        return bool(page.evaluate(_COPY_DIALOG_VISIBLE_JS))
+        return _copy_dialog_visible(page)
     except Exception:
         return False
 
@@ -228,20 +235,31 @@ def _close_copy_dialog(page) -> bool:
 
     Already closed is a success without any click. A visible dialog is clicked
     at most once; the confirmation then polls a short bounded budget without
-    clicking again, and stays fail-closed when it never becomes invisible.
+    clicking again. Unreadable visibility, a failed click or a still-visible
+    dialog after the budget all return False, so the caller never records a
+    close that could not actually be confirmed.
     """
-    if not _copy_dialog_open(page):
-        return True
+    try:
+        if not _copy_dialog_visible(page):
+            return True
+    except Exception:
+        return False
     try:
         clicked = bool(page.evaluate(_COPY_DIALOG_CLICK_JS))
     except Exception:
         return False
     if not clicked:
-        return not _copy_dialog_open(page)
+        try:
+            return not _copy_dialog_visible(page)
+        except Exception:
+            return False
     for _ in range(COPY_DIALOG_CLOSE_POLL_ATTEMPTS):
-        page.wait_for_timeout(COPY_DIALOG_CLOSE_POLL_INTERVAL_MS)
-        if not _copy_dialog_open(page):
-            return True
+        try:
+            page.wait_for_timeout(COPY_DIALOG_CLOSE_POLL_INTERVAL_MS)
+            if not _copy_dialog_visible(page):
+                return True
+        except Exception:
+            return False
     return False
 
 
