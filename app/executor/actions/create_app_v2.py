@@ -200,67 +200,230 @@ def _js_select(page, label, value):
     return picked
 
 
-def _js_channel_popover(page, label, channel_name):
-    """Select a unique exact channel option. No prefix or contains fallback."""
-    opened = page.evaluate("""
-    (label) => {
-      const wrappers = document.querySelectorAll('.el-dialog__wrapper');
-      for (const w of wrappers) {
-        if (w.style.display === 'none') continue;
-        const items = w.querySelectorAll('.el-form-item');
-        for (const it of items) {
-          if (it.offsetParent === null) continue;
-          const lblEl = it.querySelector('.el-form-item__label');
-          if (!lblEl) continue;
-          if (lblEl.innerText.includes(label)) {
-            const ci = it.querySelector('.channel-input');
-            if (ci) { ci.click(); return true; }
-          }
-        }
-      }
-      return false;
+_CHANNEL_LAYER_COMMON_JS = """
+  const HERMES_CHANNEL_MARKERS =
+    '.channel-popover, .el-popover, [id^="el-popover-"], .el-select-dropdown';
+  const HERMES_OPTION_ATTR = 'data-hermes-channel-option';
+  const hermesShown = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const hermesCopyDialog = () => {
+    const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+    for (const wrapper of wrappers) {
+      if (wrapper.style.display === 'none') continue;
+      if (wrapper.querySelectorAll('.el-tabs__item').length === 0) continue;
+      return wrapper;
     }
-    """, label)
+    return null;
+  };
+  const hermesChannelInput = (dialog, label) => {
+    if (!dialog) return null;
+    const wanted = (label || '').replace(/[ *:：]/g, '');
+    for (const item of dialog.querySelectorAll('.el-form-item')) {
+      if (item.offsetParent === null) continue;
+      const labelEl = item.querySelector('.el-form-item__label');
+      if (!labelEl) continue;
+      const text = (labelEl.innerText || '').replace(/[ *:：]/g, '').trim();
+      if (wanted && !text.includes(wanted)) continue;
+      const input = item.querySelector('.channel-input');
+      if (input) return input;
+    }
+    return null;
+  };
+  const hermesDialogSelectOpen = (dialog) => {
+    if (!dialog) return false;
+    return Array.from(dialog.querySelectorAll('.el-select')).some((sel) => {
+      return sel.classList.contains('is-focus') || Boolean(sel.querySelector('.el-input.is-focus'));
+    });
+  };
+  const hermesAnchored = (node, input) => {
+    if (!input) return false;
+    const r = node.getBoundingClientRect();
+    const i = input.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0 || i.width <= 0) return false;
+    const overlap = Math.min(r.right, i.right) - Math.max(r.left, i.left);
+    if (overlap < Math.max(8, i.width * 0.3)) return false;
+    const gap = r.top >= i.bottom ? r.top - i.bottom : (i.top >= r.bottom ? i.top - r.bottom : 0);
+    return gap < 240;
+  };
+  const hermesLayerNodes = () => Array.from(document.querySelectorAll(HERMES_CHANNEL_MARKERS));
+  const hermesLayerState = (node, dialog, input) => ({
+    shown: hermesShown(node),
+    aria_hidden: node.getAttribute('aria-hidden') === 'true',
+    is_select_dropdown: node.classList.contains('el-select-dropdown'),
+    dialog_select_open: hermesDialogSelectOpen(dialog),
+    in_copy_dialog: Boolean(dialog && dialog.contains(node)),
+    anchored_to_channel_input: hermesAnchored(node, input),
+    is_channel_popover: node.classList.contains('channel-popover'),
+  });
+  const hermesClearMarkers = () => {
+    for (const node of document.querySelectorAll('[' + HERMES_OPTION_ATTR + ']')) {
+      node.removeAttribute(HERMES_OPTION_ATTR);
+    }
+  };
+"""
+
+
+def _channel_layer_is_usable(layer):
+    """Keep only the current visible copy-dialog channel layer.
+
+    A layer must be positively bound to the current copy dialog or its channel
+    input: it is `.channel-popover`, or it lives inside the visible copy dialog,
+    or it is anchored to that dialog's channel input. Hidden, aria-hidden, other
+    form poppers and leftover list `el-select-dropdown` layers are excluded.
+    """
+    if not isinstance(layer, dict):
+        return False
+    if not layer.get("shown") or layer.get("aria_hidden"):
+        return False
+    if layer.get("is_select_dropdown") and not layer.get("dialog_select_open"):
+        return False
+    return bool(
+        layer.get("is_channel_popover")
+        or layer.get("in_copy_dialog")
+        or layer.get("anchored_to_channel_input")
+    )
+
+
+def _match_channel_option(snapshot, channel_name):
+    """Count exact option texts on usable layers only. No prefix/contains."""
+    target = (channel_name or "").strip()
+    if not target or not isinstance(snapshot, dict) or not snapshot.get("has_dialog"):
+        return {"exact_count": 0, "option_index": None}
+    hits = []
+    for layer in snapshot.get("layers") or []:
+        if not _channel_layer_is_usable(layer):
+            continue
+        for option in layer.get("options") or []:
+            if not isinstance(option, dict):
+                continue
+            if option.get("text") == target:
+                hits.append(option.get("index"))
+    if len(hits) == 1:
+        return {"exact_count": 1, "option_index": hits[0]}
+    return {"exact_count": len(hits), "option_index": None}
+
+
+_CHANNEL_LAYER_OPEN_JS = (
+    """
+(label) => {
+  /* CHANNEL_LAYER_OPEN */
+"""
+    + _CHANNEL_LAYER_COMMON_JS
+    + """
+  const dialog = hermesCopyDialog();
+  const input = hermesChannelInput(dialog, label);
+  if (!input) return false;
+  input.click();
+  return true;
+}
+"""
+)
+
+
+_CHANNEL_LAYER_SNAPSHOT_JS = (
+    """
+(label) => {
+  /* CHANNEL_LAYER_SNAPSHOT */
+"""
+    + _CHANNEL_LAYER_COMMON_JS
+    + """
+  const dialog = hermesCopyDialog();
+  const input = hermesChannelInput(dialog, label);
+  const layers = [];
+  let ordinal = 0;
+  for (const node of hermesLayerNodes()) {
+    const state = hermesLayerState(node, dialog, input);
+    const candidates = node.querySelectorAll('li, td, span, div, a, p, [role="option"]');
+    const els = [];
+    for (const el of candidates) {
+      if (el.offsetParent === null) continue;
+      const text = el.innerText ? el.innerText.trim() : '';
+      if (!text) continue;
+      els.push(el);
+    }
+    const innermost = els.filter((el) => !els.some((other) => other !== el && el.contains(other)));
+    const options = [];
+    for (const el of innermost) {
+      const text = (el.innerText || '').trim();
+      if (!text) continue;
+      el.setAttribute(HERMES_OPTION_ATTR, String(ordinal));
+      options.push({index: ordinal, text});
+      ordinal += 1;
+    }
+    layers.push(Object.assign(state, {options}));
+  }
+  return {has_dialog: Boolean(dialog), layers};
+}
+"""
+)
+
+_CHANNEL_OPTION_CLICK_JS = """
+(index) => {
+  /* CHANNEL_OPTION_CLICK */
+  if (index === null || index === undefined) return false;
+  const node = document.querySelector('[data-hermes-channel-option="' + String(index) + '"]');
+  if (!node) return false;
+  node.click();
+  return true;
+}
+"""
+
+_CHANNEL_LAYER_CLEANUP_JS = (
+    """
+() => {
+  /* CHANNEL_LAYER_CLEANUP */
+"""
+    + _CHANNEL_LAYER_COMMON_JS
+    + """
+  const dialog = hermesCopyDialog();
+  const input = hermesChannelInput(dialog, null);
+  hermesClearMarkers();
+  for (const node of hermesLayerNodes()) {
+    if (node.classList.contains('el-select-dropdown')) continue;
+    const state = hermesLayerState(node, dialog, input);
+    if (!state.shown || state.aria_hidden) continue;
+    const bound = state.is_channel_popover || state.in_copy_dialog || state.anchored_to_channel_input;
+    if (bound) node.style.display = 'none';
+  }
+  return true;
+}
+"""
+)
+
+
+def _js_channel_popover(page, label, channel_name):
+    """Select a unique exact channel option from the current copy-dialog layer."""
+    opened = page.evaluate(_CHANNEL_LAYER_OPEN_JS, label)
     if not opened:
         return {"opened": False, "exact_count": 0, "clicked": False}
-    page.wait_for_timeout(1500)
-    picked = page.evaluate("""
-    (name) => {
-      const pops = document.querySelectorAll('[id^="el-popover-"], .el-popover, .el-popper, .channel-popover');
-      const exact = [];
-      for (const p of pops) {
-        if (p.style.display === 'none') continue;
-        const candidates = p.querySelectorAll('li, td, span, div, a, p, [role="option"]');
-        for (const el of candidates) {
-          if (el.offsetParent === null) continue;
-          const t = el.innerText ? el.innerText.trim() : '';
-          if (t === name) exact.push(el);
-        }
-      }
-      const innermost = exact.filter(el => !exact.some(other => other !== el && el.contains(other)));
-      if (innermost.length !== 1) {
-        return {exact_count: innermost.length, clicked: false};
-      }
-      innermost[0].click();
-      return {exact_count: 1, clicked: true};
-    }
-    """, channel_name) or {}
-    clicked = bool(picked.get("clicked"))
-    if clicked:
+    last = {"exact_count": 0, "clicked": False}
+    for _ in range(15):
+        snapshot = page.evaluate(_CHANNEL_LAYER_SNAPSHOT_JS, label) or {}
+        matched = _match_channel_option(snapshot, channel_name)
+        last["exact_count"] = int(matched.get("exact_count") or 0)
+        if last["exact_count"] > 1:
+            break
+        if last["exact_count"] == 1:
+            last["clicked"] = bool(
+                page.evaluate(_CHANNEL_OPTION_CLICK_JS, matched.get("option_index"))
+            )
+            break
+        page.wait_for_timeout(100)
+    if last.get("clicked"):
         page.wait_for_timeout(500)
-        page.evaluate("""
-        () => {
-          const pops = document.querySelectorAll('.el-popover, .el-popper, [id^="el-popover-"]');
-          for (const p of pops) {
-            if (p.style.display !== 'none') p.style.display = 'none';
-          }
-        }
-        """)
+    page.evaluate(_CHANNEL_LAYER_CLEANUP_JS)
+    if last.get("clicked"):
         page.wait_for_timeout(300)
     return {
         "opened": True,
-        "exact_count": int(picked.get("exact_count") or 0),
-        "clicked": clicked,
+        "exact_count": int(last.get("exact_count") or 0),
+        "clicked": bool(last.get("clicked")),
     }
 
 

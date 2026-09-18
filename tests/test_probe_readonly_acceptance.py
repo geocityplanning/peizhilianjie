@@ -47,6 +47,7 @@ class AcceptancePage:
         self.dialog_open = dialog_open
         self.close_ok = close_ok
         self.closed = False
+        self.clicked_option = False
         self.save_clicks = 0
         self.scripts = []
         self.handlers = {}
@@ -61,13 +62,28 @@ class AcceptancePage:
     def evaluate(self, script, payload=None):
         self.scripts.append(script)
         text = script if isinstance(script, str) else ""
-        if "innermost" in text:
+        if "CHANNEL_LAYER_OPEN" in text:
+            return True
+        if "CHANNEL_LAYER_SNAPSHOT" in text:
+            layer = {
+                "shown": True,
+                "aria_hidden": False,
+                "is_select_dropdown": False,
+                "dialog_select_open": False,
+                "in_copy_dialog": True,
+                "anchored_to_channel_input": True,
+                "is_channel_popover": True,
+                "options": [{"index": index, "text": "chan-a"} for index in range(self.exact_count)],
+            }
+            return {"has_dialog": True, "layers": [layer]}
+        if "CHANNEL_OPTION_CLICK" in text:
             clicked = self.exact_count == 1
-            return {"exact_count": self.exact_count, "clicked": clicked}
+            self.clicked_option = clicked
+            return clicked
+        if "CHANNEL_LAYER_CLEANUP" in text:
+            return True
         if "fromInput" in text:
             return self.selected_value
-        if "ci.click" in text:
-            return True
         if "取消" in text or "headerbtn" in text:
             if self.close_ok:
                 self.dialog_open = False
@@ -154,7 +170,7 @@ def test_acceptance_calls_real_select_and_verify(monkeypatch):
     page = AcceptancePage(exact_count=1, selected_value="chan-a")
     report = probe.run_acceptance(page, cap, channel_name="chan-a", app_id="app-1", ref_app_id="ref-1")
     assert calls == ["chan-a"]
-    assert any("innermost" in script for script in page.scripts)
+    assert any("CHANNEL_LAYER_SNAPSHOT" in script for script in page.scripts)
     assert report["ok"] is True
     assert report["copy_dialog_opened"] is True
     assert report["exact_channel_unique"] is True
