@@ -1656,12 +1656,80 @@ def _identify_new_app(page, before_ids, actual_channel_name, app_name):
     return {"success": False, "error": err(code, "VERIFY", message, NEXT_MANUAL)}
 
 
+def _pagination_synced_with_unfiltered_list(state):
+    """True when pager can turn pages, or a stable single-page list is confirmed."""
+    if not state or (state.get("row_count") or 0) <= 0:
+        return False
+    if state.get("next_enabled"):
+        return True
+    total_count = state.get("total_count")
+    row_count = state.get("row_count") or 0
+    return isinstance(total_count, int) and 0 < total_count <= row_count
+
+
+def _read_list_restore_state(page):
+    state = _read_pagination_state(page) or {}
+    extra = page.evaluate("""() => {
+      const next = document.querySelector('.el-pagination .btn-next');
+      const total = document.querySelector('.el-pagination__total');
+      const nextDisabled = !next || next.disabled || (next.className || '').includes('disabled');
+      const totalText = total ? (total.innerText || '') : '';
+      const match = totalText.replace(/,/g, '').match(/(\\d+)/);
+      return {
+        next_enabled: Boolean(next) && !nextDisabled,
+        total_count: match ? Number(match[1]) : null
+      };
+    }""") or {}
+    state.update(extra)
+    return state
+
+
+def _wait_for_unfiltered_list_restore(
+    page,
+    previous_state,
+    read_state=None,
+    timeout_ms=6000,
+    poll_interval_ms=250,
+):
+    """Wait until rows and pagination are both ready after clearing an empty filter."""
+    reader = read_state or _read_list_restore_state
+    previous_table = (previous_state or {}).get("table_signature")
+    stable_candidate = None
+    stable_reads = 0
+    polls = max(1, (int(timeout_ms) + int(poll_interval_ms) - 1) // int(poll_interval_ms))
+    for _ in range(polls):
+        page.wait_for_timeout(poll_interval_ms)
+        current = reader(page) or {}
+        if (
+            current.get("table_signature") == previous_table
+            or current.get("row_count", 0) <= 0
+            or not _pagination_synced_with_unfiltered_list(current)
+        ):
+            stable_candidate = None
+            stable_reads = 0
+            continue
+        candidate = (
+            current.get("table_signature"),
+            current.get("row_count"),
+            bool(current.get("next_enabled")),
+            current.get("total_count"),
+        )
+        if candidate == stable_candidate:
+            stable_reads += 1
+        else:
+            stable_candidate = candidate
+            stable_reads = 1
+        if stable_reads >= 2:
+            return True
+    return False
+
+
 def _find_target_row_by_id(page, app_id, expected_channel_name=""):
     """Locate by exact ID, then verify the channel from the row or expanded detail."""
     previous_state = _read_pagination_state(page) or {}
     _reset_list_filters(page)
     if previous_state.get("row_count", 0) <= 0:
-        if not wait_for_table_update(page, previous_state, _read_pagination_state):
+        if not _wait_for_unfiltered_list_restore(page, previous_state):
             return {
                 "found": False,
                 "reason": "list_not_restored_after_reset",

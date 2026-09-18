@@ -99,6 +99,7 @@ def _install_locate_mocks(monkeypatch, cap, payload, *, row_count=10):
         lambda page: {"page_number": 1, "row_count": row_count, "table_signature": "A"},
     )
     monkeypatch.setattr(cap, "wait_for_table_update", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: True)
     monkeypatch.setattr(cap, "_go_to_first_page", lambda page: True)
     monkeypatch.setattr(cap, "_expand_visible_rows", lambda page: None)
     monkeypatch.setattr(cap, "_click_next_page_and_wait", lambda page: False)
@@ -305,7 +306,7 @@ def test_empty_table_reset_not_stable_is_not_not_found(monkeypatch):
         {"headers": [_col("ID")], "rows": []},
         row_count=0,
     )
-    monkeypatch.setattr(cap, "wait_for_table_update", lambda *args, **kwargs: False)
+    monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: False)
     located = cap._find_target_row_by_id(page, "12052", "chan-a")
     assert located["found"] is False
     assert located["reason"] == "list_not_restored_after_reset"
@@ -328,6 +329,117 @@ def test_empty_table_reset_restored_then_locates(monkeypatch):
         },
         row_count=0,
     )
-    monkeypatch.setattr(cap, "wait_for_table_update", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: True)
     located = cap._find_target_row_by_id(page, "12052", "chan-a")
     assert located["found"] is True
+
+
+def test_pagination_sync_rejects_rows_without_next_or_total():
+    cap = _stub_login_and_import()
+    assert cap._pagination_synced_with_unfiltered_list(
+        {"row_count": 10, "next_enabled": False, "total_count": 0}
+    ) is False
+    assert cap._pagination_synced_with_unfiltered_list(
+        {"row_count": 10, "next_enabled": False, "total_count": None}
+    ) is False
+    assert cap._pagination_synced_with_unfiltered_list(
+        {"row_count": 10, "next_enabled": True, "total_count": None}
+    ) is True
+    assert cap._pagination_synced_with_unfiltered_list(
+        {"row_count": 10, "next_enabled": False, "total_count": 10}
+    ) is True
+
+
+def test_rows_restore_before_next_button_misses_later_page_without_pager_wait(monkeypatch):
+    cap = _stub_login_and_import()
+    page = _install_locate_mocks(
+        monkeypatch,
+        cap,
+        {
+            "headers": [_col("ID")],
+            "rows": [{
+                "cells": [_col("1")],
+                "detail_channel": "",
+                "detail_id": "",
+                "row_idx": 0,
+            }],
+        },
+        row_count=0,
+    )
+    monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_click_next_page_and_wait", lambda page: False)
+    located = cap._find_target_row_by_id(page, "12052", "")
+    assert located["found"] is False
+    assert located["reason"] == "not_found"
+
+
+def test_rows_restore_then_next_button_recovers_target_on_later_page(monkeypatch):
+    cap = _stub_login_and_import()
+    ticks = {"n": 0}
+    pages = {"current": 1}
+
+    def restore_state(page):
+        ticks["n"] += 1
+        if ticks["n"] < 4:
+            return {
+                "page_number": 1,
+                "row_count": 10,
+                "table_signature": "PAGE1",
+                "next_enabled": False,
+                "total_count": 0,
+            }
+        return {
+            "page_number": 1,
+            "row_count": 10,
+            "table_signature": "PAGE1",
+            "next_enabled": True,
+            "total_count": 40,
+        }
+
+    page1 = {
+        "headers": [_col("ID")],
+        "rows": [{
+            "cells": [_col("1")],
+            "detail_channel": "",
+            "detail_id": "",
+            "row_idx": 0,
+        }],
+    }
+    page2 = {
+        "headers": [_col("ID")],
+        "rows": [{
+            "cells": [_col("12052")],
+            "detail_channel": "",
+            "detail_id": "",
+            "row_idx": 0,
+        }],
+    }
+
+    class RacePage:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+        def evaluate(self, script, data=None):
+            return page1 if pages["current"] == 1 else page2
+
+    monkeypatch.setattr(cap, "_reset_list_filters", lambda page: None)
+    monkeypatch.setattr(
+        cap,
+        "_read_pagination_state",
+        lambda page: {"page_number": 1, "row_count": 0, "table_signature": "EMPTY"}
+        if pages["current"] == 1 and ticks["n"] == 0
+        else {"page_number": pages["current"], "row_count": 10, "table_signature": f"P{pages['current']}"},
+    )
+    monkeypatch.setattr(cap, "_read_list_restore_state", restore_state)
+    monkeypatch.setattr(cap, "_go_to_first_page", lambda page: True)
+    monkeypatch.setattr(cap, "_expand_visible_rows", lambda page: None)
+
+    def click_next(page):
+        pages["current"] = 2
+        return True
+
+    monkeypatch.setattr(cap, "_click_next_page_and_wait", click_next)
+    located = cap._find_target_row_by_id(RacePage(), "12052", "")
+    assert ticks["n"] >= 4
+    assert located["found"] is True
+    assert located["id_field_source"] == "main"
