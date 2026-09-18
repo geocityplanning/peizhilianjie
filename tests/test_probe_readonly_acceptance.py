@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -314,3 +315,152 @@ def test_public_report_omits_secrets_and_disallowed_fields(monkeypatch):
     assert public["save_click_count"] == 0
     assert public["write_request_observed"] is False
     assert public["wrote_any_uat_data"] is False
+
+
+def test_success_writes_atomic_report_file(tmp_path, monkeypatch):
+    cap = _stub_login_and_import()
+    probe = _load_probe()
+    _install_common(monkeypatch, cap)
+    page = AcceptancePage()
+    report_file = tmp_path / "ok.json"
+    report = probe.run_acceptance_with_budget(
+        page,
+        cap,
+        channel_name="chan-a",
+        app_id="app-1",
+        ref_app_id="ref-1",
+        budget_seconds=5,
+        report_file=report_file,
+    )
+    assert report["ok"] is True
+    payload = json.loads(report_file.read_text(encoding="utf-8"))
+    assert payload["ok"] is True
+    assert payload["save_click_count"] == 0
+    assert set(payload) <= probe._ALLOWED_TOP_KEYS
+
+
+def test_business_failure_writes_report_file(tmp_path, monkeypatch):
+    cap = _stub_login_and_import()
+    probe = _load_probe()
+    _install_common(monkeypatch, cap)
+    page = AcceptancePage(exact_count=0, selected_value="")
+    report_file = tmp_path / "fail.json"
+    report = probe.run_acceptance_with_budget(
+        page,
+        cap,
+        channel_name="chan-a",
+        app_id="app-1",
+        ref_app_id="ref-1",
+        budget_seconds=5,
+        report_file=report_file,
+    )
+    assert report["ok"] is False
+    payload = json.loads(report_file.read_text(encoding="utf-8"))
+    assert payload["ok"] is False
+    assert payload["error"] == "channel_select_not_verified"
+    assert payload["copy_dialog_closed"] is True
+    assert payload["save_click_count"] == 0
+
+
+def test_exception_writes_report_file(tmp_path, monkeypatch):
+    cap = _stub_login_and_import()
+    probe = _load_probe()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("list boom")
+
+    _install_common(monkeypatch, cap, search=boom)
+    page = AcceptancePage()
+    report_file = tmp_path / "exc.json"
+    report = probe.run_acceptance_with_budget(
+        page,
+        cap,
+        channel_name="chan-a",
+        app_id="app-1",
+        ref_app_id="ref-1",
+        budget_seconds=5,
+        report_file=report_file,
+    )
+    assert report["error"] == "RuntimeError"
+    payload = json.loads(report_file.read_text(encoding="utf-8"))
+    assert payload["error"] == "RuntimeError"
+    assert payload["copy_dialog_closed"] is True
+
+
+def test_budget_timeout_writes_probe_timeout_and_cleans_up(tmp_path, monkeypatch):
+    cap = _stub_login_and_import()
+    probe = _load_probe()
+
+    def slow_collect(page, reset_filters=False):
+        time.sleep(1.0)
+        return {"ref-1": {"app_id": "ref-1"}}
+
+    monkeypatch.setattr(cap, "_collect_all_app_rows", slow_collect)
+    monkeypatch.setattr(cap, "_find_target_row_by_id", lambda *args, **kwargs: {"found": True, "row_idx": 0})
+    monkeypatch.setattr(cap, "_go_tab", lambda *args, **kwargs: True)
+    page = AcceptancePage()
+    report_file = tmp_path / "timeout.json"
+    report = probe.run_acceptance_with_budget(
+        page,
+        cap,
+        channel_name="chan-a",
+        app_id="app-1",
+        ref_app_id="ref-1",
+        budget_seconds=0.05,
+        report_file=report_file,
+    )
+    assert report["error"] == "probe_timeout"
+    assert report["ok"] is False
+    payload = json.loads(report_file.read_text(encoding="utf-8"))
+    assert payload["error"] == "probe_timeout"
+    assert payload["wrote_any_uat_data"] is False
+    assert SECRET_CHANNEL not in report_file.read_text(encoding="utf-8")
+
+
+def test_report_file_write_failure_still_closes(tmp_path, monkeypatch):
+    cap = _stub_login_and_import()
+    probe = _load_probe()
+    _install_common(monkeypatch, cap)
+    page = AcceptancePage()
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(probe, "_atomic_write_report", boom)
+    report = probe.run_acceptance_with_budget(
+        page,
+        cap,
+        channel_name="chan-a",
+        app_id="app-1",
+        ref_app_id="ref-1",
+        budget_seconds=5,
+        report_file=tmp_path / "nope.json",
+    )
+    assert report["copy_dialog_closed"] is True
+    assert report["save_click_count"] == 0
+    assert report["error"] == "report_write_failed"
+
+
+def test_report_file_redacts_disallowed_fields(tmp_path, monkeypatch):
+    cap = _stub_login_and_import()
+    probe = _load_probe()
+    _install_common(monkeypatch, cap)
+    page = AcceptancePage(selected_value=SECRET_CHANNEL)
+    report_file = tmp_path / "redact.json"
+    probe.run_acceptance_with_budget(
+        page,
+        cap,
+        channel_name=SECRET_CHANNEL,
+        app_id="12052",
+        ref_app_id="ref-1",
+        budget_seconds=5,
+        report_file=report_file,
+    )
+    dumped = report_file.read_text(encoding="utf-8")
+    payload = json.loads(dumped)
+    assert SECRET_CHANNEL not in dumped
+    assert SECRET_APP not in dumped
+    assert SECRET_LINK not in dumped
+    assert SECRET_URL not in dumped
+    assert "12052" not in dumped
+    assert set(payload) <= probe._ALLOWED_TOP_KEYS

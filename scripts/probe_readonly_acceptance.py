@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -48,6 +51,11 @@ _ALLOWED_TOP_KEYS = {
     "diagnosis",
     "notes",
 }
+DEFAULT_BUDGET_SECONDS = 20
+
+
+class ProbeTimeout(Exception):
+    """The combined probe exceeded its explicit total budget."""
 
 
 def _load_helpers():
@@ -177,7 +185,49 @@ def _lookup_facts(located: dict) -> dict:
     }
 
 
-def run_acceptance(page, cap, *, channel_name: str, app_id: str, ref_app_id: str) -> dict:
+def _budget_expired(deadline) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _raise_if_timeout(deadline, report: dict) -> None:
+    if _budget_expired(deadline):
+        report["ok"] = False
+        report["error"] = "probe_timeout"
+        raise ProbeTimeout()
+
+
+def _atomic_write_report(path, report: dict) -> str:
+    helpers = _load_helpers()
+    text = helpers._dump_report(_public_report(report))
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, target)
+    return text
+
+
+def _empty_report(*, error=None) -> dict:
+    return {
+        "mode": "REAL_READ_ONLY",
+        **_blank_dialog_facts(),
+        "ok": False,
+        "steps": {},
+        "notes": [],
+        "diagnosis": {},
+        "error": error,
+    }
+
+
+def run_acceptance(
+    page,
+    cap,
+    *,
+    channel_name: str,
+    app_id: str,
+    ref_app_id: str,
+    deadline=None,
+) -> dict:
     helpers = _load_helpers()
     guard = {
         "write_request_observed": False,
@@ -198,6 +248,21 @@ def run_acceptance(page, cap, *, channel_name: str, app_id: str, ref_app_id: str
 
     real_popover = cap._js_channel_popover
     real_read = cap._read_dialog_channel_value
+    cleanup_ran = {"done": False}
+
+    def _cleanup_session():
+        if cleanup_ran["done"]:
+            return
+        cleanup_ran["done"] = True
+        try:
+            guard["_restore_save"]()
+        except Exception:
+            pass
+        cap._js_channel_popover = real_popover
+        cap._read_dialog_channel_value = real_read
+
+    cap._probe_cleanup = _cleanup_session
+    cap._probe_page = page
 
     def wrapped_popover(page_inner, label, name):
         result = real_popover(page_inner, label, name)
@@ -215,6 +280,7 @@ def run_acceptance(page, cap, *, channel_name: str, app_id: str, ref_app_id: str
     cap._read_dialog_channel_value = wrapped_read
 
     try:
+        _raise_if_timeout(deadline, report)
         rows = cap._collect_all_app_rows(page, reset_filters=True)
         if rows is None:
             report["error"] = "reference_app_pagination_unstable"
@@ -223,6 +289,7 @@ def run_acceptance(page, cap, *, channel_name: str, app_id: str, ref_app_id: str
             report["error"] = "reference_app_not_unique"
             return report
 
+        _raise_if_timeout(deadline, report)
         located_ref = cap._find_target_row_by_id(page, ref_app_id, "")
         if not located_ref or not located_ref.get("found"):
             report["error"] = "reference_app_not_unique"
@@ -254,6 +321,7 @@ def run_acceptance(page, cap, *, channel_name: str, app_id: str, ref_app_id: str
             report["error"] = "copy_dialog_unconfirmed"
             return report
 
+        _raise_if_timeout(deadline, report)
         selected = cap._select_and_verify_create_channel(page, channel_name)
         report["exact_channel_unique"] = recorded.get("exact_count") == 1
         report["selected_channel_matches"] = bool(
@@ -266,6 +334,7 @@ def run_acceptance(page, cap, *, channel_name: str, app_id: str, ref_app_id: str
             report["error"] = "channel_select_not_verified"
             return report
 
+        _raise_if_timeout(deadline, report)
         detail = cap._search_list_by_channel(page, channel_name, return_detail=True)
         report["steps"]["channel_filter"] = helpers._redact_obj(
             detail if isinstance(detail, dict) else {"result": bool(detail)}
@@ -278,6 +347,9 @@ def run_acceptance(page, cap, *, channel_name: str, app_id: str, ref_app_id: str
             report["error"] = "write_observed_or_save_clicked"
             return report
         report["ok"] = True
+    except ProbeTimeout:
+        report["ok"] = False
+        report["error"] = "probe_timeout"
     except Exception as exc:
         report["ok"] = False
         report["error"] = f"{type(exc).__name__}"
@@ -297,12 +369,7 @@ def run_acceptance(page, cap, *, channel_name: str, app_id: str, ref_app_id: str
             report["ok"] = False
             if not report.get("error"):
                 report["error"] = "write_observed_or_save_clicked"
-        try:
-            guard["_restore_save"]()
-        except Exception:
-            pass
-        cap._js_channel_popover = real_popover
-        cap._read_dialog_channel_value = real_read
+        _cleanup_session()
     return report
 
 
@@ -312,11 +379,92 @@ def _public_report(report: dict) -> dict:
     return {key: redacted.get(key) for key in _ALLOWED_TOP_KEYS if key in redacted}
 
 
+def _emit_report(report_file, report: dict) -> str:
+    text = _atomic_write_report(report_file, report)
+    print(text, flush=True)
+    return text
+
+
+def run_acceptance_with_budget(
+    page,
+    cap,
+    *,
+    channel_name: str,
+    app_id: str,
+    ref_app_id: str,
+    budget_seconds: float = DEFAULT_BUDGET_SECONDS,
+    report_file,
+) -> dict:
+    deadline = time.monotonic() + max(0.01, float(budget_seconds))
+    holder = {"report": None}
+    finished = threading.Event()
+
+    def worker():
+        try:
+            holder["report"] = run_acceptance(
+                page,
+                cap,
+                channel_name=channel_name,
+                app_id=app_id,
+                ref_app_id=ref_app_id,
+                deadline=deadline,
+            )
+        except Exception:
+            holder["report"] = _empty_report(error="RuntimeError")
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    finished.wait(timeout=max(0.01, float(budget_seconds)))
+    report = holder["report"]
+    if not finished.is_set():
+        report = report or _empty_report(error="probe_timeout")
+        report["ok"] = False
+        report["error"] = "probe_timeout"
+        try:
+            report["copy_dialog_closed"] = _close_copy_dialog(page)
+        except Exception:
+            report["copy_dialog_closed"] = False
+        cleanup = getattr(cap, "_probe_cleanup", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception:
+                pass
+        report["wrote_any_uat_data"] = False
+    assert report is not None
+    try:
+        _emit_report(report_file, report)
+    except Exception:
+        report["ok"] = False
+        if report.get("error") not in {"probe_timeout"}:
+            report["error"] = "report_write_failed"
+        try:
+            _close_copy_dialog(page)
+        except Exception:
+            pass
+        cleanup = getattr(cap, "_probe_cleanup", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception:
+                pass
+    return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="S4 综合只读验收")
     parser.add_argument("--channel", required=True, help="本机渠道名，不会写入报告")
     parser.add_argument("--app-id", required=True, help="列表核验应用 ID，不会写入报告")
     parser.add_argument("--ref-app-id", required=True, help="既有参考应用 ID，不会写入报告")
+    parser.add_argument("--report-file", required=True, help="本机脱敏最终报告路径")
+    parser.add_argument(
+        "--budget-seconds",
+        type=float,
+        default=DEFAULT_BUDGET_SECONDS,
+        help=f"完整入口总预算秒数，默认 {DEFAULT_BUDGET_SECONDS}",
+    )
     parser.add_argument("--url", default=APP_LIST_URL, help="应用列表页地址")
     args = parser.parse_args()
 
@@ -325,26 +473,20 @@ def main() -> int:
     from core import get_browser_page  # noqa: PLC0415
     from actions import create_app_v2 as cap  # noqa: PLC0415
 
-    report = {
-        "mode": "REAL_READ_ONLY",
-        **_blank_dialog_facts(),
-        "ok": False,
-        "steps": {},
-        "notes": [],
-        "diagnosis": {},
-        "error": "browser_unavailable",
-    }
+    report = _empty_report(error="browser_unavailable")
     pw = None
     page = None
     try:
         pw, _browser, page = get_browser_page()
         helpers._navigate_to_list(page, args.url, {"notes": [], "url_before_navigate": None, "current_url": None})
-        report = run_acceptance(
+        report = run_acceptance_with_budget(
             page,
             cap,
             channel_name=args.channel,
             app_id=args.app_id,
             ref_app_id=args.ref_app_id,
+            budget_seconds=args.budget_seconds,
+            report_file=args.report_file,
         )
     except Exception as exc:
         report["ok"] = False
@@ -354,13 +496,22 @@ def main() -> int:
                 report["copy_dialog_closed"] = _close_copy_dialog(page)
             except Exception:
                 report["copy_dialog_closed"] = False
+        cleanup = getattr(cap, "_probe_cleanup", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception:
+                pass
+        try:
+            _emit_report(args.report_file, report)
+        except Exception:
+            report["error"] = "report_write_failed"
     finally:
         if pw is not None:
             try:
                 pw.stop()
             except Exception:
                 pass
-        print(helpers._dump_report(_public_report(report)))
     return 0 if report.get("ok") else 1
 
 
