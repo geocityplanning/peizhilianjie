@@ -100,6 +100,8 @@ def _install_locate_mocks(monkeypatch, cap, payload, *, row_count=10):
     )
     monkeypatch.setattr(cap, "wait_for_table_update", lambda *args, **kwargs: True)
     monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_attach_list_response_observer", lambda *args, **kwargs: cap._ListRequestObserver())
+    monkeypatch.setattr(cap, "_detach_list_response_observer", lambda *args, **kwargs: None)
     monkeypatch.setattr(cap, "_go_to_first_page", lambda page: True)
     monkeypatch.setattr(cap, "_expand_visible_rows", lambda page: None)
     monkeypatch.setattr(cap, "_click_next_page_and_wait", lambda page: False)
@@ -347,7 +349,7 @@ def test_pagination_sync_rejects_rows_without_next_or_total():
     ) is True
     assert cap._pagination_synced_with_unfiltered_list(
         {"row_count": 10, "next_enabled": False, "total_count": 10}
-    ) is False
+    ) is True
 
 
 def test_rows_restore_before_next_button_misses_later_page_without_pager_wait(monkeypatch):
@@ -422,7 +424,18 @@ def test_rows_restore_then_next_button_recovers_target_on_later_page(monkeypatch
         def evaluate(self, script, data=None):
             return page1 if pages["current"] == 1 else page2
 
+    observations = cap._ListRequestObserver()
+    orig_restore = restore_state
+
+    def restore_with_request(page):
+        state = orig_restore(page)
+        if ticks["n"] == 3 and len(observations) == 0:
+            observations.append(200)
+        return state
+
     monkeypatch.setattr(cap, "_reset_list_filters", lambda page: None)
+    monkeypatch.setattr(cap, "_attach_list_response_observer", lambda *args, **kwargs: observations)
+    monkeypatch.setattr(cap, "_detach_list_response_observer", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         cap,
         "_read_pagination_state",
@@ -430,7 +443,7 @@ def test_rows_restore_then_next_button_recovers_target_on_later_page(monkeypatch
         if pages["current"] == 1 and ticks["n"] == 0
         else {"page_number": pages["current"], "row_count": 10, "table_signature": f"P{pages['current']}"},
     )
-    monkeypatch.setattr(cap, "_read_list_restore_state", restore_state)
+    monkeypatch.setattr(cap, "_read_list_restore_state", restore_with_request)
     monkeypatch.setattr(cap, "_go_to_first_page", lambda page: True)
     monkeypatch.setattr(cap, "_expand_visible_rows", lambda page: None)
 
@@ -445,27 +458,50 @@ def test_rows_restore_then_next_button_recovers_target_on_later_page(monkeypatch
     assert located["id_field_source"] == "main"
 
 
-def test_cached_full_page_total_is_not_restore_ready():
+def test_cached_full_page_total_without_reset_request_is_not_restore_ready():
     cap = _stub_login_and_import()
-    assert cap._pagination_synced_with_unfiltered_list(
-        {"row_count": 20, "next_enabled": False, "total_count": 20}
-    ) is False
+    observations = cap._ListRequestObserver()
+    states = [{
+        "page_number": 1,
+        "row_count": 20,
+        "table_signature": "CACHED",
+        "next_enabled": False,
+        "total_count": 20,
+    }]
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+    restored = cap._wait_for_unfiltered_list_restore(
+        Page(),
+        {"table_signature": "EMPTY", "row_count": 0},
+        read_state=lambda page: states[0],
+        observations=observations,
+        requests_before=0,
+        timeout_ms=5,
+        poll_interval_ms=1,
+    )
+    assert restored is False
 
 
 def test_cached_rows_and_pager_then_later_page_target(monkeypatch):
     cap = _stub_login_and_import()
     ticks = {"n": 0}
     pages = {"current": 1}
+    observations = cap._ListRequestObserver()
 
     def restore_state(page):
         ticks["n"] += 1
+        if ticks["n"] == 3 and len(observations) == 0:
+            observations.append(200)
         if ticks["n"] < 4:
             return {
                 "page_number": 1,
                 "row_count": 20,
                 "table_signature": "CACHED",
-                "next_enabled": False,
-                "total_count": 20,
+                "next_enabled": True,
+                "total_count": 928,
             }
         return {
             "page_number": 1,
@@ -502,6 +538,8 @@ def test_cached_rows_and_pager_then_later_page_target(monkeypatch):
             return page1 if pages["current"] == 1 else page2
 
     monkeypatch.setattr(cap, "_reset_list_filters", lambda page: None)
+    monkeypatch.setattr(cap, "_attach_list_response_observer", lambda *args, **kwargs: observations)
+    monkeypatch.setattr(cap, "_detach_list_response_observer", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         cap,
         "_read_pagination_state",
@@ -538,3 +576,98 @@ def test_page_scan_limit_is_not_not_found(monkeypatch):
     assert located["found"] is False
     assert located["reason"] == "page_scan_limit_reached"
     assert located["reason"] != "not_found"
+
+
+def test_real_single_page_after_reset_request_can_scan(monkeypatch):
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver()
+    ticks = {"n": 0}
+
+    def restore_state(page):
+        ticks["n"] += 1
+        if ticks["n"] == 1:
+            observations.append(200)
+        return {
+            "page_number": 1,
+            "row_count": 20,
+            "table_signature": "SINGLE",
+            "next_enabled": False,
+            "total_count": 20,
+        }
+
+    payload = {
+        "headers": [_col("ID")],
+        "rows": [{
+            "cells": [_col("12052")],
+            "detail_channel": "",
+            "detail_id": "",
+            "row_idx": 0,
+        }],
+    }
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+        def evaluate(self, script, data=None):
+            return payload
+
+    monkeypatch.setattr(cap, "_reset_list_filters", lambda page: None)
+    monkeypatch.setattr(cap, "_attach_list_response_observer", lambda *args, **kwargs: observations)
+    monkeypatch.setattr(cap, "_detach_list_response_observer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cap,
+        "_read_pagination_state",
+        lambda page: {"page_number": 1, "row_count": 0, "table_signature": "EMPTY"},
+    )
+    monkeypatch.setattr(cap, "_read_list_restore_state", restore_state)
+    monkeypatch.setattr(cap, "_go_to_first_page", lambda page: True)
+    monkeypatch.setattr(cap, "_expand_visible_rows", lambda page: None)
+    monkeypatch.setattr(cap, "_click_next_page_and_wait", lambda page: False)
+    located = cap._find_target_row_by_id(Page(), "12052", "")
+    assert located["found"] is True
+    assert located["id_field_source"] == "main"
+
+
+def test_reset_request_never_completes_is_restore_failure(monkeypatch):
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver()
+
+    def restore_state(page):
+        return {
+            "page_number": 1,
+            "row_count": 20,
+            "table_signature": "CACHED",
+            "next_enabled": True,
+            "total_count": 928,
+        }
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+        def evaluate(self, script, data=None):
+            return {"headers": [_col("ID")], "rows": []}
+
+    monkeypatch.setattr(cap, "_reset_list_filters", lambda page: None)
+    monkeypatch.setattr(cap, "_attach_list_response_observer", lambda *args, **kwargs: observations)
+    monkeypatch.setattr(cap, "_detach_list_response_observer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cap,
+        "_read_pagination_state",
+        lambda page: {"page_number": 1, "row_count": 0, "table_signature": "EMPTY"},
+    )
+    monkeypatch.setattr(cap, "_read_list_restore_state", restore_state)
+    restored = cap._wait_for_unfiltered_list_restore(
+        Page(),
+        {"table_signature": "EMPTY", "row_count": 0},
+        read_state=restore_state,
+        observations=observations,
+        requests_before=0,
+        timeout_ms=5,
+        poll_interval_ms=1,
+    )
+    assert restored is False
+    located = cap._find_target_row_by_id(Page(), "12052", "")
+    assert located["found"] is False
+    assert located["reason"] == "list_not_restored_after_reset"

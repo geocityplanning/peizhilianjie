@@ -1657,14 +1657,14 @@ def _identify_new_app(page, before_ids, actual_channel_name, app_name):
 
 
 def _pagination_synced_with_unfiltered_list(state):
-    """True only when the next-page control is enabled after an empty filter.
-
-    A filled first page with total_count == row_count is not enough: that is the
-    cached-page-size race and would stop a later-page scan as not_found.
-    """
+    """True when a loaded list can paginate, or a completed single-page list is confirmed."""
     if not state or (state.get("row_count") or 0) <= 0:
         return False
-    return bool(state.get("next_enabled"))
+    if state.get("next_enabled"):
+        return True
+    total_count = state.get("total_count")
+    row_count = state.get("row_count") or 0
+    return isinstance(total_count, int) and total_count == row_count and total_count > 0
 
 
 def _read_list_restore_state(page):
@@ -1688,10 +1688,12 @@ def _wait_for_unfiltered_list_restore(
     page,
     previous_state,
     read_state=None,
+    observations=None,
+    requests_before=0,
     timeout_ms=6000,
     poll_interval_ms=250,
 ):
-    """Wait until rows and pagination are both ready after clearing an empty filter."""
+    """Wait until this reset's list request has landed and the table/pager are ready."""
     reader = read_state or _read_list_restore_state
     previous_table = (previous_state or {}).get("table_signature")
     stable_candidate = None
@@ -1700,8 +1702,13 @@ def _wait_for_unfiltered_list_restore(
     for _ in range(polls):
         page.wait_for_timeout(poll_interval_ms)
         current = reader(page) or {}
+        reset_request_seen = (
+            observations is not None
+            and len(observations) > (requests_before or 0)
+        )
         if (
-            current.get("table_signature") == previous_table
+            not reset_request_seen
+            or current.get("table_signature") == previous_table
             or current.get("row_count", 0) <= 0
             or not _pagination_synced_with_unfiltered_list(current)
         ):
@@ -1727,9 +1734,24 @@ def _wait_for_unfiltered_list_restore(
 def _find_target_row_by_id(page, app_id, expected_channel_name=""):
     """Locate by exact ID, then verify the channel from the row or expanded detail."""
     previous_state = _read_pagination_state(page) or {}
+    restore_observations = None
+    requests_before = 0
+    empty_before_reset = previous_state.get("row_count", 0) <= 0
+    if empty_before_reset:
+        restore_observations = _attach_list_response_observer(page)
+        requests_before = len(restore_observations) if restore_observations is not None else 0
     _reset_list_filters(page)
-    if previous_state.get("row_count", 0) <= 0:
-        if not _wait_for_unfiltered_list_restore(page, previous_state):
+    if empty_before_reset:
+        try:
+            restored = _wait_for_unfiltered_list_restore(
+                page,
+                previous_state,
+                observations=restore_observations,
+                requests_before=requests_before,
+            )
+        finally:
+            _detach_list_response_observer(restore_observations)
+        if not restored:
             return {
                 "found": False,
                 "reason": "list_not_restored_after_reset",
