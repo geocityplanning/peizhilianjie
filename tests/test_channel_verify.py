@@ -429,8 +429,11 @@ def test_rows_restore_then_next_button_recovers_target_on_later_page(monkeypatch
 
     def restore_with_request(page):
         state = orig_restore(page)
-        if ticks["n"] == 3 and len(observations) == 0:
+        if ticks["n"] == 3 and not observations.success_records:
             observations.append(200)
+            observations.success_records.append(
+                {"status": 200, "total_count": 40, "item_count": 10, "page_count": 4}
+            )
         return state
 
     monkeypatch.setattr(cap, "_reset_list_filters", lambda page: None)
@@ -478,7 +481,7 @@ def test_cached_full_page_total_without_reset_request_is_not_restore_ready():
         {"table_signature": "EMPTY", "row_count": 0},
         read_state=lambda page: states[0],
         observations=observations,
-        requests_before=0,
+        records_before=0,
         timeout_ms=5,
         poll_interval_ms=1,
     )
@@ -505,18 +508,86 @@ def test_failed_or_non_2xx_response_does_not_unlock_restore():
         {"table_signature": "EMPTY", "row_count": 0},
         read_state=lambda page: cached,
         observations=observations,
-        requests_before=0,
+        records_before=0,
         timeout_ms=5,
         poll_interval_ms=1,
     )
     assert restored is False
-    assert cap._has_success_list_response(observations, 0) is False
+    assert cap._complete_reset_records(observations, 0) == []
+
+
+def test_status_without_structure_record_does_not_unlock_restore():
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver([200])
+    cached = {
+        "page_number": 1,
+        "row_count": 20,
+        "table_signature": "CACHED",
+        "next_enabled": True,
+        "total_count": 928,
+    }
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+    restored = cap._wait_for_unfiltered_list_restore(
+        Page(),
+        {"table_signature": "EMPTY", "row_count": 0},
+        read_state=lambda page: cached,
+        observations=observations,
+        records_before=0,
+        timeout_ms=5,
+        poll_interval_ms=1,
+    )
+    assert restored is False
+
+
+def test_new_2xx_does_not_reuse_old_success_record():
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver([200, 200])
+    observations.success_records.append(
+        {"status": 200, "total_count": 928, "item_count": 20, "page_count": 47}
+    )
+    cached = {
+        "page_number": 1,
+        "row_count": 20,
+        "table_signature": "CACHED",
+        "next_enabled": True,
+        "total_count": 928,
+    }
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+    restored = cap._wait_for_unfiltered_list_restore(
+        Page(),
+        {"table_signature": "EMPTY", "row_count": 0},
+        read_state=lambda page: cached,
+        observations=observations,
+        records_before=1,
+        timeout_ms=5,
+        poll_interval_ms=1,
+    )
+    assert restored is False
+    assert cap._complete_reset_records(observations, 1) == []
+
+
+def test_extract_list_structure_requires_total_list_and_page_count():
+    cap = _stub_login_and_import()
+    body = '{"data":{"totalCount":80,"list":[{},{}],"pageCount":4}}'
+    meta = cap._extract_list_structure(body)
+    assert meta == {"total_count": 80, "item_count": 2, "page_count": 4}
+    assert cap._extract_list_structure('{"data":{"totalCount":80}}') is None
+    assert cap._extract_list_structure("not-json") is None
+    assert cap._extract_list_structure("") is None
 
 
 def test_2xx_already_present_final_multipage_before_wait_passes():
     cap = _stub_login_and_import()
     observations = cap._ListRequestObserver([200])
-    observations.success_structures.append(
+    observations.success_records.append(
         {"total_count": 80, "item_count": 20, "page_count": 4}
     )
     fresh = {
@@ -536,7 +607,7 @@ def test_2xx_already_present_final_multipage_before_wait_passes():
         {"table_signature": "EMPTY", "row_count": 0},
         read_state=lambda page: fresh,
         observations=observations,
-        requests_before=0,
+        records_before=0,
         timeout_ms=50,
         poll_interval_ms=1,
     )
@@ -546,7 +617,7 @@ def test_2xx_already_present_final_multipage_before_wait_passes():
 def test_2xx_already_present_final_single_page_before_wait_passes():
     cap = _stub_login_and_import()
     observations = cap._ListRequestObserver([200])
-    observations.success_structures.append(
+    observations.success_records.append(
         {"total_count": 20, "item_count": 20, "page_count": 1}
     )
     single = {
@@ -566,7 +637,7 @@ def test_2xx_already_present_final_single_page_before_wait_passes():
         {"table_signature": "EMPTY", "row_count": 0},
         read_state=lambda page: single,
         observations=observations,
-        requests_before=0,
+        records_before=0,
         timeout_ms=50,
         poll_interval_ms=1,
     )
@@ -576,7 +647,7 @@ def test_2xx_already_present_final_single_page_before_wait_passes():
 def test_success_structure_same_as_cache_fingerprint_passes():
     cap = _stub_login_and_import()
     observations = cap._ListRequestObserver([200])
-    observations.success_structures.append(
+    observations.success_records.append(
         {"total_count": 928, "item_count": 20, "page_count": 47}
     )
     same = {
@@ -596,7 +667,7 @@ def test_success_structure_same_as_cache_fingerprint_passes():
         {"table_signature": "EMPTY", "row_count": 0},
         read_state=lambda page: same,
         observations=observations,
-        requests_before=0,
+        records_before=0,
         timeout_ms=50,
         poll_interval_ms=1,
     )
@@ -660,7 +731,7 @@ def test_http_200_keeps_cached_dom_for_two_polls_then_fresh():
         n = len(reads) + 1
         if n == 1:
             observations.append(200)
-            observations.success_structures.append(
+            observations.success_records.append(
                 {"total_count": 80, "item_count": 20, "page_count": 4}
             )
         state = cached if n <= 3 else fresh
@@ -676,7 +747,7 @@ def test_http_200_keeps_cached_dom_for_two_polls_then_fresh():
         {"table_signature": "EMPTY", "row_count": 0},
         read_state=read_state,
         observations=observations,
-        requests_before=0,
+        records_before=0,
         timeout_ms=50,
         poll_interval_ms=1,
     )
@@ -695,7 +766,7 @@ def test_cached_rows_and_pager_then_later_page_target(monkeypatch):
         ticks["n"] += 1
         if ticks["n"] == 2 and len(observations) == 0:
             observations.append(200)
-            observations.success_structures.append(
+            observations.success_records.append(
                 {"total_count": 80, "item_count": 20, "page_count": 4}
             )
         if ticks["n"] < 5:
@@ -790,7 +861,7 @@ def test_real_single_page_after_reset_request_can_scan(monkeypatch):
         ticks["n"] += 1
         if not observations:
             observations.append(200)
-            observations.success_structures.append(
+            observations.success_records.append(
                 {"total_count": 20, "item_count": 20, "page_count": 1}
             )
         return {
@@ -869,7 +940,7 @@ def test_reset_request_never_completes_is_restore_failure(monkeypatch):
         {"table_signature": "EMPTY", "row_count": 0},
         read_state=restore_state,
         observations=observations,
-        requests_before=0,
+        records_before=0,
         timeout_ms=5,
         poll_interval_ms=1,
     )

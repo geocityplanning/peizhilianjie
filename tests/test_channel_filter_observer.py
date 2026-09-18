@@ -628,7 +628,7 @@ def test_observer_does_not_read_body_when_request_missing_filter():
     assert observations.carried_target_filter is False
     assert observations.response_contains_target_channel is None
     assert SECRET_CHANNEL not in str(vars(observations))
-    assert SECRET_CHANNEL not in str(getattr(observations, "success_structures", []))
+    assert SECRET_CHANNEL not in str(getattr(observations, "success_records", []))
     assert observations.carried_target_filter is False
 
 

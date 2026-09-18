@@ -730,7 +730,7 @@ class _ListRequestObserver(list):
         self.response_contains_target_channel = None
         self.target_filter_field = None
         self.target_filter_field_is_channel = None
-        self.success_structures = []
+        self.success_records = []
 
 
 # 后台列表接口的实际路径是 /backend/cloudTrial/appInfo/getAppInfoList，
@@ -968,7 +968,9 @@ def _attach_list_response_observer(page, target_filter=None):
                 if need_structure:
                     meta = _extract_list_structure(body)
                     if meta:
-                        observations.success_structures.append(meta)
+                        meta = dict(meta)
+                        meta["status"] = int(status)
+                        observations.success_records.append(meta)
             finally:
                 body = None
 
@@ -1055,7 +1057,9 @@ def _attach_list_response_observer(page, target_filter=None):
                 if need_structure:
                     meta = _extract_list_structure(body)
                     if meta:
-                        observations.success_structures.append(meta)
+                        meta = dict(meta)
+                        meta["status"] = int(status or 0)
+                        observations.success_records.append(meta)
             except Exception:
                 return
             finally:
@@ -1762,19 +1766,25 @@ def _extract_list_structure(body):
         except (TypeError, ValueError):
             continue
         break
-    return meta or None
+    if not {"total_count", "item_count", "page_count"}.issubset(meta):
+        return None
+    return {
+        "total_count": int(meta["total_count"]),
+        "item_count": int(meta["item_count"]),
+        "page_count": int(meta["page_count"]),
+    }
 
 
 def _latest_success_structure(observations):
-    structs = getattr(observations, "success_structures", None) or []
-    if not structs:
+    records = _complete_reset_records(observations, 0)
+    if not records:
         return None
-    return structs[-1]
+    return records[-1]
 
 
 def _dom_matches_success_structure(state, meta):
     if not meta:
-        return True
+        return False
     if meta.get("total_count") is not None and state.get("total_count") is not None:
         if int(state["total_count"]) != int(meta["total_count"]):
             return False
@@ -1789,17 +1799,9 @@ def _dom_matches_success_structure(state, meta):
     return True
 
 
-def _has_success_list_response(observations, requests_before=0):
-    if observations is None:
-        return False
-    for status in list(observations)[int(requests_before or 0):]:
-        try:
-            code = int(status)
-        except (TypeError, ValueError):
-            continue
-        if 200 <= code < 300:
-            return True
-    return False
+def _complete_reset_records(observations, records_before=0):
+    records = getattr(observations, "success_records", None) or []
+    return list(records)[int(records_before or 0):]
 
 
 def _wait_for_unfiltered_list_restore(
@@ -1807,11 +1809,13 @@ def _wait_for_unfiltered_list_restore(
     previous_state,
     read_state=None,
     observations=None,
-    requests_before=0,
+    records_before=0,
+    requests_before=None,
     timeout_ms=6000,
     poll_interval_ms=250,
 ):
-    """Wait until a 2xx list response for this reset has been rendered."""
+    """Wait until a complete 2xx+structure record for this reset has been rendered."""
+    baseline = records_before if requests_before is None else requests_before
     reader = read_state or _read_list_restore_state
     previous_table = (previous_state or {}).get("table_signature")
     stable_candidate = None
@@ -1820,10 +1824,10 @@ def _wait_for_unfiltered_list_restore(
     for _ in range(polls):
         page.wait_for_timeout(poll_interval_ms)
         current = reader(page) or {}
-        success_seen = _has_success_list_response(observations, requests_before)
-        meta = _latest_success_structure(observations)
+        records = _complete_reset_records(observations, baseline)
+        meta = records[-1] if records else None
         if (
-            not success_seen
+            not records
             or current.get("table_signature") == previous_table
             or current.get("row_count", 0) <= 0
             or not _pagination_synced_with_unfiltered_list(current)
@@ -1847,11 +1851,11 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
     """Locate by exact ID, then verify the channel from the row or expanded detail."""
     previous_state = _read_pagination_state(page) or {}
     restore_observations = None
-    requests_before = 0
+    records_before = 0
     empty_before_reset = previous_state.get("row_count", 0) <= 0
     if empty_before_reset:
         restore_observations = _attach_list_response_observer(page)
-        requests_before = len(restore_observations) if restore_observations is not None else 0
+        records_before = len(getattr(restore_observations, "success_records", []) or []) if restore_observations is not None else 0
     _reset_list_filters(page)
     if empty_before_reset:
         try:
@@ -1859,7 +1863,7 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
                 page,
                 previous_state,
                 observations=restore_observations,
-                requests_before=requests_before,
+                records_before=records_before,
             )
         finally:
             _detach_list_response_observer(restore_observations)
