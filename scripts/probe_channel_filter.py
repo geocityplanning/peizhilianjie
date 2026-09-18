@@ -473,6 +473,14 @@ def main() -> int:
                 "found": bool(located.get("found")),
                 "reason": located.get("reason"),
                 "channel_source": located.get("channel_source"),
+                "id_field_source": located.get("id_field_source"),
+                "header_cell_alignment_used": located.get("header_cell_alignment_used"),
+                "main_channel_present": located.get("main_channel_present"),
+                "detail_channel_present": located.get("detail_channel_present"),
+                "main_channel_matches_expected": located.get("main_channel_matches_expected"),
+                "detail_channel_matches_expected": located.get("detail_channel_matches_expected"),
+                "main_detail_same": located.get("main_detail_same"),
+                "mismatch_source": located.get("mismatch_source"),
                 "app_id": _mask(args.app_id),
             }
             report["notes"].append("按 ID 未找到不等于不存在：筛选未生效时只能判定未验证")

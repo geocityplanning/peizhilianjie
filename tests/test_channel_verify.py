@@ -91,17 +91,17 @@ def test_channel_id_header_is_not_used_as_channel_name():
     assert cap._main_channel_from_row(headers, cells) == ""
 
 
-def _install_locate_mocks(monkeypatch, cap, raw):
+def _install_locate_mocks(monkeypatch, cap, payload):
     monkeypatch.setattr(cap, "_reset_list_filters", lambda page: None)
     monkeypatch.setattr(cap, "_go_to_first_page", lambda page: True)
     monkeypatch.setattr(cap, "_expand_visible_rows", lambda page: None)
     monkeypatch.setattr(cap, "_click_next_page_and_wait", lambda page: False)
 
-    class Page:
-        def evaluate(self, script, payload=None):
-            return raw
+    class FixedPage:
+        def evaluate(self, script, data=None):
+            return payload
 
-    return Page()
+    return FixedPage()
 
 
 def test_find_row_prefers_detail_over_wrong_main(monkeypatch):
@@ -110,21 +110,26 @@ def test_find_row_prefers_detail_over_wrong_main(monkeypatch):
         monkeypatch,
         cap,
         {
-            "id_matched": True,
             "headers": [_col("", "el-table__expand-column"), _col("ID"), _col("所属渠道")],
-            "cells": [
-                _col("", "el-table__expand-column"),
-                _col("12052"),
-                _col("错位单元格"),
-            ],
-            "detail_channel": "chan-a",
-            "row_idx": 3,
+            "rows": [{
+                "cells": [
+                    _col("", "el-table__expand-column"),
+                    _col("12052"),
+                    _col("错位单元格"),
+                ],
+                "detail_channel": "chan-a",
+                "detail_id": "",
+                "row_idx": 3,
+            }],
         },
     )
     located = cap._find_target_row_by_id(page, "12052", "chan-a")
     assert located["found"] is True
     assert located["channel_source"] == "detail"
     assert located["row_idx"] == 3
+    assert located["detail_channel_matches_expected"] is True
+    assert located["main_channel_matches_expected"] is False
+    assert located["mismatch_source"] is None
 
 
 def test_find_row_mismatch_when_id_exists_and_channel_differs(monkeypatch):
@@ -133,16 +138,21 @@ def test_find_row_mismatch_when_id_exists_and_channel_differs(monkeypatch):
         monkeypatch,
         cap,
         {
-            "id_matched": True,
             "headers": [_col("ID"), _col("所属渠道")],
-            "cells": [_col("12052"), _col("chan-b")],
-            "detail_channel": "chan-b",
-            "row_idx": 1,
+            "rows": [{
+                "cells": [_col("12052"), _col("chan-b")],
+                "detail_channel": "chan-b",
+                "detail_id": "",
+                "row_idx": 1,
+            }],
         },
     )
     located = cap._find_target_row_by_id(page, "12052", "chan-a")
     assert located["found"] is False
     assert located["reason"] == "channel_mismatch"
+    assert located["mismatch_source"] == "both"
+    assert located["main_channel_present"] is True
+    assert located["detail_channel_present"] is True
 
 
 def test_find_row_unverified_when_channel_fields_missing(monkeypatch):
@@ -151,16 +161,34 @@ def test_find_row_unverified_when_channel_fields_missing(monkeypatch):
         monkeypatch,
         cap,
         {
-            "id_matched": True,
             "headers": [_col("ID"), _col("应用名称")],
-            "cells": [_col("12052"), _col("演示应用")],
-            "detail_channel": "",
-            "row_idx": 1,
+            "rows": [{
+                "cells": [_col("12052"), _col("演示应用")],
+                "detail_channel": "",
+                "detail_id": "",
+                "row_idx": 1,
+            }],
         },
     )
     located = cap._find_target_row_by_id(page, "12052", "chan-a")
     assert located["found"] is False
     assert located["reason"] == "channel_unverified"
+    assert located["mismatch_source"] == "none"
+
+
+def test_id_match_ignores_non_id_cells():
+    cap = _stub_login_and_import()
+    headers = [_col("ID"), _col("应用名称")]
+    cells = [_col("99"), _col("12052")]
+    matched, source = cap._id_matched_in_row("12052", headers, cells, detail_id="")
+    assert matched is False
+    assert source is None
+    matched, source = cap._id_matched_in_row("12052", headers, cells, detail_id="12052")
+    assert matched is True
+    assert source == "detail"
+    matched, source = cap._id_matched_in_row("12052", [_col("ID"), _col("应用名称")], [_col("12052"), _col("12052")], "")
+    assert matched is True
+    assert source == "main"
 
 
 def test_identify_retries_filter_then_falls_back_without_create(monkeypatch):

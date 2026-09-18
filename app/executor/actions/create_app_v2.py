@@ -201,8 +201,7 @@ def _js_select(page, label, value):
 
 
 def _js_channel_popover(page, label, channel_name):
-    """用 JS 处理渠道 popover 选择器（带 A-Z 字母索引的自定义组件）。"""
-    # 1. 点 channel-input 打开 popover
+    """Select a unique exact channel option. No prefix or contains fallback."""
     opened = page.evaluate("""
     (label) => {
       const wrappers = document.querySelectorAll('.el-dialog__wrapper');
@@ -223,48 +222,32 @@ def _js_channel_popover(page, label, channel_name):
     }
     """, label)
     if not opened:
-        return False
+        return {"opened": False, "exact_count": 0, "clicked": False}
     page.wait_for_timeout(1500)
-
-    # 2. 在 popover 里找渠道名并点击
     picked = page.evaluate("""
     (name) => {
-      // 找所有可能的 popover 元素
       const pops = document.querySelectorAll('[id^="el-popover-"], .el-popover, .el-popper, .channel-popover');
+      const exact = [];
       for (const p of pops) {
-        if (p.offsetParent === null && !p.style.display) continue;
         if (p.style.display === 'none') continue;
-        // 查找所有可能的渠道选项元素
-        const candidates = p.querySelectorAll('li, td, span, div, a, p');
+        const candidates = p.querySelectorAll('li, td, span, div, a, p, [role="option"]');
         for (const el of candidates) {
           if (el.offsetParent === null) continue;
           const t = el.innerText ? el.innerText.trim() : '';
-          // 精确匹配渠道名（排除包含匹配，避免误点）
-          if (t === name) {
-            el.click();
-            return true;
-          }
+          if (t === name) exact.push(el);
         }
       }
-      // 如果精确匹配没找到，试前缀匹配
-      for (const p of pops) {
-        if (p.style.display === 'none') continue;
-        const candidates = p.querySelectorAll('li, td, span, div, a, p');
-        for (const el of candidates) {
-          if (el.offsetParent === null) continue;
-          const t = el.innerText ? el.innerText.trim() : '';
-          if (t.startsWith(name) || (name.startsWith(t) && t.length > 3)) {
-            el.click();
-            return true;
-          }
-        }
+      const innermost = exact.filter(el => !exact.some(other => other !== el && el.contains(other)));
+      if (innermost.length !== 1) {
+        return {exact_count: innermost.length, clicked: false};
       }
-      return false;
+      innermost[0].click();
+      return {exact_count: 1, clicked: true};
     }
-    """, channel_name)
-    if picked:
+    """, channel_name) or {}
+    clicked = bool(picked.get("clicked"))
+    if clicked:
         page.wait_for_timeout(500)
-        # 用 JS 关闭残留 popover，不用 Escape（会误关主弹窗）
         page.evaluate("""
         () => {
           const pops = document.querySelectorAll('.el-popover, .el-popper, [id^="el-popover-"]');
@@ -274,7 +257,101 @@ def _js_channel_popover(page, label, channel_name):
         }
         """)
         page.wait_for_timeout(300)
-    return picked
+    return {
+        "opened": True,
+        "exact_count": int(picked.get("exact_count") or 0),
+        "clicked": clicked,
+    }
+
+
+def _read_dialog_channel_value(page, label):
+    """Read the selected channel display value from the create dialog control."""
+    return page.evaluate("""
+    (label) => {
+      const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+      for (const w of wrappers) {
+        if (w.style.display === 'none') continue;
+        const items = w.querySelectorAll('.el-form-item');
+        for (const it of items) {
+          if (it.offsetParent === null) continue;
+          const lblEl = it.querySelector('.el-form-item__label');
+          if (!lblEl) continue;
+          const lbl = (lblEl.innerText || '').replace(/[ *:：]/g, '').trim();
+          if (!lbl.includes(label.replace(/[ *:：]/g, '').trim())) continue;
+          const ci = it.querySelector('.channel-input');
+          if (ci) {
+            const input = ci.querySelector('input');
+            const fromInput = input ? (input.value || '').trim() : '';
+            if (fromInput) return fromInput;
+            return (ci.innerText || '').replace(/\\s+/g, ' ').trim();
+          }
+          const input = it.querySelector('input.el-input__inner');
+          if (input) return (input.value || '').trim();
+        }
+      }
+      return '';
+    }
+    """, label)
+
+
+def _select_and_verify_create_channel(page, channel_name):
+    """Exact-select the create-dialog channel and read it back before save."""
+    target = (channel_name or "").strip()
+    if not target:
+        return {
+            "success": False,
+            "error": err("CHANNEL_SELECT_FAILED", "FILL", "目标渠道为空，已停止保存", NEXT_MANUAL),
+        }
+    opened_any = False
+    for label in ("所属渠道", "渠道"):
+        result = _js_channel_popover(page, label, target)
+        if not result.get("opened"):
+            continue
+        opened_any = True
+        if result.get("exact_count") != 1 or not result.get("clicked"):
+            return {
+                "success": False,
+                "error": err(
+                    "CHANNEL_SELECT_FAILED",
+                    "FILL",
+                    "创建对话框中渠道不是唯一精确匹配，已停止保存",
+                    NEXT_MANUAL,
+                ),
+            }
+        selected = (_read_dialog_channel_value(page, label) or "").strip()
+        if selected != target:
+            return {
+                "success": False,
+                "error": err(
+                    "CHANNEL_SELECT_FAILED",
+                    "FILL",
+                    "所属渠道回读值与目标不一致，已停止保存",
+                    NEXT_MANUAL,
+                ),
+            }
+        return {"success": True}
+    message = (
+        "未找到可精确选择的所属渠道控件，已停止保存"
+        if not opened_any
+        else "创建对话框中渠道不是唯一精确匹配，已停止保存"
+    )
+    return {
+        "success": False,
+        "error": err("CHANNEL_SELECT_FAILED", "FILL", message, NEXT_MANUAL),
+    }
+
+
+def _click_save_button(page):
+    return page.evaluate("""() => {
+      const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+      for (const w of wrappers) {
+        if (w.style.display === 'none') continue;
+        if (w.querySelectorAll('.el-tabs__item').length === 0) continue;
+        const btns = w.querySelectorAll('button');
+        for (const b of btns) { if (b.innerText.includes('保存')) { b.click(); return true; } }
+      }
+      return false;
+    }""")
 
 
 def _set_stage(execution_id, stage):
@@ -1271,43 +1348,107 @@ def _main_channel_from_row(headers, cells):
     return _mapped_value(aligned, _is_channel_name_header)
 
 
-def _channel_verify_decision(expected_channel_name, main_channel, detail_channel):
-    """Verify channel using main column and expanded detail independently.
+def _is_app_id_header(header):
+    text = (header or "").strip()
+    return text == "ID" or "应用ID" in text
 
-    A wrong non-empty main cell must not hide a matching detail value.
-    Missing values are unverified, not a mismatch.
-    """
+
+def _channel_verify_facts(
+    expected_channel_name,
+    main_channel,
+    detail_channel,
+    *,
+    aligned_used=False,
+    id_field_source=None,
+):
     expected = (expected_channel_name or "").strip()
     main = (main_channel or "").strip()
     detail = (detail_channel or "").strip()
+    main_present = bool(main)
+    detail_present = bool(detail)
+    main_matches = bool(expected) and main == expected
+    detail_matches = bool(expected) and detail == expected
+    facts = {
+        "id_field_source": id_field_source,
+        "header_cell_alignment_used": bool(aligned_used),
+        "main_channel_present": main_present,
+        "detail_channel_present": detail_present,
+        "main_channel_matches_expected": main_matches,
+        "detail_channel_matches_expected": detail_matches,
+        "main_detail_same": main_present and detail_present and main == detail,
+        "mismatch_source": None,
+        "verified": True,
+        "reason": None,
+        "source": None,
+    }
     if not expected:
-        return {"verified": True, "reason": None, "source": None}
-    if detail == expected:
-        return {"verified": True, "reason": None, "source": "detail"}
-    if main == expected:
-        return {"verified": True, "reason": None, "source": "main"}
-    if not main and not detail:
-        return {"verified": False, "reason": "channel_unverified", "source": None}
+        return facts
+    if detail_matches or main_matches:
+        facts["source"] = "detail" if detail_matches else "main"
+        return facts
+    if not main_present and not detail_present:
+        facts["verified"] = False
+        facts["reason"] = "channel_unverified"
+        facts["mismatch_source"] = "none"
+        return facts
+    if main_present and not main_matches and detail_present and not detail_matches:
+        mismatch_source = "both"
+    elif detail_present and not detail_matches:
+        mismatch_source = "detail"
+    else:
+        mismatch_source = "main"
+    facts["verified"] = False
+    facts["reason"] = "channel_mismatch"
+    facts["mismatch_source"] = mismatch_source
+    facts["source"] = mismatch_source
+    return facts
+
+
+def _channel_verify_decision(expected_channel_name, main_channel, detail_channel):
+    """Verify channel using main column and expanded detail independently."""
+    facts = _channel_verify_facts(expected_channel_name, main_channel, detail_channel)
     return {
-        "verified": False,
-        "reason": "channel_mismatch",
-        "source": "detail" if detail else "main",
+        "verified": facts["verified"],
+        "reason": facts["reason"],
+        "source": facts["source"],
     }
 
 
-def _id_matched_in_row(app_id, cells, detail_id="", fallback_id=""):
+def _id_matched_in_row(app_id, headers, cells, detail_id=""):
     expected = str(app_id or "").strip()
     if not expected:
-        return False
-    if str(detail_id or "").strip() == expected or str(fallback_id or "").strip() == expected:
-        return True
-    for cell in cells or []:
-        if _is_utility_column(cell):
-            continue
-        text = (cell.get("text") if isinstance(cell, dict) else str(cell or "")).strip()
-        if text == expected:
-            return True
-    return False
+        return False, None
+    aligned = _align_header_cells(headers, cells)
+    main_id = _mapped_value(aligned, _is_app_id_header)
+    if main_id == expected:
+        return True, "main"
+    if str(detail_id or "").strip() == expected:
+        return True, "detail"
+    return False, None
+
+
+def _redacted_locate_facts(facts):
+    if not facts:
+        return {
+            "id_field_source": None,
+            "header_cell_alignment_used": False,
+            "main_channel_present": False,
+            "detail_channel_present": False,
+            "main_channel_matches_expected": False,
+            "detail_channel_matches_expected": False,
+            "main_detail_same": False,
+            "mismatch_source": None,
+        }
+    return {
+        "id_field_source": facts.get("id_field_source"),
+        "header_cell_alignment_used": bool(facts.get("header_cell_alignment_used")),
+        "main_channel_present": bool(facts.get("main_channel_present")),
+        "detail_channel_present": bool(facts.get("detail_channel_present")),
+        "main_channel_matches_expected": bool(facts.get("main_channel_matches_expected")),
+        "detail_channel_matches_expected": bool(facts.get("detail_channel_matches_expected")),
+        "main_detail_same": bool(facts.get("main_detail_same")),
+        "mismatch_source": facts.get("mismatch_source"),
+    }
 
 
 def _read_current_page_app_rows(page):
@@ -1369,10 +1510,7 @@ def _read_current_page_app_rows(page):
     rows = []
     for raw in (payload or {}).get("rows") or []:
         aligned = _align_header_cells(headers, raw.get("cells") or [])
-        app_id = _mapped_value(
-            aligned,
-            lambda header: header == "ID" or "应用ID" in header,
-        ) or (raw.get("detail_id") or "")
+        app_id = _mapped_value(aligned, _is_app_id_header) or (raw.get("detail_id") or "")
         app_name = _mapped_value(
             aligned,
             lambda header: bool(re.search(r"应用名称|应用名", header or "")),
@@ -1522,13 +1660,14 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
     """Locate by exact ID, then verify the channel from the row or expanded detail."""
     _reset_list_filters(page)
     if not _go_to_first_page(page):
-        return {"found": False, "reason": "pagination_unstable"}
+        return {"found": False, "reason": "pagination_unstable", **_redacted_locate_facts(None)}
     channel_error = None
+    channel_facts = None
 
     for _ in range(50):
         _expand_visible_rows(page)
-        raw = page.evaluate("""
-        ({appId}) => {
+        payload = page.evaluate("""
+        () => {
           const serialize = el => ({
             text: (el.innerText || el.textContent || '').trim(),
             classes: String(el.className || '')
@@ -1563,57 +1702,63 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
             return '';
           };
 
+          const result = [];
           for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
             const row = rows[rowIdx];
             if (row.offsetParent === null) continue;
-            const cells = Array.from(row.querySelectorAll('td')).map(serialize);
             const detail = expandedRowFor(row);
-            const detailId = labeledValue(detail, /^(应用)?ID$/i);
-            const fallbackIdMatch = detail && (detail.textContent || '').match(
-              /(?:应用)?ID\\s*[:：]\\s*([A-Za-z0-9_-]+)/i
-            );
-            const fallbackId = fallbackIdMatch ? fallbackIdMatch[1] : '';
-            const exactId = cells.some(cell => (cell.text || '').trim() === appId);
-            if (!exactId && detailId !== appId && fallbackId !== appId) continue;
-            return {
-              id_matched: true,
-              headers: headers,
-              cells: cells,
+            result.push({
+              cells: Array.from(row.querySelectorAll('td')).map(serialize),
               detail_channel: labeledValue(detail, /^(所属)?渠道(名称)?$/),
-              detail_id: detailId,
-              fallback_id: fallbackId,
+              detail_id: labeledValue(detail, /^(应用)?ID$/i),
               row_idx: rowIdx
-            };
+            });
           }
-          return {id_matched: false, headers: headers, cells: [], detail_channel: '', row_idx: -1};
+          return {headers: headers, rows: result};
         }
-        """, {"appId": str(app_id)})
-        if raw.get("id_matched"):
-            main_channel = _main_channel_from_row(raw.get("headers") or [], raw.get("cells") or [])
-            decision = _channel_verify_decision(
+        """)
+        headers = (payload or {}).get("headers") or []
+        matched = None
+        for row in (payload or {}).get("rows") or []:
+            ok, id_source = _id_matched_in_row(
+                app_id, headers, row.get("cells") or [], row.get("detail_id") or ""
+            )
+            if ok:
+                matched = (row, id_source)
+                break
+        if matched:
+            row, id_source = matched
+            aligned = _align_header_cells(headers, row.get("cells") or [])
+            main_channel = _main_channel_from_row(headers, row.get("cells") or [])
+            facts = _channel_verify_facts(
                 expected_channel_name,
                 main_channel,
-                raw.get("detail_channel") or "",
+                row.get("detail_channel") or "",
+                aligned_used=bool(aligned),
+                id_field_source=id_source,
             )
-            if decision["verified"]:
+            redacted = _redacted_locate_facts(facts)
+            if facts["verified"]:
                 return {
                     "found": True,
-                    "row_idx": raw.get("row_idx"),
-                    "channel_source": decision["source"],
+                    "row_idx": row.get("row_idx"),
+                    "channel_source": facts["source"],
                     "reason": None,
+                    **redacted,
                 }
-            channel_error = decision["reason"]
+            channel_error = facts["reason"]
+            channel_facts = redacted
             break
 
         moved = _click_next_page_and_wait(page)
         if moved is None:
-            return {"found": False, "reason": "pagination_unstable"}
+            return {"found": False, "reason": "pagination_unstable", **_redacted_locate_facts(channel_facts)}
         if not moved:
             break
 
     if channel_error:
-        return {"found": False, "reason": channel_error}
-    return {"found": False, "reason": "not_found"}
+        return {"found": False, "reason": channel_error, **_redacted_locate_facts(channel_facts)}
+    return {"found": False, "reason": "not_found", **_redacted_locate_facts(channel_facts)}
 
 
 def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id, app_name,
@@ -1700,14 +1845,11 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
     _bp = data.get("base_platform", "")
     if _bp:
         _js_select(page, "底座", _bp)
-    channel_selected = _js_channel_popover(page, "所属渠道", data["actual_channel_name"])
-    if not channel_selected:
-        channel_selected = _js_channel_popover(page, "渠道", data["actual_channel_name"])
-    if not channel_selected:
-        print(f"[create_app] WARN: 所属渠道 选择失败")
-    else:
-        page.keyboard.press("Tab")
-        page.wait_for_timeout(300)
+    channel_selected = _select_and_verify_create_channel(page, data["actual_channel_name"])
+    if not channel_selected.get("success"):
+        return {"success": False, "error": channel_selected["error"]}
+    page.keyboard.press("Tab")
+    page.wait_for_timeout(300)
     page.wait_for_timeout(500)
     page.evaluate("""() => {
       const pops = document.querySelectorAll('.el-popover, .el-popper, [id^="el-popover-"]');
@@ -1787,16 +1929,7 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
       }
     }""")
     page.wait_for_timeout(300)
-    saved = page.evaluate("""() => {
-      const wrappers = document.querySelectorAll('.el-dialog__wrapper');
-      for (const w of wrappers) {
-        if (w.style.display === 'none') continue;
-        if (w.querySelectorAll('.el-tabs__item').length === 0) continue;
-        const btns = w.querySelectorAll('button');
-        for (const b of btns) { if (b.innerText.includes('保存')) { b.click(); return true; } }
-      }
-      return false;
-    }""")
+    saved = _click_save_button(page)
     if not saved:
         return {"success": False, "error": err("SAVE_FAILED", "SAVE", "未找到保存按钮", NEXT_MANUAL)}
     try:
