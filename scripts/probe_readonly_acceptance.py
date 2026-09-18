@@ -261,6 +261,16 @@ def _empty_report(*, error=None) -> dict:
     }
 
 
+def _list_filter_verified(detail) -> bool:
+    if not isinstance(detail, dict):
+        return False
+    return bool(
+        detail.get("filter_stable")
+        and detail.get("response_contains_target_channel") is True
+        and detail.get("reader_sees_target_channel") is True
+    )
+
+
 def run_acceptance(
     page,
     cap,
@@ -387,6 +397,17 @@ def run_acceptance(
         report["steps"]["exact_app_id_lookup"] = _lookup_facts(located or {})
         if guard["write_request_observed"] or guard["save_click_count"]:
             report["error"] = "write_observed_or_save_clicked"
+            return report
+        if not _list_filter_verified(detail if isinstance(detail, dict) else {}):
+            report["error"] = "list_filter_not_verified"
+            return report
+        if not located or not located.get("found"):
+            reason = (located or {}).get("reason")
+            report["error"] = (
+                reason
+                if reason in {"list_not_restored_after_reset", "pagination_unstable"}
+                else "target_app_not_located"
+            )
             return report
         report["ok"] = True
     except ProbeTimeout:

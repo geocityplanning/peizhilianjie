@@ -91,8 +91,14 @@ def test_channel_id_header_is_not_used_as_channel_name():
     assert cap._main_channel_from_row(headers, cells) == ""
 
 
-def _install_locate_mocks(monkeypatch, cap, payload):
+def _install_locate_mocks(monkeypatch, cap, payload, *, row_count=10):
     monkeypatch.setattr(cap, "_reset_list_filters", lambda page: None)
+    monkeypatch.setattr(
+        cap,
+        "_read_pagination_state",
+        lambda page: {"page_number": 1, "row_count": row_count, "table_signature": "A"},
+    )
+    monkeypatch.setattr(cap, "wait_for_table_update", lambda *args, **kwargs: True)
     monkeypatch.setattr(cap, "_go_to_first_page", lambda page: True)
     monkeypatch.setattr(cap, "_expand_visible_rows", lambda page: None)
     monkeypatch.setattr(cap, "_click_next_page_and_wait", lambda page: False)
@@ -289,3 +295,39 @@ def test_identify_function_never_creates_or_saves():
     assert "create_channel" not in func_src
     assert "_js_fill" not in func_src
     assert "保存按钮" not in func_src
+
+
+def test_empty_table_reset_not_stable_is_not_not_found(monkeypatch):
+    cap = _stub_login_and_import()
+    page = _install_locate_mocks(
+        monkeypatch,
+        cap,
+        {"headers": [_col("ID")], "rows": []},
+        row_count=0,
+    )
+    monkeypatch.setattr(cap, "wait_for_table_update", lambda *args, **kwargs: False)
+    located = cap._find_target_row_by_id(page, "12052", "chan-a")
+    assert located["found"] is False
+    assert located["reason"] == "list_not_restored_after_reset"
+    assert located["reason"] != "not_found"
+
+
+def test_empty_table_reset_restored_then_locates(monkeypatch):
+    cap = _stub_login_and_import()
+    page = _install_locate_mocks(
+        monkeypatch,
+        cap,
+        {
+            "headers": [_col("ID"), _col("所属渠道")],
+            "rows": [{
+                "cells": [_col("12052"), _col("chan-a")],
+                "detail_channel": "chan-a",
+                "detail_id": "",
+                "row_idx": 0,
+            }],
+        },
+        row_count=0,
+    )
+    monkeypatch.setattr(cap, "wait_for_table_update", lambda *args, **kwargs: True)
+    located = cap._find_target_row_by_id(page, "12052", "chan-a")
+    assert located["found"] is True

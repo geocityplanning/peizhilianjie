@@ -1658,7 +1658,15 @@ def _identify_new_app(page, before_ids, actual_channel_name, app_name):
 
 def _find_target_row_by_id(page, app_id, expected_channel_name=""):
     """Locate by exact ID, then verify the channel from the row or expanded detail."""
+    previous_state = _read_pagination_state(page) or {}
     _reset_list_filters(page)
+    if previous_state.get("row_count", 0) <= 0:
+        if not wait_for_table_update(page, previous_state, _read_pagination_state):
+            return {
+                "found": False,
+                "reason": "list_not_restored_after_reset",
+                **_redacted_locate_facts(None),
+            }
     if not _go_to_first_page(page):
         return {"found": False, "reason": "pagination_unstable", **_redacted_locate_facts(None)}
     channel_error = None

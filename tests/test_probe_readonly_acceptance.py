@@ -133,6 +133,7 @@ def _install_common(monkeypatch, cap, *, find_list=None, search=None):
                 "target_filter_field_is_channel": True,
                 "table_changed": True,
                 "reader_sees_target_channel": True,
+                "response_contains_target_channel": True,
             }
         ),
     )
@@ -242,8 +243,54 @@ def test_list_locate_failure_still_closes_and_zero_write(monkeypatch):
     assert report["copy_dialog_closed"] is True
     assert report["save_click_count"] == 0
     assert report["write_request_observed"] is False
+    assert report["ok"] is False
+    assert report["error"] == "target_app_not_located"
     assert report["steps"]["exact_app_id_lookup"]["found"] is False
     assert report["steps"]["exact_app_id_lookup"]["mismatch_source"] == "both"
+
+
+def test_response_missing_target_channel_is_not_ok(monkeypatch):
+    cap = _stub_login_and_import()
+    probe = _load_probe()
+
+    def search(page, channel, return_detail=False):
+        return {
+            "filter_stable": False,
+            "list_requests_before": 0,
+            "list_requests_after": 1,
+            "last_http_status": 200,
+            "request_carried_target_filter": True,
+            "target_filter_field": "channelNames[]",
+            "target_filter_field_is_channel": True,
+            "table_changed": True,
+            "reader_sees_target_channel": False,
+            "response_contains_target_channel": False,
+        }
+
+    _install_common(monkeypatch, cap, search=search)
+    page = AcceptancePage()
+    report = probe.run_acceptance(page, cap, channel_name="chan-a", app_id="app-1", ref_app_id="ref-1")
+    assert report["ok"] is False
+    assert report["error"] == "list_filter_not_verified"
+    assert report["copy_dialog_closed"] is True
+    assert report["save_click_count"] == 0
+    assert report["diagnosis"]["response_contains_target_channel"] is False
+
+
+def test_all_success_conditions_set_ok_true(monkeypatch):
+    cap = _stub_login_and_import()
+    probe = _load_probe()
+    _install_common(monkeypatch, cap)
+    page = AcceptancePage()
+    report = probe.run_acceptance(page, cap, channel_name="chan-a", app_id="app-1", ref_app_id="ref-1")
+    assert report["ok"] is True
+    assert report["error"] is None
+    assert report["exact_channel_unique"] is True
+    assert report["selected_channel_matches"] is True
+    assert report["steps"]["exact_app_id_lookup"]["found"] is True
+    assert report["copy_dialog_closed"] is True
+    assert report["save_click_count"] == 0
+    assert report["write_request_observed"] is False
 
 
 def test_exception_still_closes_and_zero_write(monkeypatch):
