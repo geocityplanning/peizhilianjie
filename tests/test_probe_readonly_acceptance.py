@@ -8,7 +8,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-import time
+import threading
 import types
 from pathlib import Path
 
@@ -390,11 +390,19 @@ def test_exception_writes_report_file(tmp_path, monkeypatch):
 def test_budget_timeout_writes_probe_timeout_and_cleans_up(tmp_path, monkeypatch):
     cap = _stub_login_and_import()
     probe = _load_probe()
+    original_save = cap._click_save_button
+    writes = []
+    real_write = probe._atomic_write_report
+
+    def counting(path, report):
+        writes.append(1)
+        return real_write(path, report)
 
     def slow_collect(page, reset_filters=False):
-        time.sleep(1.0)
+        page.wait_for_timeout(5000)
         return {"ref-1": {"app_id": "ref-1"}}
 
+    monkeypatch.setattr(probe, "_atomic_write_report", counting)
     monkeypatch.setattr(cap, "_collect_all_app_rows", slow_collect)
     monkeypatch.setattr(cap, "_find_target_row_by_id", lambda *args, **kwargs: {"found": True, "row_idx": 0})
     monkeypatch.setattr(cap, "_go_tab", lambda *args, **kwargs: True)
@@ -415,6 +423,9 @@ def test_budget_timeout_writes_probe_timeout_and_cleans_up(tmp_path, monkeypatch
     assert payload["error"] == "probe_timeout"
     assert payload["wrote_any_uat_data"] is False
     assert SECRET_CHANNEL not in report_file.read_text(encoding="utf-8")
+    assert cap._click_save_button is original_save
+    assert report["copy_dialog_closed"] is True
+    assert writes == [1]
 
 
 def test_report_file_write_failure_still_closes(tmp_path, monkeypatch):
@@ -464,3 +475,110 @@ def test_report_file_redacts_disallowed_fields(tmp_path, monkeypatch):
     assert SECRET_URL not in dumped
     assert "12052" not in dumped
     assert set(payload) <= probe._ALLOWED_TOP_KEYS
+
+
+def test_owner_deadline_page_rejects_other_thread():
+    probe = _load_probe()
+    inner = AcceptancePage()
+    wrapped = probe.OwnerDeadlinePage(inner, threading.get_ident())
+    errors = []
+
+    def worker():
+        try:
+            wrapped.evaluate("1+1")
+        except Exception as exc:
+            errors.append(str(exc))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert errors
+    assert "Cannot switch to a different thread" in errors[0]
+
+
+def test_success_and_failure_paths_stay_on_owner_thread(tmp_path, monkeypatch):
+    cap = _stub_login_and_import()
+    probe = _load_probe()
+    owner = threading.get_ident()
+    wrappers = []
+    real_cls = probe.OwnerDeadlinePage
+
+    class Tracking(real_cls):
+        def __init__(self, page, owner_ident, deadline=None):
+            super().__init__(page, owner_ident, deadline)
+            wrappers.append(self)
+
+    monkeypatch.setattr(probe, "OwnerDeadlinePage", Tracking)
+    _install_common(monkeypatch, cap)
+    page = AcceptancePage()
+    probe.run_acceptance_with_budget(
+        page,
+        cap,
+        channel_name="chan-a",
+        app_id="app-1",
+        ref_app_id="ref-1",
+        budget_seconds=5,
+        report_file=tmp_path / "owner-ok.json",
+    )
+    assert wrappers
+    assert wrappers[0]._owner_ident == owner
+    assert wrappers[0].thread_calls
+    assert all(ident == owner for ident in wrappers[0].thread_calls)
+
+    page_fail = AcceptancePage(exact_count=0, selected_value="")
+    probe.run_acceptance_with_budget(
+        page_fail,
+        cap,
+        channel_name="chan-a",
+        app_id="app-1",
+        ref_app_id="ref-1",
+        budget_seconds=5,
+        report_file=tmp_path / "owner-fail.json",
+    )
+    assert all(ident == owner for ident in wrappers[-1].thread_calls)
+
+
+def test_timeout_path_stays_on_owner_and_starts_no_worker(tmp_path, monkeypatch):
+    cap = _stub_login_and_import()
+    probe = _load_probe()
+    owner = threading.get_ident()
+    started = []
+
+    class ForbiddenThread:
+        def __init__(self, *args, **kwargs):
+            started.append(1)
+            raise AssertionError("must not start a worker thread")
+
+    monkeypatch.setattr(probe.threading, "Thread", ForbiddenThread)
+    wrappers = []
+    real_cls = probe.OwnerDeadlinePage
+
+    class Tracking(real_cls):
+        def __init__(self, page, owner_ident, deadline=None):
+            super().__init__(page, owner_ident, deadline)
+            wrappers.append(self)
+
+    monkeypatch.setattr(probe, "OwnerDeadlinePage", Tracking)
+
+    def slow_collect(page, reset_filters=False):
+        page.wait_for_timeout(5000)
+        return {"ref-1": {"app_id": "ref-1"}}
+
+    monkeypatch.setattr(cap, "_collect_all_app_rows", slow_collect)
+    original_save = cap._click_save_button
+    page = AcceptancePage()
+    report = probe.run_acceptance_with_budget(
+        page,
+        cap,
+        channel_name="chan-a",
+        app_id="app-1",
+        ref_app_id="ref-1",
+        budget_seconds=0.05,
+        report_file=tmp_path / "owner-timeout.json",
+    )
+    assert started == []
+    assert report["error"] == "probe_timeout"
+    assert cap._click_save_button is original_save
+    assert wrappers
+    assert all(ident == owner for ident in wrappers[0].thread_calls)

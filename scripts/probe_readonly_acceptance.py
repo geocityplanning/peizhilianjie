@@ -58,6 +58,48 @@ class ProbeTimeout(Exception):
     """The combined probe exceeded its explicit total budget."""
 
 
+class OwnerDeadlinePage:
+    """Proxy that keeps sync Playwright calls on the owner thread and honors a deadline."""
+
+    def __init__(self, page, owner_ident, deadline=None):
+        object.__setattr__(self, "_inner", page)
+        object.__setattr__(self, "_owner_ident", owner_ident)
+        object.__setattr__(self, "_deadline", deadline)
+        object.__setattr__(self, "thread_calls", [])
+
+    def _check(self):
+        ident = threading.get_ident()
+        self.thread_calls.append(ident)
+        if ident != self._owner_ident:
+            raise RuntimeError("Cannot switch to a different thread")
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            raise ProbeTimeout()
+
+    def clear_deadline(self):
+        object.__setattr__(self, "_deadline", None)
+
+    def wait_for_timeout(self, milliseconds):
+        self._check()
+        wait_ms = milliseconds
+        if self._deadline is not None:
+            remaining_ms = (self._deadline - time.monotonic()) * 1000
+            if remaining_ms <= 0 or milliseconds > remaining_ms:
+                raise ProbeTimeout()
+            wait_ms = milliseconds
+        self._inner.wait_for_timeout(wait_ms)
+        self._check()
+
+    def __getattr__(self, name):
+        self._check()
+        attr = getattr(self._inner, name)
+        if callable(attr):
+            def bound(*args, **kwargs):
+                self._check()
+                return attr(*args, **kwargs)
+            return bound
+        return attr
+
+
 def _load_helpers():
     spec = importlib.util.spec_from_file_location("probe_channel_filter", PROBE_HELPERS)
     module = importlib.util.module_from_spec(spec)
@@ -357,6 +399,9 @@ def run_acceptance(
         report["save_click_count"] = int(guard.get("save_click_count") or 0)
         report["write_request_observed"] = bool(guard.get("write_request_observed"))
         report["wrote_any_uat_data"] = False
+        clearer = getattr(page, "clear_deadline", None)
+        if callable(clearer):
+            clearer()
         try:
             report["copy_dialog_closed"] = _close_copy_dialog(page)
         except Exception:
@@ -395,53 +440,25 @@ def run_acceptance_with_budget(
     budget_seconds: float = DEFAULT_BUDGET_SECONDS,
     report_file,
 ) -> dict:
+    owner_ident = threading.get_ident()
     deadline = time.monotonic() + max(0.01, float(budget_seconds))
-    holder = {"report": None}
-    finished = threading.Event()
-
-    def worker():
-        try:
-            holder["report"] = run_acceptance(
-                page,
-                cap,
-                channel_name=channel_name,
-                app_id=app_id,
-                ref_app_id=ref_app_id,
-                deadline=deadline,
-            )
-        except Exception:
-            holder["report"] = _empty_report(error="RuntimeError")
-        finally:
-            finished.set()
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    finished.wait(timeout=max(0.01, float(budget_seconds)))
-    report = holder["report"]
-    if not finished.is_set():
-        report = report or _empty_report(error="probe_timeout")
-        report["ok"] = False
-        report["error"] = "probe_timeout"
-        try:
-            report["copy_dialog_closed"] = _close_copy_dialog(page)
-        except Exception:
-            report["copy_dialog_closed"] = False
-        cleanup = getattr(cap, "_probe_cleanup", None)
-        if callable(cleanup):
-            try:
-                cleanup()
-            except Exception:
-                pass
-        report["wrote_any_uat_data"] = False
-    assert report is not None
+    wrapped = OwnerDeadlinePage(page, owner_ident, deadline)
+    report = run_acceptance(
+        wrapped,
+        cap,
+        channel_name=channel_name,
+        app_id=app_id,
+        ref_app_id=ref_app_id,
+        deadline=deadline,
+    )
     try:
         _emit_report(report_file, report)
     except Exception:
         report["ok"] = False
-        if report.get("error") not in {"probe_timeout"}:
+        if report.get("error") != "probe_timeout":
             report["error"] = "report_write_failed"
         try:
-            _close_copy_dialog(page)
+            report["copy_dialog_closed"] = _close_copy_dialog(wrapped)
         except Exception:
             pass
         cleanup = getattr(cap, "_probe_cleanup", None)
