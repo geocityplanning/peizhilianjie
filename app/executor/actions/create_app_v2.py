@@ -5,6 +5,7 @@
 import base64
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1216,16 +1217,111 @@ def _search_list_by_channel(page, channel_name, return_detail=False):
     return detail if return_detail else bool(stable)
 
 
+_UTILITY_COLUMN_CLASS_RE = re.compile(
+    r"el-table__expand-column|el-table-column--selection|el-table-column--index|\bgutter\b"
+)
+_POST_SAVE_FILTER_ATTEMPTS = 3
+_POST_SAVE_FILTER_RETRY_MS = 1500
+
+
+def _is_utility_column(item):
+    classes = ""
+    if isinstance(item, dict):
+        classes = str(item.get("classes") or "")
+    else:
+        classes = str(item or "")
+    return bool(_UTILITY_COLUMN_CLASS_RE.search(classes))
+
+
+def _align_header_cells(headers, cells):
+    """Pair data headers with data cells, skipping expand/select/gutter columns."""
+    kept_headers = [item for item in (headers or []) if not _is_utility_column(item)]
+    kept_cells = [item for item in (cells or []) if not _is_utility_column(item)]
+    if not kept_headers or not kept_cells:
+        return []
+    if len(kept_headers) != len(kept_cells):
+        return []
+    aligned = []
+    for header, cell in zip(kept_headers, kept_cells):
+        aligned.append({
+            "header": (header.get("text") if isinstance(header, dict) else str(header or "")).strip(),
+            "value": (cell.get("text") if isinstance(cell, dict) else str(cell or "")).strip(),
+        })
+    return aligned
+
+
+def _is_channel_name_header(header):
+    text = re.sub(r"[ *:：\s]", "", header or "")
+    if not text or re.search(r"ID|编码|code", text, re.I):
+        return False
+    return "渠道" in (header or "")
+
+
+def _mapped_value(aligned, predicate):
+    for item in aligned:
+        if predicate(item.get("header") or ""):
+            return (item.get("value") or "").strip()
+    return ""
+
+
+def _main_channel_from_row(headers, cells):
+    aligned = _align_header_cells(headers, cells)
+    if not aligned:
+        return ""
+    return _mapped_value(aligned, _is_channel_name_header)
+
+
+def _channel_verify_decision(expected_channel_name, main_channel, detail_channel):
+    """Verify channel using main column and expanded detail independently.
+
+    A wrong non-empty main cell must not hide a matching detail value.
+    Missing values are unverified, not a mismatch.
+    """
+    expected = (expected_channel_name or "").strip()
+    main = (main_channel or "").strip()
+    detail = (detail_channel or "").strip()
+    if not expected:
+        return {"verified": True, "reason": None, "source": None}
+    if detail == expected:
+        return {"verified": True, "reason": None, "source": "detail"}
+    if main == expected:
+        return {"verified": True, "reason": None, "source": "main"}
+    if not main and not detail:
+        return {"verified": False, "reason": "channel_unverified", "source": None}
+    return {
+        "verified": False,
+        "reason": "channel_mismatch",
+        "source": "detail" if detail else "main",
+    }
+
+
+def _id_matched_in_row(app_id, cells, detail_id="", fallback_id=""):
+    expected = str(app_id or "").strip()
+    if not expected:
+        return False
+    if str(detail_id or "").strip() == expected or str(fallback_id or "").strip() == expected:
+        return True
+    for cell in cells or []:
+        if _is_utility_column(cell):
+            continue
+        text = (cell.get("text") if isinstance(cell, dict) else str(cell or "")).strip()
+        if text == expected:
+            return True
+    return False
+
+
 def _read_current_page_app_rows(page):
-    return page.evaluate("""() => {
+    payload = page.evaluate("""() => {
+      const serialize = el => ({
+        text: (el.innerText || el.textContent || '').trim(),
+        classes: String(el.className || '')
+      });
       const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
       const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
       const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
       const primaryHeaders = document.querySelectorAll('.el-table__header-wrapper th');
       const headerNodes = primaryHeaders.length ? primaryHeaders : document.querySelectorAll('th');
-      const headers = Array.from(headerNodes).map(
-        th => (th.innerText || '').trim()
-      );
+      const headers = Array.from(headerNodes).map(serialize);
       const expandedRowFor = row => {
         const next = row.nextElementSibling;
         return next && next.classList.contains('el-table__expanded-row') ? next : null;
@@ -1252,39 +1348,48 @@ def _read_current_page_app_rows(page):
       for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
         const row = rows[rowIdx];
         if (row.offsetParent === null) continue;
-        const cells = Array.from(row.querySelectorAll('td'));
-        let appId = '';
-        let appName = '';
-        let channelName = '';
-        for (let i = 0; i < cells.length && i < headers.length; i++) {
-          const header = headers[i];
-          if (header === 'ID' || header.includes('应用ID')) {
-            appId = (cells[i].textContent || '').trim();
-          }
-          if (/应用名称|应用名/.test(header)) appName = (cells[i].textContent || '').trim();
-          if (/渠道/.test(header)) channelName = (cells[i].textContent || '').trim();
-        }
         const detail = expandedRowFor(row);
-        if (!appId) {
-          appId = labeledValue(detail, /^(应用)?ID$/i);
-          if (!appId && detail) {
-            const match = (detail.textContent || '').match(/(?:应用)?ID\\s*[:：]\\s*([A-Za-z0-9_-]+)/i);
-            appId = match ? match[1] : '';
-          }
+        let detailId = labeledValue(detail, /^(应用)?ID$/i);
+        if (!detailId && detail) {
+          const match = (detail.textContent || '').match(/(?:应用)?ID\\s*[:：]\\s*([A-Za-z0-9_-]+)/i);
+          detailId = match ? match[1] : '';
         }
-        if (!appName) appName = labeledValue(detail, /^应用(名称|名)?$/);
-        if (!channelName) channelName = labeledValue(detail, /^(所属)?渠道(名称)?$/);
-        if (!appId) continue;
         result.push({
-          app_id: appId,
+          cells: Array.from(row.querySelectorAll('td')).map(serialize),
+          detail_id: detailId,
+          detail_app_name: labeledValue(detail, /^应用(名称|名)?$/),
+          detail_channel: labeledValue(detail, /^(所属)?渠道(名称)?$/),
           row_idx: rowIdx,
-          row_text: (row.textContent || '').trim(),
-          app_name: appName,
-          channel_name: channelName
+          row_text: (row.textContent || '').trim()
         });
       }
-      return result;
+      return {headers: headers, rows: result};
     }""")
+    headers = (payload or {}).get("headers") or []
+    rows = []
+    for raw in (payload or {}).get("rows") or []:
+        aligned = _align_header_cells(headers, raw.get("cells") or [])
+        app_id = _mapped_value(
+            aligned,
+            lambda header: header == "ID" or "应用ID" in header,
+        ) or (raw.get("detail_id") or "")
+        app_name = _mapped_value(
+            aligned,
+            lambda header: bool(re.search(r"应用名称|应用名", header or "")),
+        ) or (raw.get("detail_app_name") or "")
+        channel_name = _main_channel_from_row(headers, raw.get("cells") or []) or (
+            raw.get("detail_channel") or ""
+        )
+        if not app_id:
+            continue
+        rows.append({
+            "app_id": app_id,
+            "row_idx": raw.get("row_idx"),
+            "row_text": raw.get("row_text") or "",
+            "app_name": app_name,
+            "channel_name": channel_name,
+        })
+    return rows
 
 
 def _collect_all_app_rows(page, reset_filters=False):
@@ -1324,7 +1429,21 @@ def _identify_new_app(page, before_ids, actual_channel_name, app_name):
 
     # Narrow the post-save lookup by channel and app name first. Exact ID
     # difference and channel verification remain the identity/safety checks.
-    channel_filter = _search_list_by_channel(page, actual_channel_name, return_detail=True)
+    # New channels may be briefly unfilterable; retry a bounded number of
+    # times, then fall back to a full scan. This path never creates or saves.
+    channel_filter = None
+    for filter_attempt in range(_POST_SAVE_FILTER_ATTEMPTS):
+        channel_filter = _search_list_by_channel(page, actual_channel_name, return_detail=True)
+        if channel_filter is True or (
+            isinstance(channel_filter, dict) and channel_filter.get("filter_stable")
+        ):
+            break
+        carried = isinstance(channel_filter, dict) and channel_filter.get(
+            "request_carried_target_filter"
+        )
+        if not carried or filter_attempt >= _POST_SAVE_FILTER_ATTEMPTS - 1:
+            break
+        page.wait_for_timeout(_POST_SAVE_FILTER_RETRY_MS)
     if isinstance(channel_filter, dict) and not channel_filter.get("filter_stable"):
         print(f"[create_app] 渠道筛选未生效，回退全量扫描: {channel_filter}")
     if channel_filter is True or (isinstance(channel_filter, dict) and channel_filter.get("filter_stable")):
@@ -1408,13 +1527,17 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
 
     for _ in range(50):
         _expand_visible_rows(page)
-        found = page.evaluate("""
-        ({appId, expectedChannel}) => {
+        raw = page.evaluate("""
+        ({appId}) => {
+          const serialize = el => ({
+            text: (el.innerText || el.textContent || '').trim(),
+            classes: String(el.className || '')
+          });
           const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
           const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
           const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
           const headerNodes = document.querySelectorAll('.el-table__header-wrapper th');
-          const headers = Array.from(headerNodes).map(th => (th.innerText || '').trim());
+          const headers = Array.from(headerNodes).map(serialize);
 
           const expandedRowFor = (row) => {
             const next = row.nextElementSibling;
@@ -1443,42 +1566,43 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
           for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
             const row = rows[rowIdx];
             if (row.offsetParent === null) continue;
-            const exactId = Array.from(row.querySelectorAll('td')).some(
-              cell => (cell.textContent || '').trim() === appId
-            );
+            const cells = Array.from(row.querySelectorAll('td')).map(serialize);
             const detail = expandedRowFor(row);
             const detailId = labeledValue(detail, /^(应用)?ID$/i);
             const fallbackIdMatch = detail && (detail.textContent || '').match(
               /(?:应用)?ID\\s*[:：]\\s*([A-Za-z0-9_-]+)/i
             );
-            if (!exactId && detailId !== appId && (!fallbackIdMatch || fallbackIdMatch[1] !== appId)) continue;
-
-            const rowText = (row.textContent || '').trim();
-            const channelIndex = headers.findIndex(header => /渠道/.test(header));
-            const cells = Array.from(row.querySelectorAll('td'));
-            const mainChannel = channelIndex >= 0 && cells[channelIndex]
-              ? (cells[channelIndex].textContent || '').trim()
-              : '';
-            const detailChannel = labeledValue(detail, /^(所属)?渠道(名称)?$/);
-            const channelValue = mainChannel || detailChannel;
-            const channelVerified = !expectedChannel || channelValue === expectedChannel;
+            const fallbackId = fallbackIdMatch ? fallbackIdMatch[1] : '';
+            const exactId = cells.some(cell => (cell.text || '').trim() === appId);
+            if (!exactId && detailId !== appId && fallbackId !== appId) continue;
             return {
-              found: channelVerified,
-              channel_mismatch: Boolean(expectedChannel) && Boolean(channelValue) && channelValue !== expectedChannel,
-              channel_unverified: Boolean(expectedChannel) && !channelValue,
+              id_matched: true,
+              headers: headers,
+              cells: cells,
+              detail_channel: labeledValue(detail, /^(所属)?渠道(名称)?$/),
+              detail_id: detailId,
+              fallback_id: fallbackId,
               row_idx: rowIdx
             };
           }
-          return {found: false, channel_mismatch: false, channel_unverified: false, row_idx: -1};
+          return {id_matched: false, headers: headers, cells: [], detail_channel: '', row_idx: -1};
         }
-        """, {"appId": str(app_id), "expectedChannel": expected_channel_name})
-        if found.get("found"):
-            return found
-        if found.get("channel_mismatch"):
-            channel_error = "channel_mismatch"
-            break
-        if found.get("channel_unverified"):
-            channel_error = "channel_unverified"
+        """, {"appId": str(app_id)})
+        if raw.get("id_matched"):
+            main_channel = _main_channel_from_row(raw.get("headers") or [], raw.get("cells") or [])
+            decision = _channel_verify_decision(
+                expected_channel_name,
+                main_channel,
+                raw.get("detail_channel") or "",
+            )
+            if decision["verified"]:
+                return {
+                    "found": True,
+                    "row_idx": raw.get("row_idx"),
+                    "channel_source": decision["source"],
+                    "reason": None,
+                }
+            channel_error = decision["reason"]
             break
 
         moved = _click_next_page_and_wait(page)

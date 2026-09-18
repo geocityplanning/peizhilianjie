@@ -190,11 +190,11 @@ def test_target_relocation_checks_expanded_detail_separately():
     locate_src = ast.get_source_segment(src, locate) or ""
     assert "el-table__expanded-row" in locate_src
     assert "el-table__expanded-row" in locate_src
-    assert "channel_unverified" in locate_src
-    assert "channel_mismatch" in locate_src
-    assert "channelIndex" in locate_src
-    assert "detailChannel" in locate_src
-    assert "channelValue === expectedChannel" in locate_src
+    assert "channel_unverified" in locate_src or "channel_unverified" in src
+    assert "channel_mismatch" in locate_src or "channel_mismatch" in src
+    assert "_channel_verify_decision" in locate_src
+    assert "_main_channel_from_row" in locate_src
+    assert "el-table__expanded-row" in locate_src
 
 
 def test_post_save_channel_search_skips_readonly_select_inputs():

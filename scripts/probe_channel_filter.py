@@ -472,6 +472,7 @@ def main() -> int:
             report["steps"]["exact_app_id_lookup"] = {
                 "found": bool(located.get("found")),
                 "reason": located.get("reason"),
+                "channel_source": located.get("channel_source"),
                 "app_id": _mask(args.app_id),
             }
             report["notes"].append("按 ID 未找到不等于不存在：筛选未生效时只能判定未验证")
