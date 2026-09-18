@@ -20,6 +20,14 @@ class PasswordDecryptError(RuntimeError):
     """解密失败。消息不得包含密文、明文密码或密钥。"""
 
 
+class PasswordEncryptError(RuntimeError):
+    """加密失败。消息不得包含明文密码或密钥。"""
+
+
+class ProjectEnvError(RuntimeError):
+    """项目根 .env 存在但无法加载。消息不得包含环境值或密钥。"""
+
+
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
@@ -31,8 +39,8 @@ def secret_key_path(root: Path | None = None) -> Path:
 def _fallback_load_env(env_file: Path) -> None:
     try:
         lines = env_file.read_text(encoding="utf-8").splitlines()
-    except Exception:
-        return
+    except (OSError, UnicodeDecodeError):
+        raise ProjectEnvError("无法读取环境文件") from None
     for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -54,13 +62,19 @@ def load_project_env(root: Path | None = None) -> Path:
     """Load `<root>/.env` into os.environ without overriding existing values."""
     project_root = Path(root) if root is not None else _project_root()
     env_file = project_root / ".env"
-    if env_file.is_file():
-        try:
-            from dotenv import load_dotenv
-
-            load_dotenv(dotenv_path=env_file, override=False)
-        except Exception:
-            _fallback_load_env(env_file)
+    if not env_file.is_file():
+        return project_root
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        _fallback_load_env(env_file)
+        return project_root
+    try:
+        load_dotenv(dotenv_path=env_file, override=False)
+    except ProjectEnvError:
+        raise
+    except Exception:
+        raise ProjectEnvError("无法加载环境文件") from None
     return project_root
 
 
@@ -96,8 +110,10 @@ def encrypt_password(plaintext: str) -> str:
         return ""
     try:
         return Fernet(_get_key(create=True)).encrypt(plaintext.encode()).decode()
+    except (PasswordEncryptError, ProjectEnvError):
+        raise
     except Exception:
-        return plaintext
+        raise PasswordEncryptError("密码加密失败") from None
 
 
 def decrypt_password(ciphertext: str) -> str:

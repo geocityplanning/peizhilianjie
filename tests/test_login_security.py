@@ -223,3 +223,93 @@ def test_ensure_login_uses_decrypted_password_after_env_load(restore_modules, mo
     serialized = json.dumps({"result": result, "username": captured["username"]}, ensure_ascii=False)
     assert token not in serialized
     assert plaintext not in serialized
+
+
+def test_encrypt_invalid_key_fails_without_returning_plaintext(monkeypatch):
+    monkeypatch.setenv("AMOO_SECRET_KEY", "not-a-fernet-key")
+    plaintext = "unit-test-plain-to-encrypt"
+    security = _load_security()
+    with pytest.raises(security.PasswordEncryptError) as caught:
+        security.encrypt_password(plaintext)
+    message = str(caught.value)
+    assert message == "密码加密失败"
+    assert plaintext not in message
+    assert "not-a-fernet-key" not in message
+    assert "AMOO_SECRET_KEY" not in message
+
+
+def test_read_login_config_missing_file_is_empty(restore_modules, tmp_path):
+    login = _load_ensure_login(_load_security())
+    assert login._read_login_config(tmp_path / "missing-config.json") == {}
+
+
+def test_read_login_config_invalid_json_fails_without_leaking(restore_modules, tmp_path):
+    secret = "unit-test-password-in-json"
+    path = tmp_path / "config.json"
+    path.write_text("{not-json " + secret, encoding="utf-8")
+    login = _load_ensure_login(_load_security())
+    with pytest.raises(login.LoginConfigError) as caught:
+        login._read_login_config(path)
+    message = str(caught.value)
+    assert message == "登录配置不是合法 JSON"
+    assert secret not in message
+    assert "未配置" not in message
+
+
+def test_read_login_config_unreadable_file_fails_without_leaking(restore_modules, tmp_path, monkeypatch):
+    secret = "unit-test-password-in-config"
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"login": {"password_encrypted": secret}}), encoding="utf-8")
+    login = _load_ensure_login(_load_security())
+    original = Path.read_text
+
+    def boom(self, *args, **kwargs):
+        if Path(self).resolve() == path.resolve():
+            raise PermissionError("denied " + secret)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", boom)
+    with pytest.raises(login.LoginConfigError) as caught:
+        login._read_login_config(path)
+    message = str(caught.value)
+    assert message == "无法读取登录配置"
+    assert secret not in message
+    assert "未配置" not in message
+
+
+def test_load_project_env_dotenv_error_is_fail_fast(monkeypatch, tmp_path):
+    secret = "unit-test-env-key"
+    (tmp_path / ".env").write_text(f"AMOO_SECRET_KEY={secret}\n", encoding="utf-8")
+    import dotenv
+
+    def boom(*args, **kwargs):
+        raise RuntimeError(f"dotenv exploded with {secret}")
+
+    monkeypatch.setattr(dotenv, "load_dotenv", boom)
+    security = _load_security()
+    with pytest.raises(security.ProjectEnvError) as caught:
+        security.load_project_env(tmp_path)
+    message = str(caught.value)
+    assert message == "无法加载环境文件"
+    assert secret not in message
+
+    with pytest.raises(http_settings.ProjectEnvError) as settings_caught:
+        load_project_env(tmp_path)
+    settings_message = str(settings_caught.value)
+    assert settings_message == "无法加载环境文件"
+    assert secret not in settings_message
+
+
+def test_fallback_load_env_unreadable_fails_without_leaking():
+    secret = "unit-test-env-key"
+    security = _load_security()
+
+    class Unreadable:
+        def read_text(self, encoding="utf-8"):
+            raise PermissionError("denied " + secret)
+
+    with pytest.raises(security.ProjectEnvError) as caught:
+        security._fallback_load_env(Unreadable())
+    message = str(caught.value)
+    assert message == "无法读取环境文件"
+    assert secret not in message

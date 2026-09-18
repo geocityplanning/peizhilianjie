@@ -19,16 +19,26 @@ from ocr import CaptchaRecognizer
 DIR = Path(__file__).resolve().parent.parent
 
 
-def _read_login_config():
-    path = DIR / "config.json"
-    if not path.is_file():
+class LoginConfigError(RuntimeError):
+    """config.json 存在但无法使用。消息不得包含凭据。"""
+
+
+def _read_login_config(path=None):
+    config_path = Path(path) if path is not None else DIR / "config.json"
+    if not config_path.is_file():
         return {}
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+        text = config_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise LoginConfigError("无法读取登录配置") from None
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError:
+        raise LoginConfigError("登录配置不是合法 JSON") from None
     login = loaded.get("login") if isinstance(loaded, dict) else None
-    return login if isinstance(login, dict) else {}
+    if not isinstance(login, dict):
+        raise LoginConfigError("登录配置缺少 login 对象")
+    return login
 
 
 CONFIG = _read_login_config()
