@@ -1257,6 +1257,44 @@ def _dismiss_stray_dropdowns(page):
         pass
 
 
+_READER_SETTLE_ATTEMPTS = 12
+_READER_SETTLE_INTERVAL_MS = 100
+
+
+def _read_rows_until_target_settled(
+    page,
+    channel_name,
+    *,
+    poll=True,
+    rows_reader=None,
+    attempts=None,
+    interval_ms=None,
+):
+    """Read current-page rows until the exact target channel is visible.
+
+    A two-row table can pass the stability gate while both rows are still
+    briefly `offsetParent === null`, so a single read returns zero rows. This
+    helper only re-reads the DOM within a short bounded budget: it never clicks
+    search, never sends another list request, and never relaxes the stability or
+    exact-channel gate. Persistent empty, persistent mismatch or budget
+    exhaustion still fall through to the original safe failure.
+    """
+    reader = rows_reader or _read_current_page_app_rows
+    target = (channel_name or "").strip()
+    total = 1 if not poll else max(
+        1, int(attempts if attempts is not None else _READER_SETTLE_ATTEMPTS)
+    )
+    interval = int(interval_ms if interval_ms is not None else _READER_SETTLE_INTERVAL_MS)
+    rows = []
+    for attempt in range(total):
+        rows = reader(page) or []
+        if rows and any((row.get("channel_name") or "") == target for row in rows):
+            break
+        if attempt + 1 < total:
+            page.wait_for_timeout(interval)
+    return rows
+
+
 def _search_list_by_channel(page, channel_name, return_detail=False):
     """Select an exact channel in the list filter and verify the table refresh."""
     _reset_list_filters(page)
@@ -1448,7 +1486,7 @@ def _search_list_by_channel(page, channel_name, return_detail=False):
         final_state.get("table_signature") != previous_state.get("table_signature")
     )
     try:
-        visible_rows = _read_current_page_app_rows(page)
+        visible_rows = _read_rows_until_target_settled(page, channel_name, poll=bool(stable))
         detail["reader_row_count"] = len(visible_rows)
         detail["reader_sees_target_channel"] = any(
             row.get("channel_name") == channel_name for row in visible_rows

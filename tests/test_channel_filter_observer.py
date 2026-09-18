@@ -567,6 +567,145 @@ def test_search_case_dom_refreshed_with_target_channel(monkeypatch):
     assert detail["filter_stable"] is True
 
 
+def _reader_from_sequence(sequences):
+    queue = list(sequences)
+    last = {"value": []}
+
+    def reader(page):
+        if queue:
+            last["value"] = queue.pop(0)
+        return last["value"]
+
+    return reader
+
+
+def test_search_reader_first_empty_then_target_settles(monkeypatch):
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver()
+    _install_search_mocks(monkeypatch, cap, observations=observations, stable=True, rows=[])
+    calls = {"n": 0}
+    seq_reader = _reader_from_sequence([[], [{"channel_name": "chan"}]])
+
+    def counting_reader(page):
+        calls["n"] += 1
+        return seq_reader(page)
+
+    monkeypatch.setattr(cap, "_read_current_page_app_rows", counting_reader)
+    detail = cap._search_list_by_channel(FakeSearchPage(), "chan", return_detail=True)
+    assert detail["reader_row_count"] == 1
+    assert detail["reader_sees_target_channel"] is True
+    assert detail["filter_stable"] is True
+    assert calls["n"] == 2
+
+
+def test_search_reader_persistently_empty_stays_failed(monkeypatch):
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver()
+    _install_search_mocks(monkeypatch, cap, observations=observations, stable=True, rows=[])
+    calls = {"n": 0}
+    seq_reader = _reader_from_sequence([[]])
+
+    def counting_reader(page):
+        calls["n"] += 1
+        return seq_reader(page)
+
+    monkeypatch.setattr(cap, "_read_current_page_app_rows", counting_reader)
+    detail = cap._search_list_by_channel(FakeSearchPage(), "chan", return_detail=True)
+    assert detail["reader_row_count"] == 0
+    assert detail["reader_sees_target_channel"] is False
+    assert calls["n"] == cap._READER_SETTLE_ATTEMPTS
+
+
+def test_search_reader_rows_present_but_channel_mismatch_stays_failed(monkeypatch):
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver()
+    _install_search_mocks(monkeypatch, cap, observations=observations, stable=True, rows=[])
+    monkeypatch.setattr(
+        cap,
+        "_read_current_page_app_rows",
+        _reader_from_sequence([[{"channel_name": "other"}]]),
+    )
+    detail = cap._search_list_by_channel(FakeSearchPage(), "chan", return_detail=True)
+    assert detail["reader_row_count"] == 1
+    assert detail["reader_sees_target_channel"] is False
+
+
+def test_search_reader_exception_fails_safe(monkeypatch):
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver()
+    _install_search_mocks(monkeypatch, cap, observations=observations, stable=True, rows=[])
+
+    def boom(page):
+        raise RuntimeError("reader boom")
+
+    monkeypatch.setattr(cap, "_read_current_page_app_rows", boom)
+    detail = cap._search_list_by_channel(FakeSearchPage(), "chan", return_detail=True)
+    assert detail["reader_sees_target_channel"] is None
+    assert detail["filter_stable"] is True
+
+
+def test_search_reader_poll_sends_one_search_and_zero_save(monkeypatch):
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver()
+    _install_search_mocks(monkeypatch, cap, observations=observations, stable=True, rows=[])
+    monkeypatch.setattr(
+        cap,
+        "_read_current_page_app_rows",
+        _reader_from_sequence([[], [{"channel_name": "chan"}]]),
+    )
+    saves = {"n": 0}
+    monkeypatch.setattr(
+        cap,
+        "_click_save_button",
+        lambda page: saves.__setitem__("n", saves["n"] + 1) or True,
+    )
+    page = FakeSearchPage()
+    detail = cap._search_list_by_channel(page, "chan", return_detail=True)
+    assert detail["reader_sees_target_channel"] is True
+    assert sum(1 for script in page.scripts if "scope: 'channel-form'" in script) == 1
+    assert saves["n"] == 0
+
+
+def test_reader_settle_helper_single_read_without_polling():
+    cap = _stub_login_and_import()
+    calls = {"n": 0, "waits": 0}
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            calls["waits"] += 1
+
+    def reader(page):
+        calls["n"] += 1
+        return []
+
+    rows = cap._read_rows_until_target_settled(
+        Page(), "chan", poll=False, rows_reader=reader
+    )
+    assert rows == []
+    assert calls["n"] == 1
+    assert calls["waits"] == 0
+
+
+def test_reader_settle_helper_is_bounded_when_target_absent():
+    cap = _stub_login_and_import()
+    calls = {"n": 0, "waits": 0}
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            calls["waits"] += 1
+
+    def reader(page):
+        calls["n"] += 1
+        return [{"channel_name": "other"}]
+
+    rows = cap._read_rows_until_target_settled(
+        Page(), "chan", rows_reader=reader, attempts=4, interval_ms=1
+    )
+    assert len(rows) == 1
+    assert calls["n"] == 4
+    assert calls["waits"] == 3
+
+
 def _emit_filtered_list_cycle(session, request_id="r1", post_data="", status=200):
     session.emit(
         "Network.requestWillBeSent",
