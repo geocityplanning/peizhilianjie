@@ -101,6 +101,117 @@ class AcceptancePage:
         return True
 
 
+class CloseProbePage:
+    """Close path double: visibility polls and at most one click."""
+
+    def __init__(
+        self,
+        *,
+        initially_open=True,
+        close_after_polls=0,
+        click_returns=True,
+        always_open=False,
+        raise_on_visible=False,
+    ):
+        self.initially_open = initially_open
+        self.close_after_polls = close_after_polls
+        self.click_returns = click_returns
+        self.always_open = always_open
+        self.raise_on_visible = raise_on_visible
+        self.click_count = 0
+        self.polls_after_click = 0
+        self.clicked = False
+        self.scripts = []
+
+    def evaluate(self, script, payload=None):
+        text = script if isinstance(script, str) else ""
+        self.scripts.append(text)
+        if "COPY_DIALOG_VISIBLE" in text:
+            if self.raise_on_visible:
+                raise RuntimeError("visible boom")
+            if not self.clicked:
+                return self.initially_open
+            self.polls_after_click += 1
+            if self.always_open:
+                return True
+            return self.polls_after_click <= self.close_after_polls
+        if "COPY_DIALOG_CLICK" in text:
+            self.click_count += 1
+            self.clicked = True
+            return self.click_returns
+        return True
+
+    def wait_for_timeout(self, milliseconds):
+        return None
+
+
+def test_close_already_closed_returns_true_without_click():
+    probe = _load_probe()
+    page = CloseProbePage(initially_open=False)
+    assert probe._close_copy_dialog(page) is True
+    assert page.click_count == 0
+    assert not any("COPY_DIALOG_CLICK" in script for script in page.scripts)
+
+
+def test_close_polls_until_animation_finishes_with_single_click():
+    probe = _load_probe()
+    page = CloseProbePage(initially_open=True, close_after_polls=3)
+    assert probe._close_copy_dialog(page) is True
+    assert page.click_count == 1
+    assert page.polls_after_click == 4
+    assert page.polls_after_click < probe.COPY_DIALOG_CLOSE_POLL_ATTEMPTS
+
+
+def test_close_keeps_failing_while_visible_without_repeat_click():
+    probe = _load_probe()
+    page = CloseProbePage(initially_open=True, always_open=True)
+    assert probe._close_copy_dialog(page) is False
+    assert page.click_count == 1
+    assert sum(1 for script in page.scripts if "COPY_DIALOG_CLICK" in script) == 1
+    assert page.polls_after_click == probe.COPY_DIALOG_CLOSE_POLL_ATTEMPTS
+
+
+def test_close_poll_budget_is_short_and_bounded():
+    probe = _load_probe()
+    assert probe.COPY_DIALOG_CLOSE_POLL_ATTEMPTS == 12
+    assert probe.COPY_DIALOG_CLOSE_POLL_INTERVAL_MS == 100
+
+
+def test_visibility_predicate_covers_hidden_states():
+    probe = _load_probe()
+    script = probe._COPY_DIALOG_VISIBLE_JS
+    assert "getComputedStyle" in script
+    assert "visibility" in script
+    assert "aria-hidden" in script
+    assert "getBoundingClientRect" in script
+    assert ".el-tabs__item" in script
+
+
+def test_close_exception_path_does_not_click_or_save():
+    probe = _load_probe()
+    page = CloseProbePage(raise_on_visible=True)
+    # A visibility-check exception is treated as "not open", so nothing is clicked.
+    assert probe._close_copy_dialog(page) is True
+    assert page.click_count == 0
+    assert not any("保存" in script for script in page.scripts)
+
+
+def test_close_failure_in_acceptance_report_zero_save_no_write(monkeypatch):
+    cap = _stub_login_and_import()
+    probe = _load_probe()
+    _install_common(monkeypatch, cap)
+    page = AcceptancePage(close_ok=False)
+    report = probe.run_acceptance(
+        page, cap, channel_name="chan-a", app_id="app-1", ref_app_id="ref-1"
+    )
+    assert report["ok"] is False
+    assert report["error"] == "copy_dialog_close_failed"
+    assert report["copy_dialog_closed"] is False
+    assert report["save_click_count"] == 0
+    assert report["write_request_observed"] is False
+    assert page.save_clicks == 0
+
+
 def _lookup_ok():
     return {
         "found": True,

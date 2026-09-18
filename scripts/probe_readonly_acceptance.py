@@ -162,41 +162,87 @@ def _attach_write_guard(page, cap, guard: dict) -> None:
         pass
 
 
+COPY_DIALOG_CLOSE_POLL_ATTEMPTS = 12
+COPY_DIALOG_CLOSE_POLL_INTERVAL_MS = 100
+
+_COPY_DIALOG_VISIBLE_JS = """() => {
+  /* COPY_DIALOG_VISIBLE */
+  const visible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    return true;
+  };
+  const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+  for (const w of wrappers) {
+    if (!visible(w)) continue;
+    if (w.querySelectorAll('.el-tabs__item').length > 0) return true;
+  }
+  return false;
+}"""
+
+_COPY_DIALOG_CLICK_JS = """() => {
+  /* COPY_DIALOG_CLICK */
+  const visible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    return true;
+  };
+  const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+  for (const w of wrappers) {
+    if (!visible(w)) continue;
+    if (w.querySelectorAll('.el-tabs__item').length === 0) continue;
+    const buttons = Array.from(w.querySelectorAll('button'));
+    const cancel = buttons.find(button =>
+      (button.innerText || '').replace(/\\s/g, '').trim() === '取消'
+    );
+    if (cancel) { cancel.click(); return true; }
+    const closeBtn = w.querySelector('.el-dialog__headerbtn');
+    if (closeBtn) { closeBtn.click(); return true; }
+  }
+  return false;
+}"""
+
+
 def _copy_dialog_open(page) -> bool:
+    """True only when a copy dialog wrapper is actually visible.
+
+    Uses computed style, aria-hidden and real geometry instead of the inline
+    `style.display` alone, so a closing animation is not reported as open.
+    """
     try:
-        return bool(page.evaluate("""() => {
-          const wrappers = document.querySelectorAll('.el-dialog__wrapper');
-          for (const w of wrappers) {
-            if (w.style.display === 'none') continue;
-            if (w.querySelectorAll('.el-tabs__item').length > 0) return true;
-          }
-          return false;
-        }"""))
+        return bool(page.evaluate(_COPY_DIALOG_VISIBLE_JS))
     except Exception:
         return False
 
 
 def _close_copy_dialog(page) -> bool:
+    """Close the copy dialog once, then confirm it became invisible.
+
+    Already closed is a success without any click. A visible dialog is clicked
+    at most once; the confirmation then polls a short bounded budget without
+    clicking again, and stays fail-closed when it never becomes invisible.
+    """
+    if not _copy_dialog_open(page):
+        return True
     try:
-        page.evaluate("""() => {
-          const wrappers = document.querySelectorAll('.el-dialog__wrapper');
-          for (const w of wrappers) {
-            if (w.style.display === 'none') continue;
-            if (w.querySelectorAll('.el-tabs__item').length === 0) continue;
-            const buttons = Array.from(w.querySelectorAll('button'));
-            const cancel = buttons.find(button =>
-              (button.innerText || '').replace(/\\s/g, '').trim() === '取消'
-            );
-            if (cancel) { cancel.click(); return true; }
-            const closeBtn = w.querySelector('.el-dialog__headerbtn');
-            if (closeBtn) { closeBtn.click(); return true; }
-          }
-          return false;
-        }""")
-        page.wait_for_timeout(300)
+        clicked = bool(page.evaluate(_COPY_DIALOG_CLICK_JS))
     except Exception:
-        pass
-    return not _copy_dialog_open(page)
+        return False
+    if not clicked:
+        return not _copy_dialog_open(page)
+    for _ in range(COPY_DIALOG_CLOSE_POLL_ATTEMPTS):
+        page.wait_for_timeout(COPY_DIALOG_CLOSE_POLL_INTERVAL_MS)
+        if not _copy_dialog_open(page):
+            return True
+    return False
 
 
 def _blank_dialog_facts() -> dict:
