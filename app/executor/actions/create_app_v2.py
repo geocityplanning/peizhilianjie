@@ -800,13 +800,90 @@ def _reset_list_filters(page):
     page.wait_for_timeout(1200)
 
 
+_MAIN_LIST_COLLECT_JS = """
+(includeDetails) => {
+  const visible = (el) => Boolean(el) && el.offsetParent !== null;
+  const inDialog = (el) => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
+  const tables = Array.from(document.querySelectorAll('.el-table')).filter(
+    (t) => visible(t) && !inDialog(t)
+  );
+  const pagers = Array.from(document.querySelectorAll('.el-pagination')).filter((p) => !inDialog(p));
+  const pager = pagers.length ? pagers[0] : null;
+  const active = pager ? pager.querySelector('.el-pager li.active') : null;
+  const pageText = active ? (active.innerText || '').trim() : '';
+  const payload = {
+    main_table_count: tables.length,
+    page_number: /^\\d+$/.test(pageText) ? Number(pageText) : 1,
+    headers: [],
+    rows: []
+  };
+  if (tables.length !== 1) return payload;
+  const table = tables[0];
+  const serialize = (el) => ({
+    text: (el.innerText || el.textContent || '').trim(),
+    classes: String(el.className || '')
+  });
+  const headerNodes = table.querySelectorAll('.el-table__header-wrapper th');
+  const fallbackHeaders = table.querySelectorAll('th');
+  payload.headers = Array.from(headerNodes.length ? headerNodes : fallbackHeaders).map(serialize);
+  const bodyRows = table.querySelectorAll('.el-table__body-wrapper tbody tr');
+  const sourceRows = bodyRows.length ? bodyRows : table.querySelectorAll('tbody tr');
+  const rows = Array.from(sourceRows).filter((row) => !row.classList.contains('el-table__expanded-row'));
+  const expandedRowFor = (row) => {
+    const next = row.nextElementSibling;
+    return next && next.classList.contains('el-table__expanded-row') ? next : null;
+  };
+  const labeledValue = (root, labelPattern) => {
+    if (!includeDetails || !root) return '';
+    const labels = root.querySelectorAll('.el-form-item__label, .el-descriptions-item__label, th, dt');
+    for (const label of labels) {
+      const name = (label.innerText || label.textContent || '').replace(/[ *:：\\s]/g, '').trim();
+      if (!labelPattern.test(name)) continue;
+      const item = label.closest('.el-form-item, .el-descriptions-item, tr, li, dt');
+      if (!item) continue;
+      const value = item.querySelector('.el-form-item__content, .el-descriptions-item__content, td, dd');
+      if (value) return (value.innerText || value.textContent || '').trim();
+    }
+    return '';
+  };
+  for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+    const row = rows[rowIdx];
+    if (row.offsetParent === null) continue;
+    const detail = includeDetails ? expandedRowFor(row) : null;
+    let detailId = labeledValue(detail, /^(应用)?ID$/i);
+    if (!detailId && detail) {
+      const match = (detail.textContent || '').match(/(?:应用)?ID\\s*[:：]\\s*([A-Za-z0-9_-]+)/i);
+      detailId = match ? match[1] : '';
+    }
+    payload.rows.push({
+      cells: Array.from(row.querySelectorAll('td')).map(serialize),
+      detail_id: detailId,
+      detail_app_name: labeledValue(detail, /^应用(名称|名)?$/),
+      detail_channel: labeledValue(detail, /^(所属)?渠道(名称)?$/),
+      row_idx: rowIdx,
+      row_text: (row.textContent || '').trim()
+    });
+  }
+  return payload;
+}
+"""
+
+_PAGINATION_SCOPE_JS = """const hermesInDialog = (el) => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
+      const hermesPager = () => {
+        const pagers = Array.from(document.querySelectorAll('.el-pagination')).filter((p) => !hermesInDialog(p));
+        return pagers.length ? pagers[0] : null;
+      };
+      """
+
+
 def _go_to_first_page(page):
     for _ in range(50):
         previous_state = _read_pagination_state(page)
         if previous_state.get("page_number") == 1:
             return True
         moved = page.evaluate("""() => {
-          const prev = document.querySelector('.el-pagination .btn-prev');
+          """ + _PAGINATION_SCOPE_JS + """const pager = hermesPager();
+          const prev = pager ? pager.querySelector('.btn-prev') : null;
           if (!prev || prev.disabled || prev.className.includes('disabled')) return false;
           prev.click();
           return true;
@@ -821,9 +898,19 @@ def _go_to_first_page(page):
 
 def _expand_visible_rows(page):
     expanded = page.evaluate("""() => {
+      const visible = (el) => Boolean(el) && el.offsetParent !== null;
+      const inDialog = (el) => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
+      const tables = Array.from(document.querySelectorAll('.el-table')).filter(
+        (t) => visible(t) && !inDialog(t)
+      );
+      if (tables.length !== 1) return 0;
+      const table = tables[0];
+      const bodyRows = table.querySelectorAll('.el-table__body-wrapper tbody tr');
+      const sourceRows = bodyRows.length ? bodyRows : table.querySelectorAll('tbody tr');
       let count = 0;
-      for (const row of document.querySelectorAll('table tbody tr')) {
+      for (const row of sourceRows) {
         if (row.offsetParent === null) continue;
+        if (row.classList.contains('el-table__expanded-row')) continue;
         const icon = row.querySelector('.el-table__expand-icon, [class*="expand-icon"]');
         if (icon && !icon.className.includes('expanded')) {
           icon.click();
@@ -837,37 +924,47 @@ def _expand_visible_rows(page):
 
 
 def _read_pagination_state(page):
-    """Read active page and a signature of visible primary rows separately."""
-    return page.evaluate("""() => {
-      const active = document.querySelector('.el-pagination .el-pager li.active');
-      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-      const allRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
-      const headerNodes = document.querySelectorAll('.el-table__header-wrapper th');
-      const headers = Array.from(headerNodes).map(th => (th.innerText || '').trim());
-      const rows = Array.from(allRows).filter(row =>
-        row.offsetParent !== null && !row.classList.contains('el-table__expanded-row')
-      );
-      const rowSignature = rows.map(row => {
-        const cells = Array.from(row.querySelectorAll('td'));
-        const idIndex = headers.findIndex(header => header === 'ID' || header.includes('应用ID'));
-        const id = idIndex >= 0 && cells[idIndex] ? (cells[idIndex].textContent || '').trim() : '';
-        return `${id}|${(row.textContent || '').trim()}`;
-      });
-      const pageText = active ? active.innerText.trim() : '';
-      const pageNumber = /^\\d+$/.test(pageText) ? Number(pageText) : 1;
-      return {
-        page_number: pageNumber,
-        table_signature: JSON.stringify(rowSignature),
-        row_count: rows.length
-      };
-    }""")
+    """Read active page and a signature of visible primary rows separately.
+
+    Headers and rows are read from the same unique visible main list table so a
+    copy dialog cannot contribute extra header cells. When no unique main table
+    exists the caller sees row_count 0 and fails safe.
+    """
+    payload = page.evaluate(_MAIN_LIST_COLLECT_JS, False) or {}
+    count = payload.get("main_table_count")
+    page_number = payload.get("page_number") or 1
+    if count is not None and count != 1:
+        return {"page_number": page_number, "table_signature": "", "row_count": 0}
+    headers = payload.get("headers") or []
+    header_texts = [
+        (item.get("text") if isinstance(item, dict) else str(item or "")).strip()
+        for item in headers
+    ]
+    id_index = next(
+        (index for index, text in enumerate(header_texts) if text == "ID" or "应用ID" in text),
+        -1,
+    )
+    signature = []
+    for row in payload.get("rows") or []:
+        cells = row.get("cells") or []
+        cell_id = ""
+        if 0 <= id_index < len(cells):
+            cell = cells[id_index]
+            cell_id = (cell.get("text") if isinstance(cell, dict) else str(cell or "")).strip()
+        signature.append(f"{cell_id}|{row.get('row_text') or ''}")
+    return {
+        "page_number": page_number,
+        "table_signature": json.dumps(signature, ensure_ascii=False, separators=(",", ":")),
+        "row_count": len(payload.get("rows") or []),
+    }
 
 
 def _click_next_page_and_wait(page):
     """Move one page only when the next page is enabled and actually rendered."""
     previous_state = _read_pagination_state(page)
     moved = page.evaluate("""() => {
-      const next = document.querySelector('.el-pagination .btn-next');
+      """ + _PAGINATION_SCOPE_JS + """const pager = hermesPager();
+      const next = pager ? pager.querySelector('.btn-next') : null;
       if (!next || next.disabled || next.className.includes('disabled')) return false;
       next.click();
       return true;
@@ -1257,44 +1354,6 @@ def _dismiss_stray_dropdowns(page):
         pass
 
 
-_READER_SETTLE_ATTEMPTS = 12
-_READER_SETTLE_INTERVAL_MS = 100
-
-
-def _read_rows_until_target_settled(
-    page,
-    channel_name,
-    *,
-    poll=True,
-    rows_reader=None,
-    attempts=None,
-    interval_ms=None,
-):
-    """Read current-page rows until the exact target channel is visible.
-
-    A two-row table can pass the stability gate while both rows are still
-    briefly `offsetParent === null`, so a single read returns zero rows. This
-    helper only re-reads the DOM within a short bounded budget: it never clicks
-    search, never sends another list request, and never relaxes the stability or
-    exact-channel gate. Persistent empty, persistent mismatch or budget
-    exhaustion still fall through to the original safe failure.
-    """
-    reader = rows_reader or _read_current_page_app_rows
-    target = (channel_name or "").strip()
-    total = 1 if not poll else max(
-        1, int(attempts if attempts is not None else _READER_SETTLE_ATTEMPTS)
-    )
-    interval = int(interval_ms if interval_ms is not None else _READER_SETTLE_INTERVAL_MS)
-    rows = []
-    for attempt in range(total):
-        rows = reader(page) or []
-        if rows and any((row.get("channel_name") or "") == target for row in rows):
-            break
-        if attempt + 1 < total:
-            page.wait_for_timeout(interval)
-    return rows
-
-
 def _search_list_by_channel(page, channel_name, return_detail=False):
     """Select an exact channel in the list filter and verify the table refresh."""
     _reset_list_filters(page)
@@ -1486,7 +1545,7 @@ def _search_list_by_channel(page, channel_name, return_detail=False):
         final_state.get("table_signature") != previous_state.get("table_signature")
     )
     try:
-        visible_rows = _read_rows_until_target_settled(page, channel_name, poll=bool(stable))
+        visible_rows = _read_current_page_app_rows(page)
         detail["reader_row_count"] = len(visible_rows)
         detail["reader_sees_target_channel"] = any(
             row.get("channel_name") == channel_name for row in visible_rows
@@ -1686,63 +1745,13 @@ def _redacted_locate_facts(facts):
 
 
 def _read_current_page_app_rows(page):
-    payload = page.evaluate("""() => {
-      const serialize = el => ({
-        text: (el.innerText || el.textContent || '').trim(),
-        classes: String(el.className || '')
-      });
-      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-      const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
-      const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
-      const primaryHeaders = document.querySelectorAll('.el-table__header-wrapper th');
-      const headerNodes = primaryHeaders.length ? primaryHeaders : document.querySelectorAll('th');
-      const headers = Array.from(headerNodes).map(serialize);
-      const expandedRowFor = row => {
-        const next = row.nextElementSibling;
-        return next && next.classList.contains('el-table__expanded-row') ? next : null;
-      };
-      const labeledValue = (root, labelPattern) => {
-        if (!root) return '';
-        const labels = root.querySelectorAll(
-          '.el-form-item__label, .el-descriptions-item__label, th, dt'
-        );
-        for (const label of labels) {
-          const name = (label.innerText || label.textContent || '')
-            .replace(/[ *:：\\s]/g, '').trim();
-          if (!labelPattern.test(name)) continue;
-          const item = label.closest('.el-form-item, .el-descriptions-item, tr, li, dt');
-          if (!item) continue;
-          const value = item.querySelector(
-            '.el-form-item__content, .el-descriptions-item__content, td, dd'
-          );
-          if (value) return (value.innerText || value.textContent || '').trim();
-        }
-        return '';
-      };
-      const result = [];
-      for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
-        const row = rows[rowIdx];
-        if (row.offsetParent === null) continue;
-        const detail = expandedRowFor(row);
-        let detailId = labeledValue(detail, /^(应用)?ID$/i);
-        if (!detailId && detail) {
-          const match = (detail.textContent || '').match(/(?:应用)?ID\\s*[:：]\\s*([A-Za-z0-9_-]+)/i);
-          detailId = match ? match[1] : '';
-        }
-        result.push({
-          cells: Array.from(row.querySelectorAll('td')).map(serialize),
-          detail_id: detailId,
-          detail_app_name: labeledValue(detail, /^应用(名称|名)?$/),
-          detail_channel: labeledValue(detail, /^(所属)?渠道(名称)?$/),
-          row_idx: rowIdx,
-          row_text: (row.textContent || '').trim()
-        });
-      }
-      return {headers: headers, rows: result};
-    }""")
-    headers = (payload or {}).get("headers") or []
+    payload = page.evaluate(_MAIN_LIST_COLLECT_JS, True) or {}
+    count = payload.get("main_table_count")
+    if count is not None and count != 1:
+        return []
+    headers = payload.get("headers") or []
     rows = []
-    for raw in (payload or {}).get("rows") or []:
+    for raw in payload.get("rows") or []:
         aligned = _align_header_cells(headers, raw.get("cells") or [])
         app_id = _mapped_value(aligned, _is_app_id_header) or (raw.get("detail_id") or "")
         app_name = _mapped_value(
@@ -1904,8 +1913,9 @@ def _pagination_synced_with_unfiltered_list(state):
 def _read_list_restore_state(page):
     state = _read_pagination_state(page) or {}
     extra = page.evaluate("""() => {
-      const next = document.querySelector('.el-pagination .btn-next');
-      const total = document.querySelector('.el-pagination__total');
+      """ + _PAGINATION_SCOPE_JS + """const pager = hermesPager();
+      const next = pager ? pager.querySelector('.btn-next') : null;
+      const total = pager ? pager.querySelector('.el-pagination__total') : null;
       const nextDisabled = !next || next.disabled || (next.className || '').includes('disabled');
       const totalText = total ? (total.innerText || '') : '';
       const match = totalText.replace(/,/g, '').match(/(\\d+)/);
@@ -2091,58 +2101,15 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
 
     for _ in range(50):
         _expand_visible_rows(page)
-        payload = page.evaluate("""
-        () => {
-          const serialize = el => ({
-            text: (el.innerText || el.textContent || '').trim(),
-            classes: String(el.className || '')
-          });
-          const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-          const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
-          const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
-          const headerNodes = document.querySelectorAll('.el-table__header-wrapper th');
-          const headers = Array.from(headerNodes).map(serialize);
-
-          const expandedRowFor = (row) => {
-            const next = row.nextElementSibling;
-            return next && next.classList.contains('el-table__expanded-row') ? next : null;
-          };
-
-          const labeledValue = (root, labelPattern) => {
-            if (!root) return '';
-            const labels = root.querySelectorAll(
-              '.el-form-item__label, .el-descriptions-item__label, th, dt'
-            );
-            for (const label of labels) {
-              const name = (label.innerText || label.textContent || '')
-                .replace(/[ *:：\\s]/g, '').trim();
-              if (!labelPattern.test(name)) continue;
-              const item = label.closest('.el-form-item, .el-descriptions-item, tr, li, dt');
-              if (!item) continue;
-              const value = item.querySelector(
-                '.el-form-item__content, .el-descriptions-item__content, td, dd'
-              );
-              if (value) return (value.innerText || value.textContent || '').trim();
+        payload = page.evaluate(_MAIN_LIST_COLLECT_JS, True) or {}
+        count = payload.get("main_table_count")
+        if count is not None and count != 1:
+            return {
+                "found": False,
+                "reason": "main_list_table_unavailable",
+                **_redacted_locate_facts(None),
             }
-            return '';
-          };
-
-          const result = [];
-          for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
-            const row = rows[rowIdx];
-            if (row.offsetParent === null) continue;
-            const detail = expandedRowFor(row);
-            result.push({
-              cells: Array.from(row.querySelectorAll('td')).map(serialize),
-              detail_channel: labeledValue(detail, /^(所属)?渠道(名称)?$/),
-              detail_id: labeledValue(detail, /^(应用)?ID$/i),
-              row_idx: rowIdx
-            });
-          }
-          return {headers: headers, rows: result};
-        }
-        """)
-        headers = (payload or {}).get("headers") or []
+        headers = payload.get("headers") or []
         matched = None
         for row in (payload or {}).get("rows") or []:
             ok, id_source = _id_matched_in_row(
