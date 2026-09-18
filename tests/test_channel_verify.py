@@ -516,6 +516,113 @@ def test_failed_or_non_2xx_response_does_not_unlock_restore():
     assert cap._complete_reset_records(observations, 0) == []
 
 
+def test_dom_total_missing_does_not_match_response_total():
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver([200])
+    observations.success_records.append(
+        {"status": 200, "total_count": 80, "item_count": 20, "page_count": 4}
+    )
+    missing_total = {
+        "page_number": 1,
+        "row_count": 20,
+        "table_signature": "CACHED",
+        "next_enabled": True,
+        "total_count": None,
+    }
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+    restored = cap._wait_for_unfiltered_list_restore(
+        Page(),
+        {"table_signature": "EMPTY", "row_count": 0},
+        read_state=lambda page: missing_total,
+        observations=observations,
+        records_before=0,
+        timeout_ms=5,
+        poll_interval_ms=1,
+    )
+    assert restored is False
+    assert cap._dom_matches_success_structure(missing_total, observations.success_records[0]) is False
+
+
+def test_dom_total_none_then_80_passes_after_stable():
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver([200])
+    observations.success_records.append(
+        {"status": 200, "total_count": 80, "item_count": 20, "page_count": 4}
+    )
+    reads = []
+    missing = {
+        "page_number": 1,
+        "row_count": 20,
+        "table_signature": "CACHED",
+        "next_enabled": True,
+        "total_count": None,
+    }
+    aligned = {
+        "page_number": 1,
+        "row_count": 20,
+        "table_signature": "FRESH",
+        "next_enabled": True,
+        "total_count": 80,
+    }
+
+    def read_state(page):
+        n = len(reads) + 1
+        state = missing if n <= 2 else aligned
+        reads.append(state.get("total_count"))
+        return state
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+    restored = cap._wait_for_unfiltered_list_restore(
+        Page(),
+        {"table_signature": "EMPTY", "row_count": 0},
+        read_state=read_state,
+        observations=observations,
+        records_before=0,
+        timeout_ms=50,
+        poll_interval_ms=1,
+    )
+    assert restored is True
+    assert reads[:2] == [None, None]
+    assert reads.count(80) >= 2
+
+
+def test_dom_total_928_does_not_match_response_80():
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver([200])
+    observations.success_records.append(
+        {"status": 200, "total_count": 80, "item_count": 20, "page_count": 4}
+    )
+    cached = {
+        "page_number": 1,
+        "row_count": 20,
+        "table_signature": "CACHED",
+        "next_enabled": True,
+        "total_count": 928,
+    }
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+    restored = cap._wait_for_unfiltered_list_restore(
+        Page(),
+        {"table_signature": "EMPTY", "row_count": 0},
+        read_state=lambda page: cached,
+        observations=observations,
+        records_before=0,
+        timeout_ms=5,
+        poll_interval_ms=1,
+    )
+    assert restored is False
+
+
 def test_status_without_structure_record_does_not_unlock_restore():
     cap = _stub_login_and_import()
     observations = cap._ListRequestObserver([200])

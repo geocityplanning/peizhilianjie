@@ -1782,11 +1782,21 @@ def _latest_success_structure(observations):
     return records[-1]
 
 
+def _as_int_or_none(value):
+    if value is None or value is False:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _dom_matches_success_structure(state, meta):
     if not meta:
         return False
-    if meta.get("total_count") is not None and state.get("total_count") is not None:
-        if int(state["total_count"]) != int(meta["total_count"]):
+    if meta.get("total_count") is not None:
+        dom_total = _as_int_or_none((state or {}).get("total_count"))
+        if dom_total is None or dom_total != int(meta["total_count"]):
             return False
     if meta.get("item_count") is not None:
         if int(state.get("row_count") or 0) != int(meta["item_count"]):
