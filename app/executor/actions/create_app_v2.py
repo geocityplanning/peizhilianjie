@@ -1657,14 +1657,14 @@ def _identify_new_app(page, before_ids, actual_channel_name, app_name):
 
 
 def _pagination_synced_with_unfiltered_list(state):
-    """True when pager can turn pages, or a stable single-page list is confirmed."""
+    """True only when the next-page control is enabled after an empty filter.
+
+    A filled first page with total_count == row_count is not enough: that is the
+    cached-page-size race and would stop a later-page scan as not_found.
+    """
     if not state or (state.get("row_count") or 0) <= 0:
         return False
-    if state.get("next_enabled"):
-        return True
-    total_count = state.get("total_count")
-    row_count = state.get("row_count") or 0
-    return isinstance(total_count, int) and 0 < total_count <= row_count
+    return bool(state.get("next_enabled"))
 
 
 def _read_list_restore_state(page):
@@ -1831,6 +1831,12 @@ def _find_target_row_by_id(page, app_id, expected_channel_name=""):
             return {"found": False, "reason": "pagination_unstable", **_redacted_locate_facts(channel_facts)}
         if not moved:
             break
+    else:
+        return {
+            "found": False,
+            "reason": "page_scan_limit_reached",
+            **_redacted_locate_facts(channel_facts),
+        }
 
     if channel_error:
         return {"found": False, "reason": channel_error, **_redacted_locate_facts(channel_facts)}

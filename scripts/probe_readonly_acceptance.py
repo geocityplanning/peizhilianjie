@@ -405,7 +405,11 @@ def run_acceptance(
             reason = (located or {}).get("reason")
             report["error"] = (
                 reason
-                if reason in {"list_not_restored_after_reset", "pagination_unstable"}
+                if reason in {
+                    "list_not_restored_after_reset",
+                    "pagination_unstable",
+                    "page_scan_limit_reached",
+                }
                 else "target_app_not_located"
             )
             return report
