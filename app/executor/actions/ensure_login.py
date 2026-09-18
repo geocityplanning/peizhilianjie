@@ -12,13 +12,27 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import get_browser_page
-from core.security import decrypt_password
+from core.security import PasswordDecryptError, decrypt_password
 from core.error_capture import capture_page_errors, build_error_message
 from ocr import CaptchaRecognizer
 
 DIR = Path(__file__).resolve().parent.parent
-CONFIG = json.loads((DIR / "config.json").read_text(encoding="utf-8"))["login"]
-LOGIN_URL = CONFIG["url"]
+
+
+def _read_login_config():
+    path = DIR / "config.json"
+    if not path.is_file():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    login = loaded.get("login") if isinstance(loaded, dict) else None
+    return login if isinstance(login, dict) else {}
+
+
+CONFIG = _read_login_config()
+LOGIN_URL = CONFIG.get("url") or ""
 
 
 def _dismiss_403_dialog(page):
@@ -253,9 +267,26 @@ def ensure_login(page=None) -> dict:
             return {"success": True, "message": "已登录", "already_logged_in": True}
         username = CONFIG.get("username", "")
         enc = CONFIG.get("password_encrypted", "")
-        password = decrypt_password(enc) if enc else ""
-        if not username or not password:
-            return {"success": False, "message": "config.json 未配置凭据（username / password_encrypted）", "already_logged_in": False}
+        if not username or not enc:
+            return {
+                "success": False,
+                "message": "config.json 未配置凭据（username / password_encrypted）",
+                "already_logged_in": False,
+            }
+        try:
+            password = decrypt_password(enc)
+        except PasswordDecryptError:
+            return {
+                "success": False,
+                "message": "密码解密失败",
+                "already_logged_in": False,
+            }
+        if not password:
+            return {
+                "success": False,
+                "message": "config.json 未配置凭据（username / password_encrypted）",
+                "already_logged_in": False,
+            }
         r = do_login(page, username, password)
         r["already_logged_in"] = False
         return r
