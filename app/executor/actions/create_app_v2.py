@@ -1684,6 +1684,28 @@ def _read_list_restore_state(page):
     return state
 
 
+def _restore_fingerprint(state):
+    return (
+        (state or {}).get("table_signature"),
+        (state or {}).get("row_count"),
+        bool((state or {}).get("next_enabled")),
+        (state or {}).get("total_count"),
+    )
+
+
+def _has_success_list_response(observations, requests_before=0):
+    if observations is None:
+        return False
+    for status in list(observations)[int(requests_before or 0):]:
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            continue
+        if 200 <= code < 300:
+            return True
+    return False
+
+
 def _wait_for_unfiltered_list_restore(
     page,
     previous_state,
@@ -1693,21 +1715,27 @@ def _wait_for_unfiltered_list_restore(
     timeout_ms=6000,
     poll_interval_ms=250,
 ):
-    """Wait until this reset's list request has landed and the table/pager are ready."""
+    """Wait until a 2xx list response for this reset has been rendered."""
     reader = read_state or _read_list_restore_state
     previous_table = (previous_state or {}).get("table_signature")
+    fingerprint_at_2xx = None
     stable_candidate = None
     stable_reads = 0
     polls = max(1, (int(timeout_ms) + int(poll_interval_ms) - 1) // int(poll_interval_ms))
     for _ in range(polls):
         page.wait_for_timeout(poll_interval_ms)
         current = reader(page) or {}
-        reset_request_seen = (
-            observations is not None
-            and len(observations) > (requests_before or 0)
+        success_seen = _has_success_list_response(observations, requests_before)
+        current_fp = _restore_fingerprint(current)
+        if success_seen and fingerprint_at_2xx is None:
+            fingerprint_at_2xx = current_fp
+        render_belongs_to_success = (
+            success_seen
+            and fingerprint_at_2xx is not None
+            and current_fp != fingerprint_at_2xx
         )
         if (
-            not reset_request_seen
+            not render_belongs_to_success
             or current.get("table_signature") == previous_table
             or current.get("row_count", 0) <= 0
             or not _pagination_synced_with_unfiltered_list(current)
@@ -1715,16 +1743,10 @@ def _wait_for_unfiltered_list_restore(
             stable_candidate = None
             stable_reads = 0
             continue
-        candidate = (
-            current.get("table_signature"),
-            current.get("row_count"),
-            bool(current.get("next_enabled")),
-            current.get("total_count"),
-        )
-        if candidate == stable_candidate:
+        if current_fp == stable_candidate:
             stable_reads += 1
         else:
-            stable_candidate = candidate
+            stable_candidate = current_fp
             stable_reads = 1
         if stable_reads >= 2:
             return True
