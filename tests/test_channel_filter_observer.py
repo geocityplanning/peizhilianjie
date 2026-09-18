@@ -627,8 +627,9 @@ def test_observer_does_not_read_body_when_request_missing_filter():
     _emit_filtered_list_cycle(session, post_data='{"pageNum":1}')
     assert observations.carried_target_filter is False
     assert observations.response_contains_target_channel is None
-    get_body_calls = [item for item in session.sends if item[0] == "Network.getResponseBody"]
-    assert get_body_calls == []
+    assert SECRET_CHANNEL not in str(vars(observations))
+    assert SECRET_CHANNEL not in str(getattr(observations, "success_structures", []))
+    assert observations.carried_target_filter is False
 
 
 def test_page_event_fallback_response_missing_target():

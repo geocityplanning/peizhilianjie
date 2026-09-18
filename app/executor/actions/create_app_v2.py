@@ -730,6 +730,7 @@ class _ListRequestObserver(list):
         self.response_contains_target_channel = None
         self.target_filter_field = None
         self.target_filter_field_is_channel = None
+        self.success_structures = []
 
 
 # 后台列表接口的实际路径是 /backend/cloudTrial/appInfo/getAppInfoList，
@@ -889,6 +890,7 @@ def _attach_list_response_observer(page, target_filter=None):
     observations = _ListRequestObserver()
     list_request_ids = set()
     carried_request_ids = set()
+    list_status_by_id = {}
 
     def _note_response_contains_target(contained):
         if contained:
@@ -930,7 +932,10 @@ def _attach_list_response_observer(page, target_filter=None):
                     return
             elif not _is_list_request_url(url):
                 return
-            observations.append(int(status or 0))
+            code = int(status or 0)
+            observations.append(code)
+            if request_id is not None:
+                list_status_by_id[request_id] = code
         except Exception:
             pass
 
@@ -939,7 +944,14 @@ def _attach_list_response_observer(page, target_filter=None):
         session.send("Network.enable")
 
         def _inspect_cdp_body(request_id):
-            if request_id not in carried_request_ids:
+            status = list_status_by_id.get(request_id)
+            need_target = request_id in carried_request_ids
+            need_structure = (
+                request_id in list_request_ids
+                and status is not None
+                and 200 <= int(status) < 300
+            )
+            if not need_target and not need_structure:
                 return
             try:
                 result = session.send("Network.getResponseBody", {"requestId": request_id})
@@ -951,7 +963,12 @@ def _attach_list_response_observer(page, target_filter=None):
             try:
                 if result.get("base64Encoded") and isinstance(body, str):
                     body = base64.b64decode(body).decode("utf-8", "ignore")
-                _note_response_contains_target(_body_contains_target(body))
+                if need_target:
+                    _note_response_contains_target(_body_contains_target(body))
+                if need_structure:
+                    meta = _extract_list_structure(body)
+                    if meta:
+                        observations.success_structures.append(meta)
             finally:
                 body = None
 
@@ -1009,13 +1026,20 @@ def _attach_list_response_observer(page, target_filter=None):
 
         def _on_response(response):
             url = getattr(response, "url", "") or ""
-            _record_status(url, getattr(response, "status", 0))
+            status = getattr(response, "status", 0)
+            _record_status(url, status)
             request = getattr(response, "request", None)
             req_url = getattr(request, "url", url) if request is not None else url
             post_data = getattr(request, "post_data", None) if request is not None else ""
             if not _is_list_request_url(req_url or url):
                 return
-            if not _request_carries_target_filter(req_url or url, post_data or "", target_filter):
+            need_target = _request_carries_target_filter(req_url or url, post_data or "", target_filter)
+            need_structure = False
+            try:
+                need_structure = 200 <= int(status or 0) < 300
+            except (TypeError, ValueError):
+                need_structure = False
+            if not need_target and not need_structure:
                 return
             body = None
             try:
@@ -1026,7 +1050,12 @@ def _attach_list_response_observer(page, target_filter=None):
                     body = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else raw
                 if body is None:
                     return
-                _note_response_contains_target(_body_contains_target(body))
+                if need_target:
+                    _note_response_contains_target(_body_contains_target(body))
+                if need_structure:
+                    meta = _extract_list_structure(body)
+                    if meta:
+                        observations.success_structures.append(meta)
             except Exception:
                 return
             finally:
@@ -1693,6 +1722,73 @@ def _restore_fingerprint(state):
     )
 
 
+def _extract_list_structure(body):
+    """Return in-memory counts only; never keep body, URL, names, or ids."""
+    raw = body
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "ignore")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        data = payload if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return None
+    meta = {}
+    for key in ("totalCount", "total", "total_count"):
+        if data.get(key) is None:
+            continue
+        try:
+            meta["total_count"] = int(data[key])
+        except (TypeError, ValueError):
+            continue
+        break
+    items = data.get("list")
+    if items is None:
+        items = data.get("records")
+    if items is None:
+        items = data.get("rows")
+    if isinstance(items, list):
+        meta["item_count"] = len(items)
+    for key in ("pageCount", "pages", "page_count"):
+        if data.get(key) is None:
+            continue
+        try:
+            meta["page_count"] = int(data[key])
+        except (TypeError, ValueError):
+            continue
+        break
+    return meta or None
+
+
+def _latest_success_structure(observations):
+    structs = getattr(observations, "success_structures", None) or []
+    if not structs:
+        return None
+    return structs[-1]
+
+
+def _dom_matches_success_structure(state, meta):
+    if not meta:
+        return True
+    if meta.get("total_count") is not None and state.get("total_count") is not None:
+        if int(state["total_count"]) != int(meta["total_count"]):
+            return False
+    if meta.get("item_count") is not None:
+        if int(state.get("row_count") or 0) != int(meta["item_count"]):
+            return False
+    page_count = meta.get("page_count")
+    if page_count == 1 and state.get("next_enabled"):
+        return False
+    if isinstance(page_count, int) and page_count > 1 and not state.get("next_enabled"):
+        return False
+    return True
+
+
 def _has_success_list_response(observations, requests_before=0):
     if observations is None:
         return False
@@ -1718,7 +1814,6 @@ def _wait_for_unfiltered_list_restore(
     """Wait until a 2xx list response for this reset has been rendered."""
     reader = read_state or _read_list_restore_state
     previous_table = (previous_state or {}).get("table_signature")
-    fingerprint_at_2xx = None
     stable_candidate = None
     stable_reads = 0
     polls = max(1, (int(timeout_ms) + int(poll_interval_ms) - 1) // int(poll_interval_ms))
@@ -1726,27 +1821,22 @@ def _wait_for_unfiltered_list_restore(
         page.wait_for_timeout(poll_interval_ms)
         current = reader(page) or {}
         success_seen = _has_success_list_response(observations, requests_before)
-        current_fp = _restore_fingerprint(current)
-        if success_seen and fingerprint_at_2xx is None:
-            fingerprint_at_2xx = current_fp
-        render_belongs_to_success = (
-            success_seen
-            and fingerprint_at_2xx is not None
-            and current_fp != fingerprint_at_2xx
-        )
+        meta = _latest_success_structure(observations)
         if (
-            not render_belongs_to_success
+            not success_seen
             or current.get("table_signature") == previous_table
             or current.get("row_count", 0) <= 0
             or not _pagination_synced_with_unfiltered_list(current)
+            or not _dom_matches_success_structure(current, meta)
         ):
             stable_candidate = None
             stable_reads = 0
             continue
-        if current_fp == stable_candidate:
+        candidate = _restore_fingerprint(current)
+        if candidate == stable_candidate:
             stable_reads += 1
         else:
-            stable_candidate = current_fp
+            stable_candidate = candidate
             stable_reads = 1
         if stable_reads >= 2:
             return True

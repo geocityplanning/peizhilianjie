@@ -513,6 +513,96 @@ def test_failed_or_non_2xx_response_does_not_unlock_restore():
     assert cap._has_success_list_response(observations, 0) is False
 
 
+def test_2xx_already_present_final_multipage_before_wait_passes():
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver([200])
+    observations.success_structures.append(
+        {"total_count": 80, "item_count": 20, "page_count": 4}
+    )
+    fresh = {
+        "page_number": 1,
+        "row_count": 20,
+        "table_signature": "FRESH",
+        "next_enabled": True,
+        "total_count": 80,
+    }
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+    restored = cap._wait_for_unfiltered_list_restore(
+        Page(),
+        {"table_signature": "EMPTY", "row_count": 0},
+        read_state=lambda page: fresh,
+        observations=observations,
+        requests_before=0,
+        timeout_ms=50,
+        poll_interval_ms=1,
+    )
+    assert restored is True
+
+
+def test_2xx_already_present_final_single_page_before_wait_passes():
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver([200])
+    observations.success_structures.append(
+        {"total_count": 20, "item_count": 20, "page_count": 1}
+    )
+    single = {
+        "page_number": 1,
+        "row_count": 20,
+        "table_signature": "SINGLE",
+        "next_enabled": False,
+        "total_count": 20,
+    }
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+    restored = cap._wait_for_unfiltered_list_restore(
+        Page(),
+        {"table_signature": "EMPTY", "row_count": 0},
+        read_state=lambda page: single,
+        observations=observations,
+        requests_before=0,
+        timeout_ms=50,
+        poll_interval_ms=1,
+    )
+    assert restored is True
+
+
+def test_success_structure_same_as_cache_fingerprint_passes():
+    cap = _stub_login_and_import()
+    observations = cap._ListRequestObserver([200])
+    observations.success_structures.append(
+        {"total_count": 928, "item_count": 20, "page_count": 47}
+    )
+    same = {
+        "page_number": 1,
+        "row_count": 20,
+        "table_signature": "CACHED",
+        "next_enabled": True,
+        "total_count": 928,
+    }
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+    restored = cap._wait_for_unfiltered_list_restore(
+        Page(),
+        {"table_signature": "EMPTY", "row_count": 0},
+        read_state=lambda page: same,
+        observations=observations,
+        requests_before=0,
+        timeout_ms=50,
+        poll_interval_ms=1,
+    )
+    assert restored is True
+
+
 def test_non_2xx_reset_response_returns_list_not_restored(monkeypatch):
     cap = _stub_login_and_import()
     observations = cap._ListRequestObserver([0])
@@ -570,6 +660,9 @@ def test_http_200_keeps_cached_dom_for_two_polls_then_fresh():
         n = len(reads) + 1
         if n == 1:
             observations.append(200)
+            observations.success_structures.append(
+                {"total_count": 80, "item_count": 20, "page_count": 4}
+            )
         state = cached if n <= 3 else fresh
         reads.append(state["table_signature"])
         return state
@@ -602,6 +695,9 @@ def test_cached_rows_and_pager_then_later_page_target(monkeypatch):
         ticks["n"] += 1
         if ticks["n"] == 2 and len(observations) == 0:
             observations.append(200)
+            observations.success_structures.append(
+                {"total_count": 80, "item_count": 20, "page_count": 4}
+            )
         if ticks["n"] < 5:
             return {
                 "page_number": 1,
@@ -692,16 +788,11 @@ def test_real_single_page_after_reset_request_can_scan(monkeypatch):
 
     def restore_state(page):
         ticks["n"] += 1
-        if ticks["n"] <= 2:
-            if ticks["n"] == 2:
-                observations.append(200)
-            return {
-                "page_number": 1,
-                "row_count": 0,
-                "table_signature": "EMPTY",
-                "next_enabled": False,
-                "total_count": 0,
-            }
+        if not observations:
+            observations.append(200)
+            observations.success_structures.append(
+                {"total_count": 20, "item_count": 20, "page_count": 1}
+            )
         return {
             "page_number": 1,
             "row_count": 20,
