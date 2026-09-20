@@ -275,6 +275,25 @@ def test_native_locator_fill_and_tab_are_required(monkeypatch):
     assert page.marker_cleared is True
 
 
+def test_click_save_requires_unique_exact_enabled_handler_bound_control():
+    cap = _stub_login_and_import()
+
+    class SavePage:
+        def __init__(self):
+            self.script = ""
+        def evaluate(self, script):
+            self.script = script
+            return True
+
+    page = SavePage()
+    assert cap._click_save_button(page) is True
+    assert "dialogs.length !== 1" in page.script
+    assert "text === '保存'" in page.script
+    assert "!button.disabled" in page.script
+    assert "button.getAttribute('aria-disabled') !== 'true'" in page.script
+    assert "hasHandler(button)" in page.script
+
+
 def test_missing_unique_input_fails_before_native_fill():
     cap = _stub_login_and_import()
     page = FillPage(marker_result={"dialog_found": True, "input_found": False})

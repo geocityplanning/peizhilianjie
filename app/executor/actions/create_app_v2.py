@@ -1113,15 +1113,43 @@ def _select_and_verify_create_channel(page, channel_name):
 
 
 def _click_save_button(page):
+    """Click only the unique semantic save control of the visible copy dialog.
+
+    Element-UI keeps this control in a layout-hidden parent, so geometry cannot
+    be a safety predicate.  The semantic control itself must instead be exact,
+    enabled, handler-bound, and uniquely owned by the one visible tabbed dialog.
+    """
     return page.evaluate("""() => {
-      const wrappers = document.querySelectorAll('.el-dialog__wrapper');
-      for (const w of wrappers) {
-        if (w.style.display === 'none') continue;
-        if (w.querySelectorAll('.el-tabs__item').length === 0) continue;
-        const btns = w.querySelectorAll('button');
-        for (const b of btns) { if (b.innerText.includes('保存')) { b.click(); return true; } }
-      }
-      return false;
+      const visible = el => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || el.getAttribute('aria-hidden') === 'true') return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      const dialogs = Array.from(document.querySelectorAll('.el-dialog__wrapper')).filter(
+        dialog => visible(dialog) && dialog.querySelectorAll('.el-tabs__item').length > 0
+      );
+      if (dialogs.length !== 1) return false;
+      const hasHandler = button => {
+        for (let node = button, depth = 0; node && depth < 4; node = node.parentElement, depth += 1) {
+          const component = node.__vue__;
+          const listener = component?.$listeners || component?.$vnode?.data?.on;
+          if (listener && (listener.click || listener.submit)) return true;
+          if (component?.$options?.methods && Object.keys(component.$options.methods).some(key => /click|submit/i.test(key))) return true;
+        }
+        return false;
+      };
+      const candidates = Array.from(dialogs[0].querySelectorAll('button')).filter(button => {
+        const text = (button.innerText || button.textContent || '').replace(/\\s+/g, '').trim();
+        return text === '保存'
+          && !button.disabled
+          && button.getAttribute('aria-disabled') !== 'true'
+          && hasHandler(button);
+      });
+      if (candidates.length !== 1) return false;
+      candidates[0].click();
+      return true;
     }""")
 
 
