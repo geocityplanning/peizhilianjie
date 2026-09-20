@@ -231,8 +231,8 @@ def test_normal_native_fill_model_and_tab_round_trip_pass(monkeypatch):
 
 
 def _post_setup(monkeypatch, cap, *, main_identity=None, reads=None):
-    monkeypatch.setattr(cap, "_verify_persisted_main_row_identity", lambda *args, **kwargs: main_identity or {"success": True, "row_idx": 0})
-    monkeypatch.setattr(cap, "_open_copy_dialog_by_app_id", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_locate_known_main_row_for_resource_fallback", lambda *args, **kwargs: main_identity or {"success": True, "row_idx": 0, "row_key": "row-0"})
+    monkeypatch.setattr(cap, "_open_copy_dialog_by_known_main_row", lambda *args, **kwargs: True)
     monkeypatch.setattr(cap, "_go_tab", lambda *args, **kwargs: True)
     monkeypatch.setattr(cap, "_close_copy_dialog_after_verify", lambda *args, **kwargs: True)
     if reads is not None:
@@ -414,19 +414,19 @@ def test_post_save_ambiguous_new_id_is_unknown(monkeypatch):
     assert page.save_clicks == 1
 
 
-def test_post_save_id_relocation_failure_is_unknown(monkeypatch):
+def test_post_save_known_main_identity_failure_is_unknown(monkeypatch):
     cap = _stub_login_and_import()
     page = StagePage()
     _prepare_stage(monkeypatch, cap, page)
     monkeypatch.setattr(cap, "_fill_and_verify_resource_fallback", lambda *args, **kwargs: {"success": True})
     monkeypatch.setattr(cap, "capture_page_errors", lambda *args, **kwargs: {"dialog_open": False})
     monkeypatch.setattr(cap, "_identify_new_app", lambda *args, **kwargs: {"success": True, "app_id": "new-id"})
-    monkeypatch.setattr(cap, "_find_target_row_by_id", lambda *args, **kwargs: {"found": False, "reason": "channel_unverified"})
+    monkeypatch.setattr(cap, "_verify_persisted_resource_fallback", lambda *args, **kwargs: {"success": False, "error": cap.err("RESOURCE_FALLBACK_VERIFY_FAILED", "VERIFY", "identity", cap.NEXT_MANUAL)})
 
     result = cap._stage_create_save(page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type")
 
     assert result["success"] is False
-    assert result["error"]["code"] == "CHANNEL_UNVERIFIED"
+    assert result["error"]["code"] == "RESOURCE_FALLBACK_VERIFY_FAILED"
     assert result["error"]["next_action"] == cap.NEXT_QUERY
     assert result["save_may_have_occurred"] is True
     assert page.save_clicks == 1

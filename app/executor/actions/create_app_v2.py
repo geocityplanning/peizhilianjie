@@ -166,6 +166,8 @@ def _js_fill(page, label, value):
 _RESOURCE_FALLBACK_INPUT_MARKER = "data-hermes-resource-fallback-input"
 _POST_SAVE_FALLBACK_POLL_ATTEMPTS = 6
 _POST_SAVE_FALLBACK_POLL_MS = 250
+_POST_SAVE_KNOWN_ID_POLL_ATTEMPTS = 3
+_POST_SAVE_KNOWN_ID_POLL_MS = 500
 
 
 def _mark_unique_visible_copy_dialog_input(page, label):
@@ -444,6 +446,69 @@ def _open_copy_dialog_by_app_id(page, app_id, verified_row_idx, expected_app_nam
         return False
 
 
+def _open_copy_dialog_by_known_main_row(page, app_id, row_idx, row_key, app_name, channel_name):
+    """Atomically recheck the same page/key/main anchors immediately before Copy."""
+    try:
+        return bool(page.evaluate(
+            """
+            ({appId, rowIdx, rowKey, appName, channelName}) => {
+              const visible = (el) => Boolean(el) && el.offsetParent !== null;
+              const inDialog = (el) => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
+              const utility = (el) => /el-table__expand-column|el-table-column--selection|\\bgutter\\b/.test(String(el.className || ''));
+              const tables = Array.from(document.querySelectorAll('.el-table')).filter(table => visible(table) && !inDialog(table));
+              if (tables.length !== 1 || !Number.isInteger(rowIdx) || !rowKey) return false;
+              const table = tables[0];
+              const headerNodes = table.querySelectorAll('.el-table__header-wrapper th');
+              const fallbackHeaders = table.querySelectorAll('th');
+              const headers = Array.from(headerNodes.length ? headerNodes : fallbackHeaders).filter(header => !utility(header));
+              const textOf = header => (header.innerText || header.textContent || '').replace(/[ *:：\\s]/g, '').trim();
+              const indexesFor = predicate => headers.map(textOf).map((text, index) => predicate(text) ? index : -1).filter(index => index >= 0);
+              const idIndexes = indexesFor(text => text === 'ID' || text.includes('应用ID'));
+              const nameIndexes = indexesFor(text => text.includes('应用名称') || text.includes('应用名'));
+              const channelIndexes = indexesFor(text => text.includes('渠道') && !/ID|编码|code/i.test(text));
+              if (idIndexes.length !== 1 || nameIndexes.length !== 1 || channelIndexes.length !== 1) return false;
+              const bodyRows = table.querySelectorAll('.el-table__body-wrapper tbody tr');
+              const sourceRows = bodyRows.length ? bodyRows : table.querySelectorAll('tbody tr');
+              const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row') && visible(row));
+              const rowKeyOf = row => row.getAttribute('data-row-key') || row.getAttribute('row-key') || '';
+              const valuesOf = row => {
+                const cells = Array.from(row.querySelectorAll('td')).filter(cell => !utility(cell));
+                if (cells.length !== headers.length) return null;
+                const text = index => (cells[index].innerText || cells[index].textContent || '').trim();
+                return {id: text(idIndexes[0]), name: text(nameIndexes[0]), channel: text(channelIndexes[0])};
+              };
+              const matches = rows.filter(row => {
+                const values = valuesOf(row);
+                return values && values.id === String(appId || '').trim();
+              });
+              if (!matches.length) return false;
+              for (const matched of matches) {
+                const values = valuesOf(matched);
+                if (rowKeyOf(matched) !== rowKey || !rowKeyOf(matched)
+                  || values.id !== String(appId || '').trim()
+                  || values.name !== String(appName || '').trim()
+                  || values.channel !== String(channelName || '').trim()) return false;
+              }
+              const row = rows[rowIdx];
+              if (!row || rowKeyOf(row) !== rowKey) return false;
+              const copy = Array.from(row.querySelectorAll('button, a, span')).find(button => visible(button) && (button.innerText || '').trim() === '复制');
+              if (!copy) return false;
+              copy.click();
+              return true;
+            }
+            """,
+            {
+                "appId": app_id,
+                "rowIdx": row_idx,
+                "rowKey": row_key,
+                "appName": app_name,
+                "channelName": channel_name,
+            },
+        ))
+    except Exception:
+        return False
+
+
 def _copy_dialog_visible(page):
     """Strict visible-copy-dialog check used only for bounded verification cleanup."""
     return bool(page.evaluate("""() => {
@@ -499,15 +564,30 @@ def _close_copy_dialog_after_verify(page):
 
 def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_name, expected_channel_name):
     """Read the exact new app, its identity, and its fallback value with bounded stability."""
-    main_identity = _verify_persisted_main_row_identity(
+    main_identity = _locate_known_main_row_for_resource_fallback(
         page, app_id, expected_app_name, expected_channel_name
     )
     if not main_identity["success"]:
-        return main_identity
-    if not _open_copy_dialog_by_app_id(
+        diagnostics = _known_main_redacted_facts(
+            main_identity,
+            main_identity.get("stable_row_key", False),
+        )
+        return {
+            "success": False,
+            "error": _resource_fallback_readback_error(
+                "VERIFY",
+                "保存后已知应用ID主行身份未能稳定核验，已停止 "
+                f"candidate_category={diagnostics['candidate_category']} "
+                f"page={diagnostics['page']} "
+                f"stable_row_key={diagnostics['stable_row_key']} "
+                f"id_field_source={diagnostics['id_field_source']}",
+            ),
+        }
+    if not _open_copy_dialog_by_known_main_row(
         page,
         app_id,
         main_identity.get("row_idx"),
+        main_identity.get("row_key"),
         expected_app_name,
         expected_channel_name,
     ):
@@ -1266,6 +1346,8 @@ _MAIN_LIST_COLLECT_JS = """
       detail_id: detailId,
       detail_app_name: labeledValue(detail, /^应用(名称|名)?$/),
       detail_channel: labeledValue(detail, /^(所属)?渠道(名称)?$/),
+      // Element's row-key is the only safe way to collapse fixed-column DOM mirrors.
+      row_key: row.getAttribute('data-row-key') || row.getAttribute('row-key') || '',
       row_idx: rowIdx,
       row_text: (row.textContent || '').trim()
     });
@@ -2172,7 +2254,8 @@ def _read_current_page_app_rows(page):
     rows = []
     for raw in payload.get("rows") or []:
         aligned = _align_header_cells(headers, raw.get("cells") or [])
-        app_id = _mapped_value(aligned, _is_app_id_header) or (raw.get("detail_id") or "")
+        # A detail ID can describe the expanded content, never the list row identity.
+        app_id = _mapped_value(aligned, _is_app_id_header)
         app_name = _mapped_value(
             aligned,
             lambda header: bool(re.search(r"应用名称|应用名", header or "")),
@@ -2221,6 +2304,180 @@ def _collect_all_app_rows(page, reset_filters=False):
         return None
 
     return records
+
+
+def _known_main_candidate_category(candidates):
+    return "0" if not candidates else ("1" if len(candidates) == 1 else ">1")
+
+
+def _known_main_redacted_facts(snapshot=None, stable_row_key=False):
+    snapshot = snapshot or {}
+    return {
+        "candidate_category": snapshot.get("candidate_category") or _known_main_candidate_category(snapshot.get("candidates") or []),
+        "page": snapshot.get("page") if snapshot.get("page") is not None else "unknown",
+        "stable_row_key": bool(stable_row_key),
+        "id_field_source": "main",
+    }
+
+
+def _known_main_failure(reason, snapshot=None, stable_row_key=False):
+    return {
+        "success": False,
+        "reason": reason,
+        **_known_main_redacted_facts(snapshot, stable_row_key),
+    }
+
+
+def _snapshot_known_main_id_rows(page, app_id):
+    """Read one main-table page using main cells only; detail fields are ignored."""
+    try:
+        payload = page.evaluate(_MAIN_LIST_COLLECT_JS, False) or {}
+    except Exception:
+        payload = {}
+    page_number = payload.get("page_number") or 1
+    if payload.get("main_table_count") != 1:
+        return {"success": False, "reason": "main_list_table_unavailable", "page": page_number, "candidates": []}
+    headers = payload.get("headers") or []
+    if not all(
+        _matching_main_header_count(headers, predicate) == 1
+        for predicate in (_is_app_id_header, _is_app_name_header, _is_channel_name_header)
+    ):
+        return {"success": False, "reason": "main_anchor_columns_ambiguous", "page": page_number, "candidates": []}
+    expected_id = str(app_id or "").strip()
+    candidates = []
+    for raw in payload.get("rows") or []:
+        aligned = _align_header_cells(headers, raw.get("cells") or [])
+        if not aligned or _mapped_value(aligned, _is_app_id_header) != expected_id:
+            continue
+        candidates.append({
+            "row_idx": raw.get("row_idx"),
+            "row_key": str(raw.get("row_key") or "").strip(),
+            "app_id": _mapped_value(aligned, _is_app_id_header),
+            "app_name": _mapped_value(aligned, _is_app_name_header),
+            "channel_name": _mapped_value(aligned, _is_channel_name_header),
+        })
+    return {
+        "success": True,
+        "page": page_number,
+        "candidates": candidates,
+    }
+
+
+def _known_main_identity_from_snapshot(snapshot, app_id, app_name, channel_name):
+    """Accept one row, or only a provable fixed-column DOM mirror of that row."""
+    candidates = snapshot.get("candidates") or []
+    if not candidates:
+        return {"success": False, "reason": "zero_candidates"}
+    expected = (str(app_id or "").strip(), (app_name or "").strip(), (channel_name or "").strip())
+    anchors = [
+        (row.get("app_id") or "", row.get("app_name") or "", row.get("channel_name") or "")
+        for row in candidates
+    ]
+    row_keys = [row.get("row_key") or "" for row in candidates]
+    # More than one physical row is safe only when row-key and all main anchors
+    # prove it is a fixed-column DOM mirror, not a second application row.
+    if len(candidates) > 1 and (
+        not all(row_keys)
+        or len(set(row_keys)) != 1
+        or len(set(anchors)) != 1
+    ):
+        return {"success": False, "reason": "ambiguous_main_rows"}
+    candidate = candidates[0]
+    if not candidate.get("row_key"):
+        return {"success": False, "reason": "missing_row_key"}
+    if anchors[0] != expected:
+        return {"success": False, "reason": "main_anchor_mismatch"}
+    return {"success": True, "row": candidate}
+
+
+def _log_known_main_snapshot(snapshot, decision, stable_row_key=False):
+    facts = _known_main_redacted_facts(snapshot, stable_row_key)
+    print(
+        "[create_app] 保存后已知ID主行读取: "
+        f"candidate_category={facts['candidate_category']} page={facts['page']} "
+        f"stable_row_key={facts['stable_row_key']} id_field_source={facts['id_field_source']}"
+    )
+
+
+def _return_to_known_main_page(page, page_number):
+    """Return to a previously scanned page using only the stable pager helper."""
+    if not isinstance(page_number, int) or page_number < 1 or not _go_to_first_page(page):
+        return False
+    for _ in range(page_number - 1):
+        if _click_next_page_and_wait(page) is not True:
+            return False
+    return True
+
+
+def _scan_known_main_id_pages(page, app_id, app_name, channel_name):
+    """Scan every stable page; a same-ID candidate on another page is a conflict."""
+    seen_pages = set()
+    candidate = None
+    for _ in range(50):
+        snapshot = _snapshot_known_main_id_rows(page, app_id)
+        if not snapshot.get("success"):
+            return {"status": "failure", "snapshot": snapshot, "reason": snapshot.get("reason")}
+        page_number = snapshot.get("page")
+        if page_number is None or page_number in seen_pages:
+            return {"status": "failure", "snapshot": snapshot, "reason": "pagination_unstable"}
+        seen_pages.add(page_number)
+        decision = _known_main_identity_from_snapshot(snapshot, app_id, app_name, channel_name)
+        _log_known_main_snapshot(snapshot, decision)
+        if decision.get("success"):
+            if candidate is not None:
+                return {"status": "failure", "snapshot": snapshot, "reason": "ambiguous_main_rows"}
+            candidate = {"snapshot": snapshot, "decision": decision}
+        elif decision.get("reason") != "zero_candidates":
+            return {"status": "failure", "snapshot": snapshot, "reason": decision.get("reason")}
+        moved = _click_next_page_and_wait(page)
+        if moved is None:
+            return {"status": "failure", "snapshot": snapshot, "reason": "pagination_unstable"}
+        if not moved:
+            if candidate is None:
+                return {"status": "zero", "snapshot": snapshot}
+            if candidate["snapshot"].get("page") != page_number and not _return_to_known_main_page(
+                page, candidate["snapshot"].get("page")
+            ):
+                return {"status": "failure", "snapshot": candidate["snapshot"], "reason": "pagination_unstable"}
+            return {"status": "candidate", **candidate}
+    return {"status": "failure", "snapshot": {}, "reason": "page_scan_limit_reached"}
+
+
+def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel_name):
+    """Read-only post-save locator: two stable main reads before the Copy recheck."""
+    for attempt in range(_POST_SAVE_KNOWN_ID_POLL_ATTEMPTS):
+        if attempt:
+            page.wait_for_timeout(_POST_SAVE_KNOWN_ID_POLL_MS)
+        _reset_list_filters(page)
+        if not _go_to_first_page(page):
+            return _known_main_failure("pagination_unstable")
+        scanned = _scan_known_main_id_pages(page, app_id, app_name, channel_name)
+        if scanned.get("status") == "zero":
+            continue
+        if scanned.get("status") != "candidate":
+            return _known_main_failure(scanned.get("reason"), scanned.get("snapshot"))
+        first_snapshot = scanned["snapshot"]
+        first_row = scanned["decision"]["row"]
+        page.wait_for_timeout(_POST_SAVE_KNOWN_ID_POLL_MS)
+        second_snapshot = _snapshot_known_main_id_rows(page, app_id)
+        if not second_snapshot.get("success") or second_snapshot.get("page") != first_snapshot.get("page"):
+            _log_known_main_snapshot(second_snapshot, {}, False)
+            return _known_main_failure("main_identity_unstable", second_snapshot)
+        second_decision = _known_main_identity_from_snapshot(second_snapshot, app_id, app_name, channel_name)
+        stable_key = bool(
+            second_decision.get("success")
+            and second_decision["row"].get("row_key") == first_row.get("row_key")
+        )
+        _log_known_main_snapshot(second_snapshot, second_decision, stable_key)
+        if not stable_key:
+            return _known_main_failure("main_identity_unstable", second_snapshot)
+        return {
+            "success": True,
+            "page": second_snapshot.get("page"),
+            "row_idx": second_decision["row"].get("row_idx"),
+            "row_key": second_decision["row"].get("row_key"),
+        }
+    return _known_main_failure("zero_candidates_after_poll", scanned.get("snapshot"))
 
 
 def _identify_new_app(page, before_ids, actual_channel_name, app_name):
@@ -2291,7 +2548,16 @@ def _identify_new_app(page, before_ids, actual_channel_name, app_name):
             }
         candidates = [row for app_id, row in after_rows.items() if app_id not in before_ids]
         last_candidates = candidates
-        print(f"[create_app] 新增ID识别 attempt={attempt + 1}: {[row['app_id'] for row in candidates]}")
+        category = "0" if not candidates else ("1" if len(candidates) == 1 else ">1")
+        try:
+            page_number = (_read_pagination_state(page) or {}).get("page_number", "unknown")
+        except Exception:
+            page_number = "unknown"
+        print(
+            "[create_app] 新增ID识别: "
+            f"attempt={attempt + 1} candidate_category={category} "
+            f"page={page_number} stable_row_key=False id_field_source=main"
+        )
 
         if len(candidates) == 1:
             return {"success": True, "app_id": candidates[0]["app_id"]}
@@ -2301,19 +2567,17 @@ def _identify_new_app(page, before_ids, actual_channel_name, app_name):
                 "error": err(
                     "NEW_APP_ID_AMBIGUOUS",
                     "VERIFY",
-                    f"保存后出现多个新增应用ID，无法安全确定目标: "
-                    f"{[row['app_id'] for row in candidates]}",
+                    "保存后新增应用ID候选数大于一，无法安全确定目标",
                     NEXT_MANUAL,
                 ),
             }
         page.wait_for_timeout(1500)
 
     if last_candidates:
-        candidate_ids = [row["app_id"] for row in last_candidates]
-        message = f"保存后新增应用ID无法唯一确定: {candidate_ids}"
+        message = "保存后新增应用ID候选数大于一，无法安全确定目标"
         code = "NEW_APP_ID_AMBIGUOUS"
     else:
-        message = "保存后未检测到新增应用ID"
+        message = "保存后主表应用ID不可读取或未检测到新增应用ID"
         code = "NEW_APP_ID_NOT_FOUND"
     return {"success": False, "error": err(code, "VERIFY", message, NEXT_MANUAL)}
 
@@ -2772,21 +3036,8 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
     if not identified["success"]:
         return _post_save_unconfirmed_failure(identified["error"])
     target_app_id = identified["app_id"]
-    located = _find_target_row_by_id(page, target_app_id, data["actual_channel_name"])
-    if not located.get("found"):
-        location_reason = located.get("reason")
-        if location_reason == "channel_mismatch":
-            location_code = "CHANNEL_MISMATCH"
-            location_message = f"应用ID={target_app_id}存在，但渠道归属不匹配"
-        elif location_reason == "channel_unverified":
-            location_code = "CHANNEL_UNVERIFIED"
-            location_message = f"应用ID={target_app_id}已找到，但无法从主行或展开详情核验渠道"
-        else:
-            location_code = "NEW_APP_ID_NOT_FOUND"
-            location_message = f"已识别新增应用ID={target_app_id}，但无法按ID重新定位"
-        return _post_save_unconfirmed_failure(
-            err(location_code, "VERIFY", location_message, NEXT_MANUAL)
-        )
+    # Only this post-save resource-fallback proof uses the strict main-row locator.
+    # Later enable/group/result stages intentionally retain _find_target_row_by_id.
     fallback_persisted = _verify_persisted_resource_fallback(
         page,
         target_app_id,
