@@ -101,6 +101,18 @@ class MainTablePage:
         return self.payload
 
 
+class CopyOpenPage:
+    def __init__(self, result):
+        self.result = result
+        self.script = ""
+        self.payload = None
+
+    def evaluate(self, script, payload):
+        self.script = script
+        self.payload = payload
+        return self.result
+
+
 def _main_payload(*rows, headers=("ID", "应用名称", "所属渠道"), table_count=1):
     return {
         "main_table_count": table_count,
@@ -246,6 +258,9 @@ def test_post_save_main_row_three_anchors_match():
         _main_payload(("new-id", "channel-a"), headers=("ID", "所属渠道")),
         _main_payload(("demo", "channel-a"), headers=("应用名称", "所属渠道")),
         _main_payload(("new-id", "demo"), headers=("ID", "应用名称", "所属渠道")),
+        _main_payload(("new-id", "new-id", "demo", "channel-a"), headers=("ID", "应用ID", "应用名称", "所属渠道")),
+        _main_payload(("new-id", "demo", "demo", "channel-a"), headers=("ID", "应用名称", "应用名", "所属渠道")),
+        _main_payload(("new-id", "demo", "channel-a", "channel-a"), headers=("ID", "应用名称", "所属渠道", "渠道名称")),
         _main_payload(("new-id", "demo", "channel-a"), table_count=2),
     ],
 )
@@ -259,6 +274,28 @@ def test_post_save_main_row_missing_ambiguous_or_mismatched_anchor_fails(payload
     assert result["success"] is False
     assert result["error"]["code"] == "RESOURCE_FALLBACK_VERIFY_FAILED"
     assert result["error"]["stage"] == "VERIFY"
+
+
+def test_open_copy_rechecks_all_anchors_on_verified_row_before_click():
+    cap = _stub_login_and_import()
+    page = CopyOpenPage(True)
+
+    assert cap._open_copy_dialog_by_app_id(page, "new-id", 3, "demo", "channel-a") is True
+    assert page.payload == {
+        "appId": "new-id",
+        "rowIdx": 3,
+        "appName": "demo",
+        "channelName": "channel-a",
+    }
+    assert "idIndexes.length !== 1" in page.script
+    assert "cellText(nameIndexes[0])" in page.script
+    assert "cellText(channelIndexes[0])" in page.script
+
+
+def test_open_copy_anchor_recheck_failure_is_fail_closed():
+    cap = _stub_login_and_import()
+
+    assert cap._open_copy_dialog_by_app_id(CopyOpenPage(False), "new-id", 0, "demo", "channel-a") is False
 
 
 def test_post_save_copy_dialog_default_identity_does_not_block_fallback_readback(monkeypatch):

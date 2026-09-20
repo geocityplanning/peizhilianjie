@@ -362,6 +362,11 @@ def _verify_persisted_main_row_identity(page, app_id, expected_app_name, expecte
     expected_name = (expected_app_name or "").strip()
     expected_channel = (expected_channel_name or "").strip()
     headers = payload.get("headers") or []
+    if not all(
+        _matching_main_header_count(headers, predicate) == 1
+        for predicate in (_is_app_id_header, _is_app_name_header, _is_channel_name_header)
+    ):
+        return {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后主表三锚列映射不可唯一，已停止")}
     candidates = []
     for row in payload.get("rows") or []:
         aligned = _align_header_cells(headers, row.get("cells") or [])
@@ -372,9 +377,10 @@ def _verify_persisted_main_row_identity(page, app_id, expected_app_name, expecte
         return {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后主表应用ID不可唯一核验，已停止")}
 
     row, aligned = candidates[0]
+    observed_id = _mapped_value(aligned, _is_app_id_header)
     observed_name = _mapped_value(aligned, _is_app_name_header)
     observed_channel = _mapped_value(aligned, _is_channel_name_header)
-    id_matches = bool(expected_id)
+    id_matches = bool(expected_id) and observed_id == expected_id
     name_matches = bool(expected_name) and observed_name == expected_name
     channel_matches = bool(expected_channel) and observed_channel == expected_channel
     print(
@@ -388,12 +394,12 @@ def _verify_persisted_main_row_identity(page, app_id, expected_app_name, expecte
     return {"success": True, "row_idx": row.get("row_idx")}
 
 
-def _open_copy_dialog_by_app_id(page, app_id, verified_row_idx):
-    """Open Copy only from the already verified exact main-table row."""
+def _open_copy_dialog_by_app_id(page, app_id, verified_row_idx, expected_app_name, expected_channel_name):
+    """Open Copy only after rechecking all three anchors on the verified row."""
     try:
         return bool(page.evaluate(
             """
-            ({appId, rowIdx}) => {
+            ({appId, rowIdx, appName, channelName}) => {
               const visible = (el) => Boolean(el) && el.offsetParent !== null;
               const inDialog = (el) => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
               const utility = (el) => /el-table__expand-column|el-table-column--selection|\\bgutter\\b/.test(String(el.className || ''));
@@ -403,26 +409,36 @@ def _open_copy_dialog_by_app_id(page, app_id, verified_row_idx):
               const headerNodes = table.querySelectorAll('.el-table__header-wrapper th');
               const fallbackHeaders = table.querySelectorAll('th');
               const headers = Array.from(headerNodes.length ? headerNodes : fallbackHeaders).filter(header => !utility(header));
-              const idIndex = headers.findIndex((header) => {
-                const text = (header.innerText || header.textContent || '').replace(/[ *:：\\s]/g, '').trim();
-                return text === 'ID' || text.includes('应用ID');
-              });
-              if (idIndex < 0) return false;
+              const textOf = header => (header.innerText || header.textContent || '').replace(/[ *:：\\s]/g, '').trim();
+              const idIndexes = headers.map(textOf).map((text, index) => text === 'ID' || text.includes('应用ID') ? index : -1).filter(index => index >= 0);
+              const nameIndexes = headers.map(textOf).map((text, index) => text.includes('应用名称') || text.includes('应用名') ? index : -1).filter(index => index >= 0);
+              const channelIndexes = headers.map(textOf).map((text, index) => text.includes('渠道') && !/ID|编码|code/i.test(text) ? index : -1).filter(index => index >= 0);
+              if (idIndexes.length !== 1 || nameIndexes.length !== 1 || channelIndexes.length !== 1) return false;
               const bodyRows = table.querySelectorAll('.el-table__body-wrapper tbody tr');
               const sourceRows = bodyRows.length ? bodyRows : table.querySelectorAll('tbody tr');
               const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
               const row = rows[rowIdx];
               if (!row || !visible(row)) return false;
               const cells = Array.from(row.querySelectorAll('td')).filter(cell => !utility(cell));
-              const id = cells.length === headers.length ? (cells[idIndex].innerText || cells[idIndex].textContent || '').trim() : '';
-              if (id !== String(appId || '').trim()) return false;
+              if (cells.length !== headers.length) return false;
+              const cellText = index => (cells[index].innerText || cells[index].textContent || '').trim();
+              if (
+                cellText(idIndexes[0]) !== String(appId || '').trim()
+                || cellText(nameIndexes[0]) !== String(appName || '').trim()
+                || cellText(channelIndexes[0]) !== String(channelName || '').trim()
+              ) return false;
               const copy = Array.from(row.querySelectorAll('button, a, span')).find(button => visible(button) && (button.innerText || '').trim() === '复制');
               if (!copy) return false;
               copy.click();
               return true;
             }
             """,
-            {"appId": app_id, "rowIdx": verified_row_idx},
+            {
+                "appId": app_id,
+                "rowIdx": verified_row_idx,
+                "appName": expected_app_name,
+                "channelName": expected_channel_name,
+            },
         ))
     except Exception:
         return False
@@ -488,7 +504,13 @@ def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_nam
     )
     if not main_identity["success"]:
         return main_identity
-    if not _open_copy_dialog_by_app_id(page, app_id, main_identity.get("row_idx")):
+    if not _open_copy_dialog_by_app_id(
+        page,
+        app_id,
+        main_identity.get("row_idx"),
+        expected_app_name,
+        expected_channel_name,
+    ):
         return {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后无法从已核验主表应用ID行打开资源不足中间页链接核验，已停止")}
     verified = None
     try:
@@ -2016,6 +2038,15 @@ def _mapped_value(aligned, predicate):
         if predicate(item.get("header") or ""):
             return (item.get("value") or "").strip()
     return ""
+
+
+def _matching_main_header_count(headers, predicate):
+    return sum(
+        1
+        for header in (headers or [])
+        if not _is_utility_column(header)
+        and predicate(header.get("text") if isinstance(header, dict) else str(header or ""))
+    )
 
 
 def _main_channel_from_row(headers, cells):
