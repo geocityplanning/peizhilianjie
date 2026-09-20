@@ -101,7 +101,7 @@ def map_real_success(request: ExecutionRequest, result: dict[str, Any]) -> dict[
 def map_real_failure(result: dict[str, Any]) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
     next_action = str(result.get("next_action") or "MANUAL_CHECK").upper()
     declared_status = str(result.get("status") or result.get("business_status") or "").upper()
-    if next_action == "QUERY":
+    if next_action == "QUERY" or declared_status == "UNKNOWN":
         execution_state = "UNKNOWN"
         business_status = "UNKNOWN"
     else:

@@ -163,11 +163,91 @@ def _js_fill(page, label, value):
     """, {"label": label, "value": value})
 
 
-def _read_visible_copy_dialog_input(page, label):
-    """Read one exact-labeled input from the only visible copy dialog.
+_RESOURCE_FALLBACK_INPUT_MARKER = "data-hermes-resource-fallback-input"
+_POST_SAVE_FALLBACK_POLL_ATTEMPTS = 6
+_POST_SAVE_FALLBACK_POLL_MS = 250
 
-    The raw value is used only for in-memory equality verification and is never
-    emitted to logs or result payloads.
+
+def _mark_unique_visible_copy_dialog_input(page, label):
+    """Mark one exact input in the only visible copy dialog for native fill()."""
+    try:
+        result = page.evaluate(
+            """
+            ({label, marker}) => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                if (el.getAttribute('aria-hidden') === 'true') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              for (const input of document.querySelectorAll('input[' + marker + ']')) {
+                input.removeAttribute(marker);
+              }
+              const wanted = (label || '').replace(/[ *:：]/g, '').trim();
+              const dialogs = Array.from(document.querySelectorAll('.el-dialog__wrapper')).filter(
+                dialog => visible(dialog) && dialog.querySelectorAll('.el-tabs__item').length > 0
+              );
+              if (dialogs.length !== 1) return {dialog_found: false, input_found: false};
+              const matches = [];
+              for (const item of dialogs[0].querySelectorAll('.el-form-item')) {
+                if (item.offsetParent === null) continue;
+                const labelEl = item.querySelector('.el-form-item__label');
+                if (!labelEl) continue;
+                const actual = (labelEl.innerText || '').replace(/[ *:：]/g, '').trim();
+                if (actual !== wanted) continue;
+                const input = item.querySelector('input.el-input__inner');
+                if (input) matches.push(input);
+              }
+              if (matches.length !== 1) return {dialog_found: true, input_found: false};
+              matches[0].setAttribute(marker, 'true');
+              return {dialog_found: true, input_found: true};
+            }
+            """,
+            {"label": label, "marker": _RESOURCE_FALLBACK_INPUT_MARKER},
+        )
+    except Exception:
+        result = None
+    return {
+        "dialog_found": bool(isinstance(result, dict) and result.get("dialog_found")),
+        "input_found": bool(isinstance(result, dict) and result.get("input_found")),
+    }
+
+
+def _clear_resource_fallback_input_marker(page):
+    try:
+        page.evaluate(
+            "(marker) => document.querySelectorAll('input[' + marker + ']').forEach(input => input.removeAttribute(marker))",
+            _RESOURCE_FALLBACK_INPUT_MARKER,
+        )
+    except Exception:
+        pass
+
+
+def _fill_visible_copy_dialog_input(page, label, value):
+    """Use native Playwright fill and Tab on one exact input, never a JS setter."""
+    located = _mark_unique_visible_copy_dialog_input(page, label)
+    if not located["dialog_found"] or not located["input_found"]:
+        return False
+    try:
+        input_locator = page.locator(f"input[{_RESOURCE_FALLBACK_INPUT_MARKER}='true']")
+        if input_locator.count() != 1:
+            return False
+        input_locator.fill(value, timeout=STEP_TIMEOUT)
+        input_locator.press("Tab", timeout=STEP_TIMEOUT)
+        return True
+    except Exception:
+        return False
+    finally:
+        _clear_resource_fallback_input_marker(page)
+
+
+def _read_visible_copy_dialog_input(page, label):
+    """Read exact DOM and Element-UI prop values from one visible copy dialog.
+
+    Raw values stay in memory for equality tests only. A readable component
+    `value` prop is the minimum framework-binding proof required before save.
     """
     try:
         result = page.evaluate(
@@ -186,7 +266,7 @@ def _read_visible_copy_dialog_input(page, label):
                 dialog => visible(dialog) && dialog.querySelectorAll('.el-tabs__item').length > 0
               );
               if (dialogs.length !== 1) {
-                return {dialog_found: false, input_found: false, value: ''};
+                return {dialog_found: false, input_found: false, model_found: false, value: '', model_value: ''};
               }
               for (const item of dialogs[0].querySelectorAll('.el-form-item')) {
                 if (item.offsetParent === null) continue;
@@ -195,10 +275,22 @@ def _read_visible_copy_dialog_input(page, label):
                 const actual = (labelEl.innerText || '').replace(/[ *:：]/g, '').trim();
                 if (actual !== wanted) continue;
                 const input = item.querySelector('input.el-input__inner');
-                if (!input) return {dialog_found: true, input_found: false, value: ''};
-                return {dialog_found: true, input_found: true, value: input.value || ''};
+                if (!input) return {dialog_found: true, input_found: false, model_found: false, value: '', model_value: ''};
+                const component = input.__vue__ || input.closest('.el-input')?.__vue__;
+                const propValue = component?.$props?.value;
+                const directValue = component?.value;
+                const modelValue = typeof propValue === 'string' ? propValue : (
+                  typeof directValue === 'string' ? directValue : null
+                );
+                return {
+                  dialog_found: true,
+                  input_found: true,
+                  model_found: typeof modelValue === 'string',
+                  value: input.value || '',
+                  model_value: modelValue || '',
+                };
               }
-              return {dialog_found: true, input_found: false, value: ''};
+              return {dialog_found: true, input_found: false, model_found: false, value: '', model_value: ''};
             }
             """,
             {"label": label},
@@ -206,11 +298,13 @@ def _read_visible_copy_dialog_input(page, label):
     except Exception:
         result = None
     if not isinstance(result, dict):
-        return {"dialog_found": False, "input_found": False, "value": ""}
+        return {"dialog_found": False, "input_found": False, "model_found": False, "value": "", "model_value": ""}
     return {
         "dialog_found": bool(result.get("dialog_found")),
         "input_found": bool(result.get("input_found")),
+        "model_found": bool(result.get("model_found")),
         "value": str(result.get("value") or ""),
+        "model_value": str(result.get("model_value") or ""),
     }
 
 
@@ -219,45 +313,40 @@ def _resource_fallback_readback_error(stage, message):
 
 
 def _verify_resource_fallback_readback(page, expected, stage, context):
-    """Verify the fallback value in the visible copy dialog without leaking it."""
+    """Verify DOM and framework prop values without leaking the fallback URL."""
     readback = _read_visible_copy_dialog_input(page, "资源不足中间页链接")
     expected_text = (expected or "").strip()
     observed = readback["value"]
-    matches = bool(readback["input_found"]) and observed == expected_text
+    model_observed = readback["model_value"]
+    dom_matches = bool(readback["input_found"]) and observed == expected_text
+    model_matches = bool(readback["model_found"]) and model_observed == expected_text
     print(
         "[create_app] 资源不足中间页链接核验: "
         f"context={context} dialog_found={readback['dialog_found']} "
-        f"input_found={readback['input_found']} expected_length={len(expected_text)} "
-        f"observed_length={len(observed)} matches={matches}"
+        f"input_found={readback['input_found']} model_found={readback['model_found']} "
+        f"expected_length={len(expected_text)} observed_length={len(observed)} "
+        f"model_length={len(model_observed)} dom_matches={dom_matches} model_matches={model_matches}"
     )
     if not readback["dialog_found"] or not readback["input_found"]:
-        return {
-            "success": False,
-            "error": _resource_fallback_readback_error(
-                stage, "资源不足中间页链接控件不可读取，已停止"
-            ),
-        }
-    if not matches:
-        return {
-            "success": False,
-            "error": _resource_fallback_readback_error(
-                stage, "资源不足中间页链接回读不一致，已停止"
-            ),
-        }
+        return {"success": False, "error": _resource_fallback_readback_error(stage, "资源不足中间页链接控件不可读取，已停止")}
+    if not readback["model_found"]:
+        return {"success": False, "error": _resource_fallback_readback_error(stage, "资源不足中间页链接框架模型不可读取，已停止")}
+    if not dom_matches or not model_matches:
+        return {"success": False, "error": _resource_fallback_readback_error(stage, "资源不足中间页链接DOM或框架模型回读不一致，已停止")}
     return {"success": True}
 
 
 def _fill_and_verify_resource_fallback(page, expected):
-    """Fill and exactly read back the required fallback field before save."""
-    if not _js_fill(page, "资源不足中间页链接", expected):
+    """Native-fill, prove framework binding, then prove a Tab round trip before save."""
+    if not _fill_visible_copy_dialog_input(page, "资源不足中间页链接", expected):
         print("[create_app] 资源不足中间页链接填写: filled=False")
-        return {
-            "success": False,
-            "error": _resource_fallback_readback_error(
-                "FILL", "资源不足中间页链接填写失败，已停止保存"
-            ),
-        }
-    return _verify_resource_fallback_readback(page, expected, "FILL", "before_save")
+        return {"success": False, "error": _resource_fallback_readback_error("FILL", "资源不足中间页链接填写失败，已停止保存")}
+    initial = _verify_resource_fallback_readback(page, expected, "FILL", "before_save")
+    if not initial["success"]:
+        return initial
+    if not _go_tab(page, "悬浮球配置") or not _go_tab(page, "基础配置"):
+        return {"success": False, "error": _resource_fallback_readback_error("FILL", "资源不足中间页链接Tab往返无法确认，已停止保存")}
+    return _verify_resource_fallback_readback(page, expected, "FILL", "before_save_tab_round_trip")
 
 
 def _open_copy_dialog_by_app_id(page, app_id):
@@ -362,15 +451,64 @@ def _close_copy_dialog_after_verify(page):
     return False
 
 
-def _verify_persisted_resource_fallback(page, app_id, expected):
-    """Open the newly saved app read-only and verify its persisted fallback value."""
+def _read_visible_copy_dialog_channel_value(page):
+    """Read the selected channel from the only visible copy dialog."""
+    try:
+        result = page.evaluate("""() => {
+          const visible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          };
+          const dialogs = Array.from(document.querySelectorAll('.el-dialog__wrapper')).filter(
+            dialog => visible(dialog) && dialog.querySelectorAll('.el-tabs__item').length > 0
+          );
+          if (dialogs.length !== 1) return {dialog_found: false, value: ''};
+          for (const item of dialogs[0].querySelectorAll('.el-form-item')) {
+            if (item.offsetParent === null) continue;
+            const label = item.querySelector('.el-form-item__label');
+            const text = (label?.innerText || '').replace(/[ *:：]/g, '').trim();
+            if (text !== '所属渠道' && text !== '渠道') continue;
+            const channel = item.querySelector('.channel-input');
+            const input = channel?.querySelector('input');
+            return {dialog_found: true, value: (input?.value || channel?.innerText || '').trim()};
+          }
+          return {dialog_found: true, value: ''};
+        }""")
+    except Exception:
+        result = None
+    return {
+        "dialog_found": bool(isinstance(result, dict) and result.get("dialog_found")),
+        "value": str(result.get("value") or "") if isinstance(result, dict) else "",
+    }
+
+
+def _verify_persisted_dialog_identity(page, expected_app_name, expected_channel_name):
+    app = _read_visible_copy_dialog_input(page, "应用名称")
+    channel = _read_visible_copy_dialog_channel_value(page)
+    app_matches = bool(app["input_found"]) and app["value"] == (expected_app_name or "").strip()
+    channel_matches = bool(channel["dialog_found"]) and channel["value"] == (expected_channel_name or "").strip()
+    print(
+        "[create_app] 保存后复制对话框身份核验: "
+        f"app_input_found={app['input_found']} app_matches={app_matches} "
+        f"channel_found={channel['dialog_found']} channel_matches={channel_matches}"
+    )
+    if app_matches and channel_matches:
+        return {"success": True}
+    return {
+        "success": False,
+        "error": _resource_fallback_readback_error(
+            "VERIFY", "保存后复制对话框应用名或渠道身份回读不一致，已停止"
+        ),
+    }
+
+
+def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_name, expected_channel_name):
+    """Read the exact new app, its identity, and its fallback value with bounded stability."""
     if not _open_copy_dialog_by_app_id(page, app_id):
-        return {
-            "success": False,
-            "error": _resource_fallback_readback_error(
-                "VERIFY", "保存后无法按新增应用ID打开资源不足中间页链接核验，已停止"
-            ),
-        }
+        return {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后无法按新增应用ID打开资源不足中间页链接核验，已停止")}
     verified = None
     try:
         try:
@@ -379,30 +517,37 @@ def _verify_persisted_resource_fallback(page, app_id, expected):
                 timeout=STEP_TIMEOUT,
             )
         except Exception:
-            verified = {
-                "success": False,
-                "error": _resource_fallback_readback_error(
-                    "VERIFY", "保存后资源不足中间页链接核验对话框未就绪，已停止"
-                ),
-            }
-        if verified is None and not _go_tab(page, "基础配置"):
-            verified = {
-                "success": False,
-                "error": _resource_fallback_readback_error(
-                    "VERIFY", "保存后无法切换资源不足中间页链接核验页签，已停止"
-                ),
-            }
+            verified = {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后资源不足中间页链接核验对话框未就绪，已停止")}
         if verified is None:
-            verified = _verify_resource_fallback_readback(page, expected, "VERIFY", "after_save")
+            identity = _verify_persisted_dialog_identity(page, expected_app_name, expected_channel_name)
+            if not identity["success"]:
+                verified = identity
+        if verified is None and not _go_tab(page, "基础配置"):
+            verified = {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后无法切换资源不足中间页链接核验页签，已停止")}
+        if verified is None:
+            stable_reads = 0
+            last_failure = None
+            for attempt in range(_POST_SAVE_FALLBACK_POLL_ATTEMPTS):
+                current = _verify_resource_fallback_readback(page, expected, "VERIFY", "after_save")
+                if current["success"]:
+                    stable_reads += 1
+                    if stable_reads >= 2:
+                        verified = current
+                        break
+                else:
+                    stable_reads = 0
+                    last_failure = current
+                if attempt < _POST_SAVE_FALLBACK_POLL_ATTEMPTS - 1:
+                    page.wait_for_timeout(_POST_SAVE_FALLBACK_POLL_MS)
+            if verified is None:
+                verified = last_failure or {
+                    "success": False,
+                    "error": _resource_fallback_readback_error("VERIFY", "保存后资源不足中间页链接未能稳定核验，已停止"),
+                }
     finally:
         closed = _close_copy_dialog_after_verify(page)
     if not closed:
-        return {
-            "success": False,
-            "error": _resource_fallback_readback_error(
-                "VERIFY", "保存后资源不足中间页链接核验对话框未能确认关闭，已停止"
-            ),
-        }
+        return {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后资源不足中间页链接核验对话框未能确认关闭，已停止")}
     return verified
 
 
@@ -2617,7 +2762,11 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
             "error": err(location_code, "VERIFY", location_message, NEXT_MANUAL),
         }
     fallback_persisted = _verify_persisted_resource_fallback(
-        page, target_app_id, resource_fallback_page
+        page,
+        target_app_id,
+        resource_fallback_page,
+        app_name,
+        data["actual_channel_name"],
     )
     if not fallback_persisted["success"]:
         return {

@@ -94,6 +94,7 @@ def _strip(result: dict) -> dict:
             "error_code": error.get("code"),
             "error_stage": error.get("stage"),
             "next_action": error.get("next_action"),
+            "business_status": result.get("business_status"),
             **data,
         }
 

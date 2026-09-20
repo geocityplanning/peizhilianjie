@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Offline behavior tests for required resource fallback persistence verification."""
+"""Offline behavior tests for resource fallback framework/persistence verification."""
 from __future__ import annotations
 
 import sys
@@ -22,15 +22,40 @@ def _stub_login_and_import():
     return cap
 
 
-class DialogPage:
-    def __init__(self, readback):
-        self.readback = readback
-        self.save_clicks = 0
+class FillLocator:
+    def __init__(self, *, count=1, fill_error=False):
+        self._count = count
+        self.fill_error = fill_error
+        self.calls = []
+
+    def count(self):
+        return self._count
+
+    def fill(self, value, **kwargs):
+        self.calls.append(("fill", value, kwargs))
+        if self.fill_error:
+            raise RuntimeError("fill failed")
+
+    def press(self, value, **kwargs):
+        self.calls.append(("press", value, kwargs))
+
+
+class FillPage:
+    def __init__(self, *, marker_result=None, locator=None):
+        self.marker_result = marker_result or {"dialog_found": True, "input_found": True}
+        self.input_locator = locator or FillLocator()
+        self.marker_cleared = False
 
     def evaluate(self, script, payload=None):
-        if "const wanted" in script:
-            return dict(self.readback)
+        if "matches[0].setAttribute(marker" in script:
+            return dict(self.marker_result)
+        if "removeAttribute(marker)" in script:
+            self.marker_cleared = True
         return True
+
+    def locator(self, selector):
+        assert "data-hermes-resource-fallback-input" in selector
+        return self.input_locator
 
 
 class StagePage:
@@ -68,23 +93,26 @@ class StagePage:
         return True
 
 
+def _readback(value=EXPECTED, *, model_value=EXPECTED, model_found=True, input_found=True):
+    return {
+        "dialog_found": True,
+        "input_found": input_found,
+        "model_found": model_found,
+        "value": value,
+        "model_value": model_value,
+    }
+
+
 def _prepare_stage(monkeypatch, cap, page):
     monkeypatch.setattr(cap, "_set_stage", lambda *args, **kwargs: None)
     monkeypatch.setattr(cap, "_cleanup_overlays", lambda page: None)
     monkeypatch.setattr(cap, "_shot", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        cap,
-        "_collect_all_app_rows",
-        lambda page, reset_filters=False: {"old-id": {"app_id": "old-id"}},
-    )
-    monkeypatch.setattr(
-        cap,
-        "_search_by_link",
-        lambda page, link: {"clicked": True, "error": None, "uncertain": False},
-    )
-    monkeypatch.setattr(cap, "_go_tab", lambda page, name: True)
+    monkeypatch.setattr(cap, "_collect_all_app_rows", lambda *args, **kwargs: {"old-id": {}})
+    monkeypatch.setattr(cap, "_search_by_link", lambda *args, **kwargs: {"clicked": True, "error": None, "uncertain": False})
+    monkeypatch.setattr(cap, "_go_tab", lambda *args, **kwargs: True)
     monkeypatch.setattr(cap, "_js_select", lambda *args, **kwargs: True)
     monkeypatch.setattr(cap, "_select_and_verify_create_channel", lambda *args, **kwargs: {"success": True})
+    monkeypatch.setattr(cap, "_fill_visible_copy_dialog_input", lambda *args, **kwargs: True)
 
     def counted_save(page):
         page.save_clicks += 1
@@ -97,41 +125,31 @@ def _stage_data():
     return {"actual_channel_name": "channel-a", "base_platform": ""}
 
 
-@pytest.mark.parametrize(
-    ("readback", "expected_code"),
-    [
-        ({"dialog_found": True, "input_found": False, "value": ""}, "RESOURCE_FALLBACK_VERIFY_FAILED"),
-        ({"dialog_found": False, "input_found": False, "value": ""}, "RESOURCE_FALLBACK_VERIFY_FAILED"),
-        ({"dialog_found": True, "input_found": True, "value": "different"}, "RESOURCE_FALLBACK_VERIFY_FAILED"),
-    ],
-    ids=["input-missing", "copy-dialog-unreadable", "readback-mismatch"],
-)
-def test_before_save_readback_failures_stop_with_zero_save(monkeypatch, readback, expected_code):
+def test_native_locator_fill_and_tab_are_required(monkeypatch):
+    cap = _stub_login_and_import()
+    page = FillPage()
+
+    assert cap._fill_visible_copy_dialog_input(page, "资源不足中间页链接", EXPECTED) is True
+    assert page.input_locator.calls[0][0:2] == ("fill", EXPECTED)
+    assert page.input_locator.calls[1][0:2] == ("press", "Tab")
+    assert page.marker_cleared is True
+
+
+def test_missing_unique_input_fails_before_native_fill():
+    cap = _stub_login_and_import()
+    page = FillPage(marker_result={"dialog_found": True, "input_found": False})
+
+    assert cap._fill_visible_copy_dialog_input(page, "资源不足中间页链接", EXPECTED) is False
+    assert page.input_locator.calls == []
+
+
+def test_model_unreadable_stops_with_zero_save(monkeypatch):
     cap = _stub_login_and_import()
     page = StagePage()
     _prepare_stage(monkeypatch, cap, page)
-    monkeypatch.setattr(cap, "_js_fill", lambda *args, **kwargs: True)
-    monkeypatch.setattr(cap, "_read_visible_copy_dialog_input", lambda *args, **kwargs: readback)
+    monkeypatch.setattr(cap, "_read_visible_copy_dialog_input", lambda *args, **kwargs: _readback(model_found=False, model_value=""))
 
-    result = cap._stage_create_save(
-        page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type"
-    )
-
-    assert result["success"] is False
-    assert result["error"]["code"] == expected_code
-    assert result["error"]["stage"] == "FILL"
-    assert page.save_clicks == 0
-
-
-def test_js_fill_false_stops_with_zero_save(monkeypatch):
-    cap = _stub_login_and_import()
-    page = StagePage()
-    _prepare_stage(monkeypatch, cap, page)
-    monkeypatch.setattr(cap, "_js_fill", lambda *args, **kwargs: False)
-
-    result = cap._stage_create_save(
-        page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type"
-    )
+    result = cap._stage_create_save(page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type")
 
     assert result["success"] is False
     assert result["error"]["code"] == "RESOURCE_FALLBACK_VERIFY_FAILED"
@@ -139,26 +157,97 @@ def test_js_fill_false_stops_with_zero_save(monkeypatch):
     assert page.save_clicks == 0
 
 
-def test_normal_fill_and_exact_readback_passes(monkeypatch):
+def test_model_dom_mismatch_stops_with_zero_save(monkeypatch):
     cap = _stub_login_and_import()
-    page = DialogPage({"dialog_found": True, "input_found": True, "value": EXPECTED})
-    monkeypatch.setattr(cap, "_js_fill", lambda *args, **kwargs: True)
+    page = StagePage()
+    _prepare_stage(monkeypatch, cap, page)
+    monkeypatch.setattr(cap, "_read_visible_copy_dialog_input", lambda *args, **kwargs: _readback(model_value="different"))
+
+    result = cap._stage_create_save(page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type")
+
+    assert result["success"] is False
+    assert result["error"]["stage"] == "FILL"
+    assert page.save_clicks == 0
+
+
+def test_tab_round_trip_value_loss_stops_with_zero_save(monkeypatch):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    _prepare_stage(monkeypatch, cap, page)
+    reads = iter([_readback(), _readback(value="", model_value="")])
+    monkeypatch.setattr(cap, "_read_visible_copy_dialog_input", lambda *args, **kwargs: next(reads))
+
+    result = cap._stage_create_save(page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type")
+
+    assert result["success"] is False
+    assert result["error"]["stage"] == "FILL"
+    assert page.save_clicks == 0
+
+
+def test_normal_native_fill_model_and_tab_round_trip_pass(monkeypatch):
+    cap = _stub_login_and_import()
+    page = FillPage()
+    monkeypatch.setattr(cap, "_read_visible_copy_dialog_input", lambda *args, **kwargs: _readback())
+    monkeypatch.setattr(cap, "_go_tab", lambda *args, **kwargs: True)
 
     result = cap._fill_and_verify_resource_fallback(page, EXPECTED)
 
     assert result == {"success": True}
+    assert [call[0] for call in page.input_locator.calls] == ["fill", "press"]
+
+
+def _post_setup(monkeypatch, cap, *, identity=None, reads=None):
+    monkeypatch.setattr(cap, "_open_copy_dialog_by_app_id", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_go_tab", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_close_copy_dialog_after_verify", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_verify_persisted_dialog_identity", lambda *args, **kwargs: identity or {"success": True})
+    if reads is not None:
+        iterator = iter(reads)
+        monkeypatch.setattr(cap, "_verify_resource_fallback_readback", lambda *args, **kwargs: next(iterator))
+
+
+def test_post_save_delayed_readback_requires_two_stable_matches(monkeypatch):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    waits = []
+    page.wait_for_timeout = lambda milliseconds: waits.append(milliseconds)
+    fail = {"success": False, "error": cap.err("RESOURCE_FALLBACK_VERIFY_FAILED", "VERIFY", "mismatch", cap.NEXT_MANUAL)}
+    _post_setup(monkeypatch, cap, reads=[fail, {"success": True}, {"success": True}])
+
+    result = cap._verify_persisted_resource_fallback(page, "new-id", EXPECTED, "demo", "channel-a")
+
+    assert result == {"success": True}
+    assert waits == [cap._POST_SAVE_FALLBACK_POLL_MS, cap._POST_SAVE_FALLBACK_POLL_MS]
     assert page.save_clicks == 0
 
 
-@pytest.mark.parametrize(
-    "post_error",
-    [
-        "保存后资源不足中间页链接回读不一致，已停止",
-        "保存后资源不足中间页链接控件不可读取，已停止",
-    ],
-    ids=["value-lost", "unverifiable"],
-)
-def test_post_save_fallback_failure_never_returns_success(monkeypatch, post_error):
+def test_post_save_identity_mismatch_is_never_success(monkeypatch):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    mismatch = {"success": False, "error": cap.err("RESOURCE_FALLBACK_VERIFY_FAILED", "VERIFY", "identity mismatch", cap.NEXT_MANUAL)}
+    _post_setup(monkeypatch, cap, identity=mismatch)
+
+    result = cap._verify_persisted_resource_fallback(page, "new-id", EXPECTED, "demo", "channel-a")
+
+    assert result["success"] is False
+    assert result["error"]["stage"] == "VERIFY"
+    assert page.save_clicks == 0
+
+
+def test_post_save_empty_value_never_returns_success(monkeypatch):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    fail = {"success": False, "error": cap.err("RESOURCE_FALLBACK_VERIFY_FAILED", "VERIFY", "empty", cap.NEXT_MANUAL)}
+    _post_setup(monkeypatch, cap, reads=[fail] * cap._POST_SAVE_FALLBACK_POLL_ATTEMPTS)
+
+    result = cap._verify_persisted_resource_fallback(page, "new-id", EXPECTED, "demo", "channel-a")
+
+    assert result["success"] is False
+    assert result["error"]["stage"] == "VERIFY"
+    assert page.save_clicks == 0
+
+
+def test_post_save_failure_marks_stage_as_may_have_saved(monkeypatch):
     cap = _stub_login_and_import()
     page = StagePage()
     _prepare_stage(monkeypatch, cap, page)
@@ -166,100 +255,39 @@ def test_post_save_fallback_failure_never_returns_success(monkeypatch, post_erro
     monkeypatch.setattr(cap, "capture_page_errors", lambda *args, **kwargs: {"dialog_open": False})
     monkeypatch.setattr(cap, "_identify_new_app", lambda *args, **kwargs: {"success": True, "app_id": "new-id"})
     monkeypatch.setattr(cap, "_find_target_row_by_id", lambda *args, **kwargs: {"found": True, "row_idx": 0})
-    monkeypatch.setattr(
-        cap,
-        "_verify_persisted_resource_fallback",
-        lambda *args, **kwargs: {
-            "success": False,
-            "error": cap.err("RESOURCE_FALLBACK_VERIFY_FAILED", "VERIFY", post_error, cap.NEXT_MANUAL),
-        },
-    )
+    monkeypatch.setattr(cap, "_verify_persisted_resource_fallback", lambda *args, **kwargs: {"success": False, "error": cap.err("RESOURCE_FALLBACK_VERIFY_FAILED", "VERIFY", "empty", cap.NEXT_MANUAL)})
 
-    result = cap._stage_create_save(
-        page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type"
-    )
+    result = cap._stage_create_save(page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type")
 
     assert result["success"] is False
-    assert result["error"]["code"] == "RESOURCE_FALLBACK_VERIFY_FAILED"
-    assert result["error"]["stage"] == "VERIFY"
     assert result["save_may_have_occurred"] is True
     assert page.save_clicks == 1
 
 
-def test_post_save_dialog_failure_is_not_success(monkeypatch):
-    cap = _stub_login_and_import()
-    page = StagePage()
-    monkeypatch.setattr(cap, "_open_copy_dialog_by_app_id", lambda *args, **kwargs: False)
+def test_action_api_exposes_declared_unknown_to_http_runner():
+    _stub_login_and_import()
+    from app.executor.actions import api
 
-    result = cap._verify_persisted_resource_fallback(page, "new-id", EXPECTED)
+    stripped = api._strip({
+        "business_status": "UNKNOWN",
+        "data": {},
+        "error": {"code": "RESOURCE_FALLBACK_VERIFY_FAILED", "stage": "VERIFY", "next_action": "MANUAL_CHECK"},
+    })
 
-    assert result["success"] is False
-    assert result["error"]["code"] == "RESOURCE_FALLBACK_VERIFY_FAILED"
-    assert result["error"]["stage"] == "VERIFY"
-    assert page.save_clicks == 0
-
-
-def test_post_save_exact_readback_passes_without_save(monkeypatch):
-    cap = _stub_login_and_import()
-    page = StagePage()
-    opened = []
-    monkeypatch.setattr(
-        cap, "_open_copy_dialog_by_app_id", lambda _page, app_id: opened.append(app_id) or True
-    )
-    monkeypatch.setattr(cap, "_go_tab", lambda *args, **kwargs: True)
-    monkeypatch.setattr(cap, "_close_copy_dialog_after_verify", lambda *args, **kwargs: True)
-    monkeypatch.setattr(
-        cap, "_verify_resource_fallback_readback", lambda *args, **kwargs: {"success": True}
-    )
-
-    result = cap._verify_persisted_resource_fallback(page, "new-id", EXPECTED)
-
-    assert result == {"success": True}
-    assert opened == ["new-id"]
-    assert page.save_clicks == 0
+    assert stripped["success"] is False
+    assert stripped["business_status"] == "UNKNOWN"
 
 
-def test_post_save_value_mismatch_fails_after_readonly_open(monkeypatch):
-    cap = _stub_login_and_import()
-    page = StagePage()
-    monkeypatch.setattr(cap, "_open_copy_dialog_by_app_id", lambda *args, **kwargs: True)
-    monkeypatch.setattr(cap, "_go_tab", lambda *args, **kwargs: True)
-    monkeypatch.setattr(cap, "_close_copy_dialog_after_verify", lambda *args, **kwargs: True)
-    monkeypatch.setattr(
-        cap,
-        "_verify_resource_fallback_readback",
-        lambda *args, **kwargs: {
-            "success": False,
-            "error": cap.err(
-                "RESOURCE_FALLBACK_VERIFY_FAILED", "VERIFY", "资源不足中间页链接回读不一致，已停止", cap.NEXT_MANUAL
-            ),
-        },
-    )
+def test_http_failure_mapping_preserves_declared_unknown():
+    from app.http_executor.real_runner import map_real_failure
 
-    result = cap._verify_persisted_resource_fallback(page, "new-id", EXPECTED)
+    state, business, data, error = map_real_failure({
+        "business_status": "UNKNOWN",
+        "next_action": "MANUAL_CHECK",
+        "error_code": "RESOURCE_FALLBACK_VERIFY_FAILED",
+        "error_stage": "VERIFY",
+    })
 
-    assert result["success"] is False
-    assert result["error"]["stage"] == "VERIFY"
-    assert page.save_clicks == 0
-
-
-def test_post_save_unready_dialog_fails_and_closes(monkeypatch):
-    cap = _stub_login_and_import()
-
-    class UnreadyPage(StagePage):
-        def wait_for_selector(self, *args, **kwargs):
-            raise RuntimeError("dialog unavailable")
-
-    page = UnreadyPage()
-    close_calls = []
-    monkeypatch.setattr(cap, "_open_copy_dialog_by_app_id", lambda *args, **kwargs: True)
-    monkeypatch.setattr(
-        cap, "_close_copy_dialog_after_verify", lambda *args, **kwargs: close_calls.append(True) or True
-    )
-
-    result = cap._verify_persisted_resource_fallback(page, "new-id", EXPECTED)
-
-    assert result["success"] is False
-    assert result["error"]["stage"] == "VERIFY"
-    assert close_calls == [True]
-    assert page.save_clicks == 0
+    assert (state, business) == ("UNKNOWN", "UNKNOWN")
+    assert data["failed_stage"] == "VERIFY"
+    assert error["error_code"] == "RESOURCE_FALLBACK_VERIFY_FAILED"

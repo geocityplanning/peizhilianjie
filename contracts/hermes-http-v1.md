@@ -141,7 +141,7 @@ Content-Type: application/json
 | `input.business_object` | 应用名称 | 中国移动云盘、中国移动等；不是业务对象和活动名称的拼接值 |
 | `input.actual_channel_name` | 实际渠道名称 | 来自创建渠道接口返回的 `data.actual_channel_name`，不是直接取 Excel |
 | `input.jump_address` | 应用配置调起路径/跳转地址 | Excel 中的跳转地址字段 |
-| `input.resource_fallback_page` | 资源不足兜底页 | Excel 中的资源兜底页字段；必填。执行端仅在当前可见复制对话框中精确填写并回读一致、保存后按新增应用 ID 重新打开对话框再次回读一致时才可返回成功。 |
+| `input.resource_fallback_page` | 资源不足兜底页 | Excel 中的资源兜底页字段；必填。执行端仅在唯一可见复制对话框中以原生输入填写、框架组件 value/model 回读一致且切换页签往返后仍一致，并在保存后按新增应用 ID 重新打开对话框、核验应用名/渠道身份及两次稳定回读一致时才可返回成功。 |
 | `input.settlement_type` | 结算类型 | Excel 中的结算类型字段 |
 | `input.group_name` | 应用上线后的分组，可选 | 有值时例如 `10086`；省略或为空时不修改复制件原分组 |
 | `input.ref_cloud_app_link` | 复制源应用的长链接 | Excel 中的参考应用长链接/复制源长链接，可选 |
@@ -164,7 +164,7 @@ Content-Type: application/json
 }
 ```
 
-保存后资源不足兜底页无法重新打开、页签/控件不可核验、回读不一致或验证对话框无法确认关闭时，执行端返回现有错误信封：`code=RESOURCE_FALLBACK_VERIFY_FAILED`、`stage=VERIFY`、`next_action=MANUAL_CHECK`；该次保存可能已发生，业务状态为 `UNKNOWN`，不得更换幂等键重建，只能人工核验原单。
+保存后资源不足兜底页无法重新打开、对象身份/页签/控件不可核验、两次稳定回读不一致或验证对话框无法确认关闭时，执行端返回现有错误信封：`code=RESOURCE_FALLBACK_VERIFY_FAILED`、`stage=VERIFY`、`next_action=MANUAL_CHECK`；该次保存可能已发生，业务状态在 HTTP 原单中也必须保持 `UNKNOWN`，不得更换幂等键重建，只能人工核验原单。
 
 ### 应用执行结果字段
 

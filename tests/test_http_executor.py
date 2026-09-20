@@ -293,6 +293,29 @@ def test_create_app_maps_exact_real_result_fields(tmp_path: Path):
     assert calls[0][1]["ref_cloud_app_link"].endswith("KWcMvfaFlhw=")
 
 
+def test_create_app_preserves_real_unknown_business_status(tmp_path: Path):
+    def caller(name, **kwargs):
+        assert name == "create_app"
+        return {
+            "success": False,
+            "business_status": "UNKNOWN",
+            "error_code": "RESOURCE_FALLBACK_VERIFY_FAILED",
+            "error_stage": "VERIFY",
+            "next_action": "MANUAL_CHECK",
+            "message": "保存后核验未通过",
+        }
+
+    with make_client(tmp_path, real_caller=caller) as client:
+        response = client.post("/v1/exec/create-app", headers=HEADERS, json=app_request())
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["state"] == "UNKNOWN"
+    assert body["status"] == "UNKNOWN"
+    assert body["adjudicated"] is False
+    assert body["error"]["error_code"] == "RESOURCE_FALLBACK_VERIFY_FAILED"
+
+
 def test_request_schema_and_operation_input_are_strict(tmp_path: Path):
     body_version = channel_request()
     body_version["contract_version"] = "http-executor.v1"
