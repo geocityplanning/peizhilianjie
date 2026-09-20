@@ -106,9 +106,9 @@ def _available_tabs(page):
 
 def _go_tab(page, name):
     """Activate and prove the target tab in the one genuinely visible dialog."""
-    deadline = time.monotonic() + 6
+    discovery_deadline = time.monotonic() + 6
     last_tabs = []
-    while time.monotonic() < deadline:
+    while time.monotonic() < discovery_deadline:
         last_tabs = _available_tabs(page)
         if last_tabs:
             break
@@ -137,10 +137,17 @@ def _go_tab(page, name):
         # Element-UI does not reliably react to HTMLElement.click() in this dialog;
         # use a real pointer click, then prove both tab and its mapped pane changed.
         tabs.nth(target_indexes[0]).click(timeout=STEP_TIMEOUT)
-    except Exception:
-        print(f"[create_app] WARN: 可见Tab '{name}' 无法物理点击")
+    except Exception as exc:
+        print(
+            f"[create_app] WARN: 可见Tab '{name}' 无法物理点击 "
+            f"reason=physical_click_exception exception_type={type(exc).__name__}"
+        )
         return False
-    while time.monotonic() < deadline:
+    # Physical click may consume most of the discovery budget.  Activation must
+    # always receive its own bounded observation window, rather than silently
+    # performing zero post-click checks against the earlier deadline.
+    activation_deadline = time.monotonic() + 6
+    while time.monotonic() < activation_deadline:
         active = page.evaluate("""
         (tabName) => {
           const visible = el => {
@@ -168,7 +175,7 @@ def _go_tab(page, name):
         if active:
             return True
         page.wait_for_timeout(150)
-    print(f"[create_app] WARN: Tab '{name}' 未激活")
+    print(f"[create_app] WARN: Tab '{name}' 未激活 reason=activation_evidence_timeout")
     return False
 
 

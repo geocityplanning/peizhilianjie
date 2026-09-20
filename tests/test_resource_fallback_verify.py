@@ -221,6 +221,50 @@ def test_go_tab_requires_visible_dialog_and_active_target_tab():
     assert "pane.getAttribute('aria-hidden') === 'true'" in source
 
 
+def test_go_tab_gives_activation_proof_a_fresh_budget_after_physical_click(monkeypatch):
+    cap = _stub_login_and_import()
+    clock = [0.0]
+
+    class Tab:
+        def inner_text(self):
+            return "基础配置"
+        def click(self, timeout):
+            # Exceeds the old shared six-second deadline, but is within the
+            # physical-click timeout and must not suppress post-click proof.
+            clock[0] += 6.1
+
+    class Tabs:
+        def count(self):
+            return 1
+        def nth(self, index):
+            return Tab()
+
+    class Dialog:
+        def is_visible(self):
+            return True
+        def locator(self, selector):
+            return Tabs()
+
+    class Wrappers:
+        def count(self):
+            return 1
+        def nth(self, index):
+            return Dialog()
+
+    class Page:
+        def locator(self, selector):
+            return Wrappers()
+        def evaluate(self, script, payload=None):
+            if "return Array.from(dialogs[0].querySelectorAll('.el-tabs__item'))" in script:
+                return ["基础配置"]
+            return True
+        def wait_for_timeout(self, milliseconds):
+            clock[0] += milliseconds / 1000
+
+    monkeypatch.setattr(cap.time, "monotonic", lambda: clock[0])
+    assert cap._go_tab(Page(), "基础配置") is True
+
+
 def test_native_locator_fill_and_tab_are_required(monkeypatch):
     cap = _stub_login_and_import()
     page = FillPage()
