@@ -247,6 +247,88 @@ def test_post_save_empty_value_never_returns_success(monkeypatch):
     assert page.save_clicks == 0
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"code": "SAVE_FAILED", "stage": "SAVE", "message": "dialog open", "next_action": "MANUAL_CHECK"},
+        {"code": "NEW_APP_ID_AMBIGUOUS", "stage": "VERIFY", "message": "ambiguous", "next_action": "MANUAL_CHECK"},
+        {"code": "NEW_APP_ID_NOT_FOUND", "stage": "VERIFY", "message": "not found", "next_action": "MANUAL_CHECK"},
+    ],
+)
+def test_post_save_unconfirmed_failures_preserve_unknown_through_http(error):
+    cap = _stub_login_and_import()
+    from app.http_executor.real_runner import map_real_failure
+
+    result = cap._post_save_unconfirmed_failure(error)
+    state, business, _, envelope_error = map_real_failure({
+        "business_status": cap._create_failure_business_status(result),
+        "error_code": result["error"]["code"],
+        "error_stage": result["error"]["stage"],
+        "next_action": result["error"]["next_action"],
+    })
+
+    assert result["success"] is False
+    assert result["save_may_have_occurred"] is True
+    assert result["error"]["code"] == error["code"]
+    assert result["error"]["stage"] == error["stage"]
+    assert result["error"]["next_action"] == cap.NEXT_QUERY
+    assert cap._create_failure_business_status(result) == cap.ex.BIZ_UNKNOWN
+    assert (state, business) == ("UNKNOWN", "UNKNOWN")
+    assert envelope_error["next_action"] == cap.NEXT_QUERY
+    assert envelope_error["error_code"] == error["code"]
+
+
+def test_save_dialog_still_open_after_click_is_unknown(monkeypatch):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    _prepare_stage(monkeypatch, cap, page)
+    monkeypatch.setattr(cap, "_fill_and_verify_resource_fallback", lambda *args, **kwargs: {"success": True})
+    monkeypatch.setattr(cap, "capture_page_errors", lambda *args, **kwargs: {"dialog_open": True})
+
+    result = cap._stage_create_save(page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type")
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "SAVE_FAILED"
+    assert result["error"]["next_action"] == cap.NEXT_QUERY
+    assert result["save_may_have_occurred"] is True
+    assert page.save_clicks == 1
+
+
+def test_post_save_ambiguous_new_id_is_unknown(monkeypatch):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    _prepare_stage(monkeypatch, cap, page)
+    monkeypatch.setattr(cap, "_fill_and_verify_resource_fallback", lambda *args, **kwargs: {"success": True})
+    monkeypatch.setattr(cap, "capture_page_errors", lambda *args, **kwargs: {"dialog_open": False})
+    monkeypatch.setattr(cap, "_identify_new_app", lambda *args, **kwargs: {"success": False, "error": cap.err("NEW_APP_ID_AMBIGUOUS", "VERIFY", "ambiguous", cap.NEXT_MANUAL)})
+
+    result = cap._stage_create_save(page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type")
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "NEW_APP_ID_AMBIGUOUS"
+    assert result["error"]["next_action"] == cap.NEXT_QUERY
+    assert result["save_may_have_occurred"] is True
+    assert page.save_clicks == 1
+
+
+def test_post_save_id_relocation_failure_is_unknown(monkeypatch):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    _prepare_stage(monkeypatch, cap, page)
+    monkeypatch.setattr(cap, "_fill_and_verify_resource_fallback", lambda *args, **kwargs: {"success": True})
+    monkeypatch.setattr(cap, "capture_page_errors", lambda *args, **kwargs: {"dialog_open": False})
+    monkeypatch.setattr(cap, "_identify_new_app", lambda *args, **kwargs: {"success": True, "app_id": "new-id"})
+    monkeypatch.setattr(cap, "_find_target_row_by_id", lambda *args, **kwargs: {"found": False, "reason": "channel_unverified"})
+
+    result = cap._stage_create_save(page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type")
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "CHANNEL_UNVERIFIED"
+    assert result["error"]["next_action"] == cap.NEXT_QUERY
+    assert result["save_may_have_occurred"] is True
+    assert page.save_clicks == 1
+
+
 def test_post_save_failure_marks_stage_as_may_have_saved(monkeypatch):
     cap = _stub_login_and_import()
     page = StagePage()

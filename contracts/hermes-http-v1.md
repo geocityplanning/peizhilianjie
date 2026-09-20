@@ -164,7 +164,7 @@ Content-Type: application/json
 }
 ```
 
-保存后资源不足兜底页无法重新打开、对象身份/页签/控件不可核验、两次稳定回读不一致或验证对话框无法确认关闭时，执行端返回现有错误信封：`code=RESOURCE_FALLBACK_VERIFY_FAILED`、`stage=VERIFY`、`next_action=MANUAL_CHECK`；该次保存可能已发生，业务状态在 HTTP 原单中也必须保持 `UNKNOWN`，不得更换幂等键重建，只能人工核验原单。
+从保存按钮成功点击开始，若对话框未关闭、新应用 ID 无法唯一确认、按 ID 定位失败、资源不足兜底页无法重新打开、对象身份/页签/控件不可核验、两次稳定回读不一致或验证对话框无法确认关闭，执行端均保留原错误码和阶段、返回 `next_action=QUERY`，并使 HTTP 原单保持 `UNKNOWN` / `UNKNOWN` / `adjudicated=false`。不得更换幂等键重建，只能查询或人工核验原单。保存点击前的失败仍是普通失败，不被扩张为 UNKNOWN。
 
 ### 应用执行结果字段
 

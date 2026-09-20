@@ -919,6 +919,19 @@ def _set_stage(execution_id, stage):
         pass
 
 
+def _post_save_unconfirmed_failure(error):
+    """Once Save clicked, preserve uncertainty and prohibit a fresh create."""
+    return {
+        "success": False,
+        "error": {**(error or {}), "next_action": NEXT_QUERY},
+        "save_may_have_occurred": True,
+    }
+
+
+def _create_failure_business_status(create_result):
+    return ex.BIZ_UNKNOWN if create_result.get("save_may_have_occurred") else ex.BIZ_FAILED
+
+
 def _open_group_dialog(page, row_idx):
     return page.evaluate("""
     (rowIdx) => {
@@ -2732,7 +2745,9 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
     _shot(page, "06_after_save")
     save_err = capture_page_errors(page, screenshot_name=f"app_save_{app_name}")
     if save_err["dialog_open"]:
-        return {"success": False, "error": err("SAVE_FAILED", "SAVE", build_error_message(save_err, "保存失败(对话框未关闭)"), NEXT_MANUAL)}
+        return _post_save_unconfirmed_failure(
+            err("SAVE_FAILED", "SAVE", build_error_message(save_err, "保存失败(对话框未关闭)"), NEXT_MANUAL)
+        )
 
     # 保存后不按应用名称定位；通过前后快照得到的新 ID 继续定位。
     try:
@@ -2743,7 +2758,7 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
     _set_stage(execution_id, "正在识别新增应用ID")
     identified = _identify_new_app(page, before_ids, data["actual_channel_name"], app_name)
     if not identified["success"]:
-        return identified
+        return _post_save_unconfirmed_failure(identified["error"])
     target_app_id = identified["app_id"]
     located = _find_target_row_by_id(page, target_app_id, data["actual_channel_name"])
     if not located.get("found"):
@@ -2757,10 +2772,9 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
         else:
             location_code = "NEW_APP_ID_NOT_FOUND"
             location_message = f"已识别新增应用ID={target_app_id}，但无法按ID重新定位"
-        return {
-            "success": False,
-            "error": err(location_code, "VERIFY", location_message, NEXT_MANUAL),
-        }
+        return _post_save_unconfirmed_failure(
+            err(location_code, "VERIFY", location_message, NEXT_MANUAL)
+        )
     fallback_persisted = _verify_persisted_resource_fallback(
         page,
         target_app_id,
@@ -2769,11 +2783,7 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
         data["actual_channel_name"],
     )
     if not fallback_persisted["success"]:
-        return {
-            "success": False,
-            "error": fallback_persisted["error"],
-            "save_may_have_occurred": True,
-        }
+        return _post_save_unconfirmed_failure(fallback_persisted["error"])
     _shot(page, "07_created")
     return {"success": True, "target_app_id": target_app_id}
 
@@ -3254,10 +3264,11 @@ def execute_create_app(request: dict) -> dict:
             settlement_type,
         )
         if not create_result["success"]:
-            business_status = (
-                ex.BIZ_UNKNOWN if create_result.get("save_may_have_occurred") else ex.BIZ_FAILED
+            return finish_failure(
+                create_result["error"],
+                current_stage,
+                _create_failure_business_status(create_result),
             )
-            return finish_failure(create_result["error"], current_stage, business_status)
         target_app_id = create_result["target_app_id"]
         completed_stages.append(current_stage)
 
