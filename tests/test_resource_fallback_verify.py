@@ -93,6 +93,28 @@ class StagePage:
         return True
 
 
+class MainTablePage:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def evaluate(self, *args, **kwargs):
+        return self.payload
+
+
+def _main_payload(*rows, headers=("ID", "应用名称", "所属渠道"), table_count=1):
+    return {
+        "main_table_count": table_count,
+        "headers": [{"text": header, "classes": ""} for header in headers],
+        "rows": [
+            {
+                "row_idx": index,
+                "cells": [{"text": value, "classes": ""} for value in row],
+            }
+            for index, row in enumerate(rows)
+        ],
+    }
+
+
 def _readback(value=EXPECTED, *, model_value=EXPECTED, model_found=True, input_found=True):
     return {
         "dialog_found": True,
@@ -196,14 +218,58 @@ def test_normal_native_fill_model_and_tab_round_trip_pass(monkeypatch):
     assert [call[0] for call in page.input_locator.calls] == ["fill", "press"]
 
 
-def _post_setup(monkeypatch, cap, *, identity=None, reads=None):
+def _post_setup(monkeypatch, cap, *, main_identity=None, reads=None):
+    monkeypatch.setattr(cap, "_verify_persisted_main_row_identity", lambda *args, **kwargs: main_identity or {"success": True, "row_idx": 0})
     monkeypatch.setattr(cap, "_open_copy_dialog_by_app_id", lambda *args, **kwargs: True)
     monkeypatch.setattr(cap, "_go_tab", lambda *args, **kwargs: True)
     monkeypatch.setattr(cap, "_close_copy_dialog_after_verify", lambda *args, **kwargs: True)
-    monkeypatch.setattr(cap, "_verify_persisted_dialog_identity", lambda *args, **kwargs: identity or {"success": True})
     if reads is not None:
         iterator = iter(reads)
         monkeypatch.setattr(cap, "_verify_resource_fallback_readback", lambda *args, **kwargs: next(iterator))
+
+
+def test_post_save_main_row_three_anchors_match():
+    cap = _stub_login_and_import()
+    page = MainTablePage(_main_payload(("new-id", "demo", "channel-a")))
+
+    result = cap._verify_persisted_main_row_identity(page, "new-id", "demo", "channel-a")
+
+    assert result == {"success": True, "row_idx": 0}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _main_payload(("new-id", "other-name", "channel-a")),
+        _main_payload(("new-id", "demo", "other-channel")),
+        _main_payload(("new-id", "demo", "channel-a"), ("new-id", "demo", "channel-a")),
+        _main_payload(("new-id", "channel-a"), headers=("ID", "所属渠道")),
+        _main_payload(("demo", "channel-a"), headers=("应用名称", "所属渠道")),
+        _main_payload(("new-id", "demo"), headers=("ID", "应用名称", "所属渠道")),
+        _main_payload(("new-id", "demo", "channel-a"), table_count=2),
+    ],
+)
+def test_post_save_main_row_missing_ambiguous_or_mismatched_anchor_fails(payload):
+    cap = _stub_login_and_import()
+
+    result = cap._verify_persisted_main_row_identity(
+        MainTablePage(payload), "new-id", "demo", "channel-a"
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "RESOURCE_FALLBACK_VERIFY_FAILED"
+    assert result["error"]["stage"] == "VERIFY"
+
+
+def test_post_save_copy_dialog_default_identity_does_not_block_fallback_readback(monkeypatch):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    _post_setup(monkeypatch, cap, reads=[{"success": True}, {"success": True}])
+
+    result = cap._verify_persisted_resource_fallback(page, "new-id", EXPECTED, "demo", "channel-a")
+
+    assert result == {"success": True}
+    assert page.save_clicks == 0
 
 
 def test_post_save_delayed_readback_requires_two_stable_matches(monkeypatch):
@@ -221,11 +287,11 @@ def test_post_save_delayed_readback_requires_two_stable_matches(monkeypatch):
     assert page.save_clicks == 0
 
 
-def test_post_save_identity_mismatch_is_never_success(monkeypatch):
+def test_post_save_main_identity_mismatch_is_never_success(monkeypatch):
     cap = _stub_login_and_import()
     page = StagePage()
     mismatch = {"success": False, "error": cap.err("RESOURCE_FALLBACK_VERIFY_FAILED", "VERIFY", "identity mismatch", cap.NEXT_MANUAL)}
-    _post_setup(monkeypatch, cap, identity=mismatch)
+    _post_setup(monkeypatch, cap, main_identity=mismatch)
 
     result = cap._verify_persisted_resource_fallback(page, "new-id", EXPECTED, "demo", "channel-a")
 
@@ -343,6 +409,8 @@ def test_post_save_failure_marks_stage_as_may_have_saved(monkeypatch):
 
     assert result["success"] is False
     assert result["save_may_have_occurred"] is True
+    assert result["error"]["next_action"] == cap.NEXT_QUERY
+    assert cap._create_failure_business_status(result) == cap.ex.BIZ_UNKNOWN
     assert page.save_clicks == 1
 
 

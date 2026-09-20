@@ -141,7 +141,7 @@ Content-Type: application/json
 | `input.business_object` | 应用名称 | 中国移动云盘、中国移动等；不是业务对象和活动名称的拼接值 |
 | `input.actual_channel_name` | 实际渠道名称 | 来自创建渠道接口返回的 `data.actual_channel_name`，不是直接取 Excel |
 | `input.jump_address` | 应用配置调起路径/跳转地址 | Excel 中的跳转地址字段 |
-| `input.resource_fallback_page` | 资源不足兜底页 | Excel 中的资源兜底页字段；必填。执行端仅在唯一可见复制对话框中以原生输入填写、框架组件 value/model 回读一致且切换页签往返后仍一致，并在保存后按新增应用 ID 重新打开对话框、核验应用名/渠道身份及两次稳定回读一致时才可返回成功。 |
+| `input.resource_fallback_page` | 资源不足兜底页 | Excel 中的资源兜底页字段；必填。执行端仅在唯一可见复制对话框中以原生输入填写、框架组件 value/model 回读一致且切换页签往返后仍一致；保存后须先在唯一主表同一行精确核验新增应用 ID、应用名、渠道三锚，再从该行打开复制对话框，对兜底字段执行两次稳定 DOM/model 回读一致时才可返回成功。复制表单的应用名/渠道不作为持久化身份锚。 |
 | `input.settlement_type` | 结算类型 | Excel 中的结算类型字段 |
 | `input.group_name` | 应用上线后的分组，可选 | 有值时例如 `10086`；省略或为空时不修改复制件原分组 |
 | `input.ref_cloud_app_link` | 复制源应用的长链接 | Excel 中的参考应用长链接/复制源长链接，可选 |
@@ -164,7 +164,7 @@ Content-Type: application/json
 }
 ```
 
-从保存按钮成功点击开始，若对话框未关闭、新应用 ID 无法唯一确认、按 ID 定位失败、资源不足兜底页无法重新打开、对象身份/页签/控件不可核验、两次稳定回读不一致或验证对话框无法确认关闭，执行端均保留原错误码和阶段、返回 `next_action=QUERY`，并使 HTTP 原单保持 `UNKNOWN` / `UNKNOWN` / `adjudicated=false`。不得更换幂等键重建，只能查询或人工核验原单。保存点击前的失败仍是普通失败，不被扩张为 UNKNOWN。
+从保存按钮成功点击开始，若对话框未关闭、新应用 ID 无法唯一确认、主表 ID/应用名/渠道三锚不可读或不匹配、无法从已核验主表行打开复制对话框、资源不足兜底页不可核验、两次稳定回读不一致或验证对话框无法确认关闭，执行端均保留原错误码和阶段、返回 `next_action=QUERY`，并使 HTTP 原单保持 `UNKNOWN` / `UNKNOWN` / `adjudicated=false`。不得更换幂等键重建，只能查询或人工核验原单。保存点击前的失败仍是普通失败，不被扩张为 UNKNOWN。
 
 ### 应用执行结果字段
 

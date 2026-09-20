@@ -349,26 +349,60 @@ def _fill_and_verify_resource_fallback(page, expected):
     return _verify_resource_fallback_readback(page, expected, "FILL", "before_save_tab_round_trip")
 
 
-def _open_copy_dialog_by_app_id(page, app_id):
-    """Open Copy for an exact ID from the unique visible main table only."""
+def _verify_persisted_main_row_identity(page, app_id, expected_app_name, expected_channel_name):
+    """Prove all persisted identity anchors in the unique visible main-table row."""
+    try:
+        payload = page.evaluate(_MAIN_LIST_COLLECT_JS, True) or {}
+    except Exception:
+        payload = {}
+    if payload.get("main_table_count") != 1:
+        return {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后主表不可唯一读取，已停止")}
+
+    expected_id = str(app_id or "").strip()
+    expected_name = (expected_app_name or "").strip()
+    expected_channel = (expected_channel_name or "").strip()
+    headers = payload.get("headers") or []
+    candidates = []
+    for row in payload.get("rows") or []:
+        aligned = _align_header_cells(headers, row.get("cells") or [])
+        if not aligned or _mapped_value(aligned, _is_app_id_header) != expected_id:
+            continue
+        candidates.append((row, aligned))
+    if len(candidates) != 1:
+        return {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后主表应用ID不可唯一核验，已停止")}
+
+    row, aligned = candidates[0]
+    observed_name = _mapped_value(aligned, _is_app_name_header)
+    observed_channel = _mapped_value(aligned, _is_channel_name_header)
+    id_matches = bool(expected_id)
+    name_matches = bool(expected_name) and observed_name == expected_name
+    channel_matches = bool(expected_channel) and observed_channel == expected_channel
+    print(
+        "[create_app] 保存后主表三锚核验: "
+        f"id_matches={id_matches} app_name_present={bool(observed_name)} "
+        f"app_name_matches={name_matches} channel_present={bool(observed_channel)} "
+        f"channel_matches={channel_matches}"
+    )
+    if not (id_matches and name_matches and channel_matches):
+        return {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后主表应用ID、应用名或渠道身份回读不一致，已停止")}
+    return {"success": True, "row_idx": row.get("row_idx")}
+
+
+def _open_copy_dialog_by_app_id(page, app_id, verified_row_idx):
+    """Open Copy only from the already verified exact main-table row."""
     try:
         return bool(page.evaluate(
             """
-            (appId) => {
+            ({appId, rowIdx}) => {
               const visible = (el) => Boolean(el) && el.offsetParent !== null;
               const inDialog = (el) => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
-              const utility = (el) => /el-table__expand-column|el-table-column--selection|\\bgutter\\b/.test(
-                String(el.className || '')
-              );
-              const tables = Array.from(document.querySelectorAll('.el-table')).filter(
-                table => visible(table) && !inDialog(table)
-              );
-              if (tables.length !== 1) return false;
+              const utility = (el) => /el-table__expand-column|el-table-column--selection|\\bgutter\\b/.test(String(el.className || ''));
+              const tables = Array.from(document.querySelectorAll('.el-table')).filter(table => visible(table) && !inDialog(table));
+              if (tables.length !== 1 || !Number.isInteger(rowIdx)) return false;
               const table = tables[0];
               const headerNodes = table.querySelectorAll('.el-table__header-wrapper th');
               const fallbackHeaders = table.querySelectorAll('th');
-              const headers = Array.from(headerNodes.length ? headerNodes : fallbackHeaders)
-                .filter(header => !utility(header));
+              const headers = Array.from(headerNodes.length ? headerNodes : fallbackHeaders).filter(header => !utility(header));
               const idIndex = headers.findIndex((header) => {
                 const text = (header.innerText || header.textContent || '').replace(/[ *:：\\s]/g, '').trim();
                 return text === 'ID' || text.includes('应用ID');
@@ -376,23 +410,19 @@ def _open_copy_dialog_by_app_id(page, app_id):
               if (idIndex < 0) return false;
               const bodyRows = table.querySelectorAll('.el-table__body-wrapper tbody tr');
               const sourceRows = bodyRows.length ? bodyRows : table.querySelectorAll('tbody tr');
-              for (const row of sourceRows) {
-                if (!visible(row) || row.classList.contains('el-table__expanded-row')) continue;
-                const cells = Array.from(row.querySelectorAll('td')).filter(cell => !utility(cell));
-                if (cells.length !== headers.length) continue;
-                const id = (cells[idIndex].innerText || cells[idIndex].textContent || '').trim();
-                if (id !== String(appId || '').trim()) continue;
-                const copy = Array.from(row.querySelectorAll('button, a, span')).find(
-                  button => visible(button) && (button.innerText || '').trim() === '复制'
-                );
-                if (!copy) return false;
-                copy.click();
-                return true;
-              }
-              return false;
+              const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
+              const row = rows[rowIdx];
+              if (!row || !visible(row)) return false;
+              const cells = Array.from(row.querySelectorAll('td')).filter(cell => !utility(cell));
+              const id = cells.length === headers.length ? (cells[idIndex].innerText || cells[idIndex].textContent || '').trim() : '';
+              if (id !== String(appId || '').trim()) return false;
+              const copy = Array.from(row.querySelectorAll('button, a, span')).find(button => visible(button) && (button.innerText || '').trim() === '复制');
+              if (!copy) return false;
+              copy.click();
+              return true;
             }
             """,
-            app_id,
+            {"appId": app_id, "rowIdx": verified_row_idx},
         ))
     except Exception:
         return False
@@ -451,64 +481,15 @@ def _close_copy_dialog_after_verify(page):
     return False
 
 
-def _read_visible_copy_dialog_channel_value(page):
-    """Read the selected channel from the only visible copy dialog."""
-    try:
-        result = page.evaluate("""() => {
-          const visible = (el) => {
-            if (!el) return false;
-            const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden') return false;
-            const rect = el.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0;
-          };
-          const dialogs = Array.from(document.querySelectorAll('.el-dialog__wrapper')).filter(
-            dialog => visible(dialog) && dialog.querySelectorAll('.el-tabs__item').length > 0
-          );
-          if (dialogs.length !== 1) return {dialog_found: false, value: ''};
-          for (const item of dialogs[0].querySelectorAll('.el-form-item')) {
-            if (item.offsetParent === null) continue;
-            const label = item.querySelector('.el-form-item__label');
-            const text = (label?.innerText || '').replace(/[ *:：]/g, '').trim();
-            if (text !== '所属渠道' && text !== '渠道') continue;
-            const channel = item.querySelector('.channel-input');
-            const input = channel?.querySelector('input');
-            return {dialog_found: true, value: (input?.value || channel?.innerText || '').trim()};
-          }
-          return {dialog_found: true, value: ''};
-        }""")
-    except Exception:
-        result = None
-    return {
-        "dialog_found": bool(isinstance(result, dict) and result.get("dialog_found")),
-        "value": str(result.get("value") or "") if isinstance(result, dict) else "",
-    }
-
-
-def _verify_persisted_dialog_identity(page, expected_app_name, expected_channel_name):
-    app = _read_visible_copy_dialog_input(page, "应用名称")
-    channel = _read_visible_copy_dialog_channel_value(page)
-    app_matches = bool(app["input_found"]) and app["value"] == (expected_app_name or "").strip()
-    channel_matches = bool(channel["dialog_found"]) and channel["value"] == (expected_channel_name or "").strip()
-    print(
-        "[create_app] 保存后复制对话框身份核验: "
-        f"app_input_found={app['input_found']} app_matches={app_matches} "
-        f"channel_found={channel['dialog_found']} channel_matches={channel_matches}"
-    )
-    if app_matches and channel_matches:
-        return {"success": True}
-    return {
-        "success": False,
-        "error": _resource_fallback_readback_error(
-            "VERIFY", "保存后复制对话框应用名或渠道身份回读不一致，已停止"
-        ),
-    }
-
-
 def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_name, expected_channel_name):
     """Read the exact new app, its identity, and its fallback value with bounded stability."""
-    if not _open_copy_dialog_by_app_id(page, app_id):
-        return {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后无法按新增应用ID打开资源不足中间页链接核验，已停止")}
+    main_identity = _verify_persisted_main_row_identity(
+        page, app_id, expected_app_name, expected_channel_name
+    )
+    if not main_identity["success"]:
+        return main_identity
+    if not _open_copy_dialog_by_app_id(page, app_id, main_identity.get("row_idx")):
+        return {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后无法从已核验主表应用ID行打开资源不足中间页链接核验，已停止")}
     verified = None
     try:
         try:
@@ -518,10 +499,6 @@ def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_nam
             )
         except Exception:
             verified = {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后资源不足中间页链接核验对话框未就绪，已停止")}
-        if verified is None:
-            identity = _verify_persisted_dialog_identity(page, expected_app_name, expected_channel_name)
-            if not identity["success"]:
-                verified = identity
         if verified is None and not _go_tab(page, "基础配置"):
             verified = {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后无法切换资源不足中间页链接核验页签，已停止")}
         if verified is None:
@@ -2051,6 +2028,10 @@ def _main_channel_from_row(headers, cells):
 def _is_app_id_header(header):
     text = (header or "").strip()
     return text == "ID" or "应用ID" in text
+
+
+def _is_app_name_header(header):
+    return bool(re.search(r"应用名称|应用名", header or ""))
 
 
 def _channel_verify_facts(
