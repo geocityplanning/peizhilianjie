@@ -446,21 +446,25 @@ def _open_copy_dialog_by_app_id(page, app_id, verified_row_idx, expected_app_nam
         return False
 
 
-def _open_copy_dialog_by_known_main_row(page, app_id, row_idx, row_key, app_name, channel_name):
-    """Atomically recheck the same page/key/main anchors immediately before Copy."""
+def _open_copy_dialog_by_known_main_row(
+    page, app_id, page_number, row_idx, logical_key, key_kind, app_name, channel_name
+):
+    """Atomically recheck the collector's page/index/key/main anchors before Copy."""
     try:
         return bool(page.evaluate(
             """
-            ({appId, rowIdx, rowKey, appName, channelName}) => {
-              const visible = (el) => Boolean(el) && el.offsetParent !== null;
-              const inDialog = (el) => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
-              const utility = (el) => /el-table__expand-column|el-table-column--selection|\\bgutter\\b/.test(String(el.className || ''));
+            ({appId, pageNumber, rowIdx, logicalKey, keyKind, appName, channelName}) => {
+              const visible = el => Boolean(el) && el.offsetParent !== null;
+              const inDialog = el => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
+              const utility = el => /el-table__expand-column|el-table-column--selection|\\bgutter\\b/.test(String(el.className || ''));
               const tables = Array.from(document.querySelectorAll('.el-table')).filter(table => visible(table) && !inDialog(table));
-              if (tables.length !== 1 || !Number.isInteger(rowIdx) || !rowKey) return false;
+              if (tables.length !== 1 || !Number.isInteger(rowIdx) || !logicalKey) return false;
+              const pagers = Array.from(document.querySelectorAll('.el-pagination')).filter(pager => !inDialog(pager));
+              const active = pagers[0]?.querySelector('.el-pager li.active');
+              const currentPage = /^\\d+$/.test((active?.innerText || '').trim()) ? Number(active.innerText.trim()) : 1;
+              if (currentPage !== pageNumber) return false;
               const table = tables[0];
-              const headerNodes = table.querySelectorAll('.el-table__header-wrapper th');
-              const fallbackHeaders = table.querySelectorAll('th');
-              const headers = Array.from(headerNodes.length ? headerNodes : fallbackHeaders).filter(header => !utility(header));
+              const headers = Array.from((table.querySelectorAll('.el-table__header-wrapper th').length ? table.querySelectorAll('.el-table__header-wrapper th') : table.querySelectorAll('th'))).filter(header => !utility(header));
               const textOf = header => (header.innerText || header.textContent || '').replace(/[ *:：\\s]/g, '').trim();
               const indexesFor = predicate => headers.map(textOf).map((text, index) => predicate(text) ? index : -1).filter(index => index >= 0);
               const idIndexes = indexesFor(text => text === 'ID' || text.includes('应用ID'));
@@ -468,30 +472,31 @@ def _open_copy_dialog_by_known_main_row(page, app_id, row_idx, row_key, app_name
               const channelIndexes = indexesFor(text => text.includes('渠道') && !/ID|编码|code/i.test(text));
               if (idIndexes.length !== 1 || nameIndexes.length !== 1 || channelIndexes.length !== 1) return false;
               const bodyRows = table.querySelectorAll('.el-table__body-wrapper tbody tr');
-              const sourceRows = bodyRows.length ? bodyRows : table.querySelectorAll('tbody tr');
-              const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row') && visible(row));
-              const rowKeyOf = row => row.getAttribute('data-row-key') || row.getAttribute('row-key') || '';
+              const sourceRows = Array.from(bodyRows.length ? bodyRows : table.querySelectorAll('tbody tr'));
+              const logicalRows = sourceRows.filter(row => !row.classList.contains('el-table__expanded-row'));
               const valuesOf = row => {
                 const cells = Array.from(row.querySelectorAll('td')).filter(cell => !utility(cell));
                 if (cells.length !== headers.length) return null;
                 const text = index => (cells[index].innerText || cells[index].textContent || '').trim();
                 return {id: text(idIndexes[0]), name: text(nameIndexes[0]), channel: text(channelIndexes[0])};
               };
-              const matches = rows.filter(row => {
-                const values = valuesOf(row);
-                return values && values.id === String(appId || '').trim();
-              });
+              const nativeKeyOf = row => row.getAttribute('data-row-key') || row.getAttribute('row-key') || '';
+              const keyOf = (row, index, values) => {
+                const nativeKey = nativeKeyOf(row);
+                return nativeKey || [`synthetic:${currentPage}`, index, values.id, values.name, values.channel].join(String.fromCharCode(31));
+              };
+              const matches = logicalRows.map((row, index) => ({row, index, values: valuesOf(row)})).filter(item => visible(item.row) && item.values && item.values.id === String(appId || '').trim());
               if (!matches.length) return false;
+              if (keyKind === 'synthetic' && matches.length !== 1) return false;
               for (const matched of matches) {
-                const values = valuesOf(matched);
-                if (rowKeyOf(matched) !== rowKey || !rowKeyOf(matched)
-                  || values.id !== String(appId || '').trim()
-                  || values.name !== String(appName || '').trim()
-                  || values.channel !== String(channelName || '').trim()) return false;
+                if (matched.values.id !== String(appId || '').trim() || matched.values.name !== String(appName || '').trim() || matched.values.channel !== String(channelName || '').trim()) return false;
+                if (keyKind === 'native' && (!nativeKeyOf(matched.row) || nativeKeyOf(matched.row) !== logicalKey)) return false;
+                if (keyKind === 'synthetic' && keyOf(matched.row, matched.index, matched.values) !== logicalKey) return false;
               }
-              const row = rows[rowIdx];
-              if (!row || rowKeyOf(row) !== rowKey) return false;
-              const copy = Array.from(row.querySelectorAll('button, a, span')).find(button => visible(button) && (button.innerText || '').trim() === '复制');
+              const target = logicalRows[rowIdx];
+              const targetValues = target ? valuesOf(target) : null;
+              if (!target || !visible(target) || !targetValues || keyOf(target, rowIdx, targetValues) !== logicalKey) return false;
+              const copy = Array.from(target.querySelectorAll('button, a, span')).find(button => visible(button) && (button.innerText || '').trim() === '复制');
               if (!copy) return false;
               copy.click();
               return true;
@@ -499,8 +504,10 @@ def _open_copy_dialog_by_known_main_row(page, app_id, row_idx, row_key, app_name
             """,
             {
                 "appId": app_id,
+                "pageNumber": page_number,
                 "rowIdx": row_idx,
-                "rowKey": row_key,
+                "logicalKey": logical_key,
+                "keyKind": key_kind,
                 "appName": app_name,
                 "channelName": channel_name,
             },
@@ -586,8 +593,10 @@ def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_nam
     if not _open_copy_dialog_by_known_main_row(
         page,
         app_id,
+        main_identity.get("page"),
         main_identity.get("row_idx"),
         main_identity.get("row_key"),
+        main_identity.get("key_kind"),
         expected_app_name,
         expected_channel_name,
     ):
@@ -2363,8 +2372,23 @@ def _snapshot_known_main_id_rows(page, app_id):
     }
 
 
+def _known_main_logical_key(page_number, row, *, native_only=False):
+    """Keep native keys verbatim; synthesize only a single candidate in memory."""
+    native_key = str((row or {}).get("row_key") or "").strip()
+    if native_key:
+        return native_key, "native"
+    if native_only:
+        return "", "none"
+    anchors = (
+        str((row or {}).get("app_id") or ""),
+        str((row or {}).get("app_name") or ""),
+        str((row or {}).get("channel_name") or ""),
+    )
+    return "synthetic:" + "\x1f".join((str(page_number), str((row or {}).get("row_idx")), *anchors)), "synthetic"
+
+
 def _known_main_identity_from_snapshot(snapshot, app_id, app_name, channel_name):
-    """Accept one row, or only a provable fixed-column DOM mirror of that row."""
+    """Accept one main row, or only a native-key-proven fixed-column mirror."""
     candidates = snapshot.get("candidates") or []
     if not candidates:
         return {"success": False, "reason": "zero_candidates"}
@@ -2373,20 +2397,20 @@ def _known_main_identity_from_snapshot(snapshot, app_id, app_name, channel_name)
         (row.get("app_id") or "", row.get("app_name") or "", row.get("channel_name") or "")
         for row in candidates
     ]
-    row_keys = [row.get("row_key") or "" for row in candidates]
-    # More than one physical row is safe only when row-key and all main anchors
-    # prove it is a fixed-column DOM mirror, not a second application row.
+    native_keys = [str(row.get("row_key") or "").strip() for row in candidates]
+    # Multiple DOM rows may fold only with one nonempty native key and identical anchors.
     if len(candidates) > 1 and (
-        not all(row_keys)
-        or len(set(row_keys)) != 1
+        not all(native_keys)
+        or len(set(native_keys)) != 1
         or len(set(anchors)) != 1
     ):
         return {"success": False, "reason": "ambiguous_main_rows"}
-    candidate = candidates[0]
-    if not candidate.get("row_key"):
-        return {"success": False, "reason": "missing_row_key"}
+    candidate = dict(candidates[0])
     if anchors[0] != expected:
         return {"success": False, "reason": "main_anchor_mismatch"}
+    logical_key, key_kind = _known_main_logical_key(snapshot.get("page"), candidate)
+    candidate["logical_key"] = logical_key
+    candidate["key_kind"] = key_kind
     return {"success": True, "row": candidate}
 
 
@@ -2466,7 +2490,8 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
         second_decision = _known_main_identity_from_snapshot(second_snapshot, app_id, app_name, channel_name)
         stable_key = bool(
             second_decision.get("success")
-            and second_decision["row"].get("row_key") == first_row.get("row_key")
+            and second_decision["row"].get("logical_key") == first_row.get("logical_key")
+            and second_decision["row"].get("row_idx") == first_row.get("row_idx")
         )
         _log_known_main_snapshot(second_snapshot, second_decision, stable_key)
         if not stable_key:
@@ -2475,7 +2500,8 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
             "success": True,
             "page": second_snapshot.get("page"),
             "row_idx": second_decision["row"].get("row_idx"),
-            "row_key": second_decision["row"].get("row_key"),
+            "row_key": second_decision["row"].get("logical_key"),
+            "key_kind": second_decision["row"].get("key_kind"),
         }
     return _known_main_failure("zero_candidates_after_poll", scanned.get("snapshot"))
 

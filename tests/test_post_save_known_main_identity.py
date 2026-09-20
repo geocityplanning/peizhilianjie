@@ -99,8 +99,26 @@ def test_known_locator_accepts_async_zero_then_two_same_main_reads(monkeypatch):
 
     result = cap._locate_known_main_row_for_resource_fallback(page, "secret-id", "secret-name", "secret-channel")
 
-    assert result == {"success": True, "page": 2, "row_idx": 0, "row_key": "row-2"}
+    assert result["success"] is True
+    assert result["page"] == 2
+    assert result["row_idx"] == 0
+    assert result["row_key"] == "row-2"
+    assert result["key_kind"] == "native"
     assert len(resets) == 1
+
+
+def test_known_locator_rejects_synthetic_key_when_row_index_changes(monkeypatch):
+    cap = _cap()
+    page = SequencePage([
+        _payload(("secret-id", "secret-name", "secret-channel", "")),
+        _payload(("old-id", "old", "old-channel", "old-key"), ("secret-id", "secret-name", "secret-channel", "")),
+    ])
+    _install_navigation(monkeypatch, cap)
+
+    result = cap._locate_known_main_row_for_resource_fallback(page, "secret-id", "secret-name", "secret-channel")
+
+    assert result["success"] is False
+    assert result["reason"] == "main_identity_unstable"
 
 
 def test_known_locator_rejects_unstable_second_main_read(monkeypatch):
@@ -132,10 +150,23 @@ def test_known_locator_collapses_only_provable_dom_mirror(monkeypatch):
     assert result["row_key"] == "row-1"
 
 
-def test_known_locator_rejects_unkeyed_or_nonmirror_duplicate_rows(monkeypatch):
+def test_known_locator_accepts_single_unkeyed_candidate_with_in_memory_logical_key(monkeypatch):
+    cap = _cap()
+    payload = _payload(("secret-id", "secret-name", "secret-channel", ""))
+    page = SequencePage([payload, payload])
+    _install_navigation(monkeypatch, cap)
+
+    result = cap._locate_known_main_row_for_resource_fallback(page, "secret-id", "secret-name", "secret-channel")
+
+    assert result["success"] is True
+    assert result["key_kind"] == "synthetic"
+    assert result["row_key"].startswith("synthetic:1\x1f0\x1f")
+
+
+def test_known_locator_rejects_nonmirror_duplicate_rows(monkeypatch):
     cap = _cap()
     cases = [
-        _payload(("secret-id", "secret-name", "secret-channel", "")),
+        _payload(("secret-id", "secret-name", "secret-channel", ""), ("secret-id", "secret-name", "secret-channel", "")),
         _payload(("secret-id", "secret-name", "secret-channel", "row-1"), ("secret-id", "other", "secret-channel", "row-1")),
         _payload(("secret-id", "secret-name", "secret-channel", "row-1"), ("secret-id", "secret-name", "secret-channel", "row-2")),
         # Same anchors but different row keys are real duplicate rows, not a mirror.
@@ -146,7 +177,7 @@ def test_known_locator_rejects_unkeyed_or_nonmirror_duplicate_rows(monkeypatch):
         _install_navigation(monkeypatch, cap)
         result = cap._locate_known_main_row_for_resource_fallback(page, "secret-id", "secret-name", "secret-channel")
         assert result["success"] is False
-        assert result["reason"] in {"missing_row_key", "ambiguous_main_rows"}
+        assert result["reason"] == "ambiguous_main_rows"
 
 
 def test_known_locator_rejects_duplicate_main_anchor_columns(monkeypatch):
@@ -233,7 +264,10 @@ def test_known_locator_restores_first_page_candidate_before_stable_read(monkeypa
         Page(), "secret-id", "secret-name", "secret-channel"
     )
 
-    assert result == {"success": True, "page": 1, "row_idx": 0, "row_key": "row-1"}
+    assert result["success"] is True
+    assert result["page"] == 1
+    assert result["row_idx"] == 0
+    assert result["row_key"] == "row-1"
 
 
 def test_known_main_preclick_recheck_carries_same_key_and_main_anchors():
@@ -248,10 +282,14 @@ def test_known_main_preclick_recheck_carries_same_key_and_main_anchors():
             return True
 
     page = Page()
-    assert cap._open_copy_dialog_by_known_main_row(page, "secret-id", 2, "row-2", "secret-name", "secret-channel") is True
-    assert page.data["rowKey"] == "row-2"
+    assert cap._open_copy_dialog_by_known_main_row(page, "secret-id", 2, 3, "row-2", "native", "secret-name", "secret-channel") is True
+    assert page.data["logicalKey"] == "row-2"
+    assert page.data["keyKind"] == "native"
     assert "const matches" in page.script
-    assert "rowKeyOf(matched) !== rowKey" in page.script
+    assert "const logicalRows = sourceRows.filter(row => !row.classList.contains('el-table__expanded-row'));" in page.script
+    assert "const target = logicalRows[rowIdx]" in page.script
+    assert "keyOf(target, rowIdx" in page.script
+    assert "String.fromCharCode(31)" in page.script
     assert "values.channel" in page.script
 
 
@@ -264,7 +302,7 @@ def test_known_main_preclick_toctou_recheck_fails_closed():
             return False
 
     assert cap._open_copy_dialog_by_known_main_row(
-        Page(), "secret-id", 0, "row-1", "secret-name", "secret-channel"
+        Page(), "secret-id", 1, 0, "row-1", "native", "secret-name", "secret-channel"
     ) is False
 
 
