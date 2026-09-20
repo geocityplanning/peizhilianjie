@@ -162,9 +162,46 @@ def _stage_data():
 def test_go_tab_requires_visible_dialog_and_active_target_tab():
     cap = _stub_login_and_import()
 
+    class Tab:
+        def __init__(self, page):
+            self.page = page
+        def inner_text(self):
+            return "基础配置"
+        def click(self, timeout):
+            self.page.physical_clicks += 1
+
+    class Tabs:
+        def __init__(self, page):
+            self.page = page
+        def count(self):
+            return 1
+        def nth(self, index):
+            return Tab(self.page)
+
+    class Dialog:
+        def __init__(self, page):
+            self.page = page
+        def is_visible(self):
+            return True
+        def locator(self, selector):
+            assert selector == ".el-tabs__item"
+            return Tabs(self.page)
+
+    class Wrappers:
+        def __init__(self, page):
+            self.page = page
+        def count(self):
+            return 1
+        def nth(self, index):
+            return Dialog(self.page)
+
     class TabPage:
         def __init__(self):
             self.calls = []
+            self.physical_clicks = 0
+        def locator(self, selector):
+            assert selector == ".el-dialog__wrapper"
+            return Wrappers(self)
         def evaluate(self, script, payload=None):
             self.calls.append(script)
             if "return Array.from(dialogs[0].querySelectorAll('.el-tabs__item'))" in script:
@@ -175,10 +212,13 @@ def test_go_tab_requires_visible_dialog_and_active_target_tab():
 
     page = TabPage()
     assert cap._go_tab(page, "基础配置") is True
+    assert page.physical_clicks == 1
     source = "\n".join(page.calls)
     assert "window.getComputedStyle" in source
     assert "dialogs.length !== 1" in source
     assert "tab.classList.contains('is-active')" in source
+    assert "tab.getAttribute('aria-selected') !== 'true'" in source
+    assert "pane.getAttribute('aria-hidden') === 'true'" in source
 
 
 def test_native_locator_fill_and_tab_are_required(monkeypatch):

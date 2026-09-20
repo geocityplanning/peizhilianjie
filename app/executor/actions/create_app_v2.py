@@ -116,29 +116,29 @@ def _go_tab(page, name):
     if not last_tabs:
         print(f"[create_app] WARN: 未找到可见Tab {name}")
         return False
-    clicked = page.evaluate("""
-    (tabName) => {
-      const visible = el => {
-        if (!el) return false;
-        const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden' || el.getAttribute('aria-hidden') === 'true') return false;
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-      };
-      const dialogs = Array.from(document.querySelectorAll('.el-dialog__wrapper')).filter(
-        dialog => visible(dialog) && dialog.querySelectorAll('.el-tabs__item').length > 0
-      );
-      if (dialogs.length !== 1) return false;
-      const tab = Array.from(dialogs[0].querySelectorAll('.el-tabs__item')).find(
-        item => (item.innerText || '').trim().includes(tabName)
-      );
-      if (!tab) return false;
-      tab.click();
-      return true;
-    }
-    """, name)
-    if not clicked:
-        print(f"[create_app] WARN: 可见Tab '{name}' 不在 {last_tabs} 中")
+    try:
+        wrappers = page.locator(".el-dialog__wrapper")
+        visible_dialogs = []
+        for index in range(wrappers.count()):
+            dialog = wrappers.nth(index)
+            if dialog.is_visible() and dialog.locator(".el-tabs__item").count() > 0:
+                visible_dialogs.append(dialog)
+        if len(visible_dialogs) != 1:
+            print(f"[create_app] WARN: 可见Tab dialog 数量不唯一: {len(visible_dialogs)}")
+            return False
+        tabs = visible_dialogs[0].locator(".el-tabs__item")
+        target_indexes = [
+            index for index in range(tabs.count())
+            if name in (tabs.nth(index).inner_text() or "").strip()
+        ]
+        if len(target_indexes) != 1:
+            print(f"[create_app] WARN: 可见Tab '{name}' 不唯一或不存在")
+            return False
+        # Element-UI does not reliably react to HTMLElement.click() in this dialog;
+        # use a real pointer click, then prove both tab and its mapped pane changed.
+        tabs.nth(target_indexes[0]).click(timeout=STEP_TIMEOUT)
+    except Exception:
+        print(f"[create_app] WARN: 可见Tab '{name}' 无法物理点击")
         return False
     while time.monotonic() < deadline:
         active = page.evaluate("""
@@ -157,7 +157,12 @@ def _go_tab(page, name):
           const tab = Array.from(dialogs[0].querySelectorAll('.el-tabs__item')).find(
             item => (item.innerText || '').trim().includes(tabName)
           );
-          return Boolean(tab && tab.classList.contains('is-active'));
+          if (!tab || !tab.classList.contains('is-active') || tab.getAttribute('aria-selected') !== 'true') return false;
+          const paneId = tab.getAttribute('aria-controls');
+          const pane = paneId ? document.getElementById(paneId) : null;
+          if (!pane || pane.getAttribute('aria-hidden') === 'true') return false;
+          const style = window.getComputedStyle(pane);
+          return style.display !== 'none' && style.visibility !== 'hidden';
         }
         """, name)
         if active:
