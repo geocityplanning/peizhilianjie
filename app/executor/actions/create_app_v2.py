@@ -82,27 +82,30 @@ def _cleanup_overlays(page):
 # ====== JS 直操 DOM 工具函数（不依赖 Playwright :visible） ======
 
 def _available_tabs(page):
-    """用 JS 查可见对话框的 Tab 名称。"""
+    """Read tabs only from the one genuinely visible tabbed dialog."""
     try:
         return page.evaluate("""
         () => {
-          const wrappers = document.querySelectorAll('.el-dialog__wrapper');
-          for (const w of wrappers) {
-            if (w.style.display === 'none') continue;
-            const tabs = w.querySelectorAll('.el-tabs__item');
-            if (tabs.length > 0) {
-              return Array.from(tabs).map(t => t.innerText.trim());
-            }
-          }
-          return [];
+          const visible = el => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || el.getAttribute('aria-hidden') === 'true') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          };
+          const dialogs = Array.from(document.querySelectorAll('.el-dialog__wrapper')).filter(
+            dialog => visible(dialog) && dialog.querySelectorAll('.el-tabs__item').length > 0
+          );
+          if (dialogs.length !== 1) return [];
+          return Array.from(dialogs[0].querySelectorAll('.el-tabs__item')).map(tab => (tab.innerText || '').trim());
         }
-        """)
+        """) or []
     except Exception:
         return []
 
 
 def _go_tab(page, name):
-    """用 JS 点击目标 Tab。"""
+    """Activate and prove the target tab in the one genuinely visible dialog."""
     deadline = time.monotonic() + 6
     last_tabs = []
     while time.monotonic() < deadline:
@@ -111,25 +114,56 @@ def _go_tab(page, name):
             break
         page.wait_for_timeout(300)
     if not last_tabs:
-        print(f"[create_app] WARN: 未找到Tab {name}，当前Tabs={last_tabs}")
+        print(f"[create_app] WARN: 未找到可见Tab {name}")
         return False
     clicked = page.evaluate("""
     (tabName) => {
-      const wrappers = document.querySelectorAll('.el-dialog__wrapper');
-      for (const w of wrappers) {
-        if (w.style.display === 'none') continue;
-        const tabs = w.querySelectorAll('.el-tabs__item');
-        for (const t of tabs) {
-          if (t.innerText.trim().includes(tabName)) { t.click(); return true; }
-        }
-      }
-      return false;
+      const visible = el => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || el.getAttribute('aria-hidden') === 'true') return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      const dialogs = Array.from(document.querySelectorAll('.el-dialog__wrapper')).filter(
+        dialog => visible(dialog) && dialog.querySelectorAll('.el-tabs__item').length > 0
+      );
+      if (dialogs.length !== 1) return false;
+      const tab = Array.from(dialogs[0].querySelectorAll('.el-tabs__item')).find(
+        item => (item.innerText || '').trim().includes(tabName)
+      );
+      if (!tab) return false;
+      tab.click();
+      return true;
     }
     """, name)
-    if clicked:
-        page.wait_for_timeout(500)
-        return True
-    print(f"[create_app] WARN: Tab '{name}' 不在 {last_tabs} 中")
+    if not clicked:
+        print(f"[create_app] WARN: 可见Tab '{name}' 不在 {last_tabs} 中")
+        return False
+    while time.monotonic() < deadline:
+        active = page.evaluate("""
+        (tabName) => {
+          const visible = el => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || el.getAttribute('aria-hidden') === 'true') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          };
+          const dialogs = Array.from(document.querySelectorAll('.el-dialog__wrapper')).filter(
+            dialog => visible(dialog) && dialog.querySelectorAll('.el-tabs__item').length > 0
+          );
+          if (dialogs.length !== 1) return false;
+          const tab = Array.from(dialogs[0].querySelectorAll('.el-tabs__item')).find(
+            item => (item.innerText || '').trim().includes(tabName)
+          );
+          return Boolean(tab && tab.classList.contains('is-active'));
+        }
+        """, name)
+        if active:
+            return True
+        page.wait_for_timeout(150)
+    print(f"[create_app] WARN: Tab '{name}' 未激活")
     return False
 
 

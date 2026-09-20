@@ -159,6 +159,28 @@ def _stage_data():
     return {"actual_channel_name": "channel-a", "base_platform": ""}
 
 
+def test_go_tab_requires_visible_dialog_and_active_target_tab():
+    cap = _stub_login_and_import()
+
+    class TabPage:
+        def __init__(self):
+            self.calls = []
+        def evaluate(self, script, payload=None):
+            self.calls.append(script)
+            if "return Array.from(dialogs[0].querySelectorAll('.el-tabs__item'))" in script:
+                return ["基础配置"]
+            return True
+        def wait_for_timeout(self, milliseconds):
+            return None
+
+    page = TabPage()
+    assert cap._go_tab(page, "基础配置") is True
+    source = "\n".join(page.calls)
+    assert "window.getComputedStyle" in source
+    assert "dialogs.length !== 1" in source
+    assert "tab.classList.contains('is-active')" in source
+
+
 def test_native_locator_fill_and_tab_are_required(monkeypatch):
     cap = _stub_login_and_import()
     page = FillPage()
