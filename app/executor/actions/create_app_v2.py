@@ -15,7 +15,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import get_browser_page
 from core.error_capture import capture_page_errors, build_error_message
-from core.error_codes import err, NEXT_STOP, NEXT_QUERY, NEXT_MANUAL
+from core.error_codes import (
+    ERR_RESOURCE_FALLBACK_VERIFY_FAILED,
+    NEXT_MANUAL,
+    NEXT_QUERY,
+    NEXT_STOP,
+    err,
+)
 from core import executor as ex
 from actions.ensure_login import ensure_login
 from actions.link_utils import extract_cloud_app_key
@@ -155,6 +161,249 @@ def _js_fill(page, label, value):
       return false;
     }
     """, {"label": label, "value": value})
+
+
+def _read_visible_copy_dialog_input(page, label):
+    """Read one exact-labeled input from the only visible copy dialog.
+
+    The raw value is used only for in-memory equality verification and is never
+    emitted to logs or result payloads.
+    """
+    try:
+        result = page.evaluate(
+            """
+            ({label}) => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                if (el.getAttribute('aria-hidden') === 'true') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const wanted = (label || '').replace(/[ *:：]/g, '').trim();
+              const dialogs = Array.from(document.querySelectorAll('.el-dialog__wrapper')).filter(
+                dialog => visible(dialog) && dialog.querySelectorAll('.el-tabs__item').length > 0
+              );
+              if (dialogs.length !== 1) {
+                return {dialog_found: false, input_found: false, value: ''};
+              }
+              for (const item of dialogs[0].querySelectorAll('.el-form-item')) {
+                if (item.offsetParent === null) continue;
+                const labelEl = item.querySelector('.el-form-item__label');
+                if (!labelEl) continue;
+                const actual = (labelEl.innerText || '').replace(/[ *:：]/g, '').trim();
+                if (actual !== wanted) continue;
+                const input = item.querySelector('input.el-input__inner');
+                if (!input) return {dialog_found: true, input_found: false, value: ''};
+                return {dialog_found: true, input_found: true, value: input.value || ''};
+              }
+              return {dialog_found: true, input_found: false, value: ''};
+            }
+            """,
+            {"label": label},
+        )
+    except Exception:
+        result = None
+    if not isinstance(result, dict):
+        return {"dialog_found": False, "input_found": False, "value": ""}
+    return {
+        "dialog_found": bool(result.get("dialog_found")),
+        "input_found": bool(result.get("input_found")),
+        "value": str(result.get("value") or ""),
+    }
+
+
+def _resource_fallback_readback_error(stage, message):
+    return err(ERR_RESOURCE_FALLBACK_VERIFY_FAILED, stage, message, NEXT_MANUAL)
+
+
+def _verify_resource_fallback_readback(page, expected, stage, context):
+    """Verify the fallback value in the visible copy dialog without leaking it."""
+    readback = _read_visible_copy_dialog_input(page, "资源不足中间页链接")
+    expected_text = (expected or "").strip()
+    observed = readback["value"]
+    matches = bool(readback["input_found"]) and observed == expected_text
+    print(
+        "[create_app] 资源不足中间页链接核验: "
+        f"context={context} dialog_found={readback['dialog_found']} "
+        f"input_found={readback['input_found']} expected_length={len(expected_text)} "
+        f"observed_length={len(observed)} matches={matches}"
+    )
+    if not readback["dialog_found"] or not readback["input_found"]:
+        return {
+            "success": False,
+            "error": _resource_fallback_readback_error(
+                stage, "资源不足中间页链接控件不可读取，已停止"
+            ),
+        }
+    if not matches:
+        return {
+            "success": False,
+            "error": _resource_fallback_readback_error(
+                stage, "资源不足中间页链接回读不一致，已停止"
+            ),
+        }
+    return {"success": True}
+
+
+def _fill_and_verify_resource_fallback(page, expected):
+    """Fill and exactly read back the required fallback field before save."""
+    if not _js_fill(page, "资源不足中间页链接", expected):
+        print("[create_app] 资源不足中间页链接填写: filled=False")
+        return {
+            "success": False,
+            "error": _resource_fallback_readback_error(
+                "FILL", "资源不足中间页链接填写失败，已停止保存"
+            ),
+        }
+    return _verify_resource_fallback_readback(page, expected, "FILL", "before_save")
+
+
+def _open_copy_dialog_by_app_id(page, app_id):
+    """Open Copy for an exact ID from the unique visible main table only."""
+    try:
+        return bool(page.evaluate(
+            """
+            (appId) => {
+              const visible = (el) => Boolean(el) && el.offsetParent !== null;
+              const inDialog = (el) => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
+              const utility = (el) => /el-table__expand-column|el-table-column--selection|\\bgutter\\b/.test(
+                String(el.className || '')
+              );
+              const tables = Array.from(document.querySelectorAll('.el-table')).filter(
+                table => visible(table) && !inDialog(table)
+              );
+              if (tables.length !== 1) return false;
+              const table = tables[0];
+              const headerNodes = table.querySelectorAll('.el-table__header-wrapper th');
+              const fallbackHeaders = table.querySelectorAll('th');
+              const headers = Array.from(headerNodes.length ? headerNodes : fallbackHeaders)
+                .filter(header => !utility(header));
+              const idIndex = headers.findIndex((header) => {
+                const text = (header.innerText || header.textContent || '').replace(/[ *:：\\s]/g, '').trim();
+                return text === 'ID' || text.includes('应用ID');
+              });
+              if (idIndex < 0) return false;
+              const bodyRows = table.querySelectorAll('.el-table__body-wrapper tbody tr');
+              const sourceRows = bodyRows.length ? bodyRows : table.querySelectorAll('tbody tr');
+              for (const row of sourceRows) {
+                if (!visible(row) || row.classList.contains('el-table__expanded-row')) continue;
+                const cells = Array.from(row.querySelectorAll('td')).filter(cell => !utility(cell));
+                if (cells.length !== headers.length) continue;
+                const id = (cells[idIndex].innerText || cells[idIndex].textContent || '').trim();
+                if (id !== String(appId || '').trim()) continue;
+                const copy = Array.from(row.querySelectorAll('button, a, span')).find(
+                  button => visible(button) && (button.innerText || '').trim() === '复制'
+                );
+                if (!copy) return false;
+                copy.click();
+                return true;
+              }
+              return false;
+            }
+            """,
+            app_id,
+        ))
+    except Exception:
+        return False
+
+
+def _copy_dialog_visible(page):
+    """Strict visible-copy-dialog check used only for bounded verification cleanup."""
+    return bool(page.evaluate("""() => {
+      const visible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        if (el.getAttribute('aria-hidden') === 'true') return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      return Array.from(document.querySelectorAll('.el-dialog__wrapper')).some(
+        dialog => visible(dialog) && dialog.querySelectorAll('.el-tabs__item').length > 0
+      );
+    }"""))
+
+
+def _close_copy_dialog_after_verify(page):
+    """Close the read-only verification dialog once and confirm it closed."""
+    try:
+        if not _copy_dialog_visible(page):
+            return True
+        clicked = bool(page.evaluate("""() => {
+          const visible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          };
+          const dialog = Array.from(document.querySelectorAll('.el-dialog__wrapper')).find(
+            item => visible(item) && item.querySelectorAll('.el-tabs__item').length > 0
+          );
+          if (!dialog) return false;
+          const cancel = Array.from(dialog.querySelectorAll('button')).find(
+            button => visible(button) && (button.innerText || '').replace(/\\s/g, '').trim() === '取消'
+          );
+          if (cancel) { cancel.click(); return true; }
+          const close = dialog.querySelector('.el-dialog__headerbtn');
+          if (close) { close.click(); return true; }
+          return false;
+        }"""))
+        if not clicked:
+            return not _copy_dialog_visible(page)
+        for _ in range(12):
+            page.wait_for_timeout(100)
+            if not _copy_dialog_visible(page):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _verify_persisted_resource_fallback(page, app_id, expected):
+    """Open the newly saved app read-only and verify its persisted fallback value."""
+    if not _open_copy_dialog_by_app_id(page, app_id):
+        return {
+            "success": False,
+            "error": _resource_fallback_readback_error(
+                "VERIFY", "保存后无法按新增应用ID打开资源不足中间页链接核验，已停止"
+            ),
+        }
+    verified = None
+    try:
+        try:
+            page.wait_for_selector(
+                ".el-dialog__wrapper:not([style*='display: none']) .el-tabs__item",
+                timeout=STEP_TIMEOUT,
+            )
+        except Exception:
+            verified = {
+                "success": False,
+                "error": _resource_fallback_readback_error(
+                    "VERIFY", "保存后资源不足中间页链接核验对话框未就绪，已停止"
+                ),
+            }
+        if verified is None and not _go_tab(page, "基础配置"):
+            verified = {
+                "success": False,
+                "error": _resource_fallback_readback_error(
+                    "VERIFY", "保存后无法切换资源不足中间页链接核验页签，已停止"
+                ),
+            }
+        if verified is None:
+            verified = _verify_resource_fallback_readback(page, expected, "VERIFY", "after_save")
+    finally:
+        closed = _close_copy_dialog_after_verify(page)
+    if not closed:
+        return {
+            "success": False,
+            "error": _resource_fallback_readback_error(
+                "VERIFY", "保存后资源不足中间页链接核验对话框未能确认关闭，已停止"
+            ),
+        }
+    return verified
 
 
 def _js_select(page, label, value):
@@ -2307,8 +2556,9 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
     _set_stage(execution_id, "正在填写基础配置")
     if not _go_tab(page, "基础配置"):
         return {"success": False, "error": err("TAB_SWITCH_FAILED", "FILL", f"无法切换到基础配置Tab", NEXT_MANUAL)}
-    if resource_fallback_page:
-        _js_fill(page, "资源不足中间页链接", resource_fallback_page)
+    fallback_filled = _fill_and_verify_resource_fallback(page, resource_fallback_page)
+    if not fallback_filled["success"]:
+        return {"success": False, "error": fallback_filled["error"], "save_may_have_occurred": False}
     if settlement_type:
         _js_select(page, "结算类型", settlement_type)
     _shot(page, "05_basic_config")
@@ -2365,6 +2615,15 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
         return {
             "success": False,
             "error": err(location_code, "VERIFY", location_message, NEXT_MANUAL),
+        }
+    fallback_persisted = _verify_persisted_resource_fallback(
+        page, target_app_id, resource_fallback_page
+    )
+    if not fallback_persisted["success"]:
+        return {
+            "success": False,
+            "error": fallback_persisted["error"],
+            "save_may_have_occurred": True,
         }
     _shot(page, "07_created")
     return {"success": True, "target_app_id": target_app_id}
@@ -2846,7 +3105,10 @@ def execute_create_app(request: dict) -> dict:
             settlement_type,
         )
         if not create_result["success"]:
-            return finish_failure(create_result["error"], current_stage)
+            business_status = (
+                ex.BIZ_UNKNOWN if create_result.get("save_may_have_occurred") else ex.BIZ_FAILED
+            )
+            return finish_failure(create_result["error"], current_stage, business_status)
         target_app_id = create_result["target_app_id"]
         completed_stages.append(current_stage)
 
