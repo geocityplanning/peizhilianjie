@@ -324,6 +324,50 @@ def test_tab_round_trip_value_loss_stops_with_zero_save(monkeypatch):
     assert page.save_clicks == 0
 
 
+@pytest.mark.parametrize(
+    "selection_failure",
+    ["physical_open", "option_not_unique", "dropdown_not_closed", "dom_model_mismatch"],
+)
+def test_settlement_selection_failure_stops_with_zero_save(monkeypatch, selection_failure):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    _prepare_stage(monkeypatch, cap, page)
+    monkeypatch.setattr(cap, "_fill_and_verify_resource_fallback", lambda *args, **kwargs: {"success": True})
+    monkeypatch.setattr(cap, "_js_select", lambda *args, **kwargs: False)
+
+    result = cap._stage_create_save(
+        page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type"
+    )
+
+    assert selection_failure
+    assert result["success"] is False
+    assert result["error"]["code"] == "SETTLEMENT_SELECT_FAILED"
+    assert result["error"]["stage"] == "FILL"
+    assert page.save_clicks == 0
+
+
+def test_normal_settlement_selection_reaches_save_after_prior_tab_activation(monkeypatch):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    _prepare_stage(monkeypatch, cap, page)
+    tabs = []
+    monkeypatch.setattr(cap, "_fill_and_verify_resource_fallback", lambda *args, **kwargs: {"success": True})
+    monkeypatch.setattr(cap, "_js_select", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_go_tab", lambda _page, name: tabs.append(name) or True)
+    monkeypatch.setattr(cap, "_identify_new_app", lambda *args, **kwargs: {
+        "success": False,
+        "error": cap.err("NEW_APP_ID_NOT_FOUND", "VERIFY", "stop", cap.NEXT_MANUAL),
+    })
+
+    result = cap._stage_create_save(
+        page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type"
+    )
+
+    assert result["success"] is False
+    assert page.save_clicks == 1
+    assert tabs == ["体验配置", "登录页配置", "基础配置"]
+
+
 def test_normal_native_fill_model_and_tab_round_trip_pass(monkeypatch):
     cap = _stub_login_and_import()
     page = FillPage()

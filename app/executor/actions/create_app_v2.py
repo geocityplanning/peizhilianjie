@@ -686,46 +686,126 @@ def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_nam
 
 
 def _js_select(page, label, value):
-    """用 JS 点下拉框并选项。"""
-    opened = page.evaluate("""
-    (label) => {
-      const wrappers = document.querySelectorAll('.el-dialog__wrapper');
-      for (const w of wrappers) {
-        if (w.style.display === 'none') continue;
-        const items = w.querySelectorAll('.el-form-item');
-        for (const it of items) {
-          if (it.offsetParent === null) continue;
-          const lblEl = it.querySelector('.el-form-item__label');
-          if (!lblEl) continue;
-          const lbl = lblEl.innerText.replace(/[ *:]/g, '').trim();
-          if (lbl === label) {
-            const sel = it.querySelector('.el-select');
-            if (sel) { sel.click(); return true; }
-          }
-        }
-      }
-      return false;
-    }
-    """, label)
-    if not opened:
+    """Native-select an exact value and prove the Element-UI control settled."""
+    target = (value or "").strip()
+    if not target:
+        print(f"[create_app] WARN: 下拉选择失败 label={label} reason=empty_target")
         return False
-    page.wait_for_timeout(500)
-    picked = page.evaluate("""
-    (value) => {
-      const dropdowns = document.querySelectorAll('.el-select-dropdown');
-      for (const dd of dropdowns) {
-        if (dd.style.display === 'none') continue;
-        const items = dd.querySelectorAll('.el-select-dropdown__item');
-        for (const it of items) {
-          if (it.innerText.trim().includes(value)) { it.click(); return true; }
+    try:
+        wrappers = page.locator(".el-dialog__wrapper")
+        dialogs = []
+        for index in range(wrappers.count()):
+            dialog = wrappers.nth(index)
+            if dialog.is_visible() and dialog.locator(".el-tabs__item").count() > 0:
+                dialogs.append(dialog)
+        if len(dialogs) != 1:
+            print(f"[create_app] WARN: 下拉选择失败 label={label} reason=visible_dialog_not_unique")
+            return False
+        form_items = dialogs[0].locator(".el-form-item")
+        matched_items = []
+        for index in range(form_items.count()):
+            item = form_items.nth(index)
+            if not item.is_visible():
+                continue
+            label_node = item.locator(".el-form-item__label")
+            if label_node.count() != 1:
+                continue
+            observed_label = (label_node.inner_text() or "").replace(" ", "").replace("*", "").replace(":", "").replace("：", "").strip()
+            if observed_label == label and item.locator(".el-select").count() == 1:
+                matched_items.append(item)
+        if len(matched_items) != 1:
+            print(f"[create_app] WARN: 下拉选择失败 label={label} reason=control_not_unique")
+            return False
+        select = matched_items[0].locator(".el-select")
+        select.click(timeout=STEP_TIMEOUT)
+    except Exception as exc:
+        print(f"[create_app] WARN: 下拉选择失败 label={label} reason=physical_open_exception exception_type={type(exc).__name__}")
+        return False
+
+    dropdown = None
+    deadline = time.monotonic() + (STEP_TIMEOUT / 1000)
+    while time.monotonic() < deadline:
+        try:
+            candidates = page.locator(".el-select-dropdown")
+            visible_dropdowns = [
+                candidates.nth(index) for index in range(candidates.count())
+                if candidates.nth(index).is_visible()
+            ]
+            if len(visible_dropdowns) == 1:
+                dropdown = visible_dropdowns[0]
+                break
+            if len(visible_dropdowns) > 1:
+                print(f"[create_app] WARN: 下拉选择失败 label={label} reason=visible_dropdown_not_unique")
+                return False
+        except Exception as exc:
+            print(f"[create_app] WARN: 下拉选择失败 label={label} reason=dropdown_observe_exception exception_type={type(exc).__name__}")
+            return False
+        page.wait_for_timeout(100)
+    if dropdown is None:
+        print(f"[create_app] WARN: 下拉选择失败 label={label} reason=dropdown_not_visible")
+        return False
+
+    try:
+        options = dropdown.locator(".el-select-dropdown__item")
+        exact_options = [
+            options.nth(index) for index in range(options.count())
+            if options.nth(index).is_visible() and (options.nth(index).inner_text() or "").strip() == target
+        ]
+        if len(exact_options) != 1:
+            print(f"[create_app] WARN: 下拉选择失败 label={label} reason=option_not_unique")
+            return False
+        option_model = exact_options[0].evaluate("""
+        option => {
+          const component = option.__vue__ || null;
+          const value = component?.$props?.value;
+          return { found: value !== undefined, value };
         }
-      }
-      return false;
-    }
-    """, value)
-    if not picked:
-        page.keyboard.press("Escape")
-    return picked
+        """)
+        if not option_model.get("found"):
+            print(f"[create_app] WARN: 下拉选择失败 label={label} reason=option_model_unreadable")
+            return False
+        exact_options[0].click(timeout=STEP_TIMEOUT)
+    except Exception as exc:
+        print(f"[create_app] WARN: 下拉选择失败 label={label} reason=physical_option_exception exception_type={type(exc).__name__}")
+        return False
+
+    deadline = time.monotonic() + (STEP_TIMEOUT / 1000)
+    while time.monotonic() < deadline:
+        try:
+            candidates = page.locator(".el-select-dropdown")
+            if all(not candidates.nth(index).is_visible() for index in range(candidates.count())):
+                break
+        except Exception as exc:
+            print(f"[create_app] WARN: 下拉选择失败 label={label} reason=dropdown_close_observe_exception exception_type={type(exc).__name__}")
+            return False
+        page.wait_for_timeout(100)
+    else:
+        print(f"[create_app] WARN: 下拉选择失败 label={label} reason=dropdown_not_closed")
+        return False
+
+    try:
+        binding = select.evaluate("""
+        (node, expected) => {
+          const input = node.querySelector('input');
+          const component = node.__vue__ || input?.__vue__ || null;
+          const model = component?.$vnode?.data?.model?.expression || null;
+          const propValue = component?.$props?.value;
+          const domValue = input?.value;
+          return {
+            input_found: Boolean(input),
+            model_found: Boolean(model) && propValue !== undefined,
+            dom_matches: typeof domValue === 'string' && domValue.trim() === expected.displayValue,
+            model_matches: propValue !== undefined && String(propValue) === String(expected.optionModelValue),
+          };
+        }
+        """, {"displayValue": target, "optionModelValue": option_model.get("value")})
+    except Exception as exc:
+        print(f"[create_app] WARN: 下拉选择失败 label={label} reason=model_observe_exception exception_type={type(exc).__name__}")
+        return False
+    if not all(binding.get(key) for key in ("input_found", "model_found", "dom_matches", "model_matches")):
+        print(f"[create_app] WARN: 下拉选择失败 label={label} reason=dom_model_mismatch")
+        return False
+    return True
 
 
 _CHANNEL_LAYER_COMMON_JS = """
@@ -3065,14 +3145,16 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
     fallback_filled = _fill_and_verify_resource_fallback(page, resource_fallback_page)
     if not fallback_filled["success"]:
         return {"success": False, "error": fallback_filled["error"], "save_may_have_occurred": False}
-    if settlement_type:
-        _js_select(page, "结算类型", settlement_type)
+    if settlement_type and not _js_select(page, "结算类型", settlement_type):
+        return {"success": False, "error": err(
+            "SETTLEMENT_SELECT_FAILED", "FILL", "结算类型未能完成稳定原生选择，已停止保存", NEXT_MANUAL
+        ), "save_may_have_occurred": False}
     _shot(page, "05_basic_config")
 
-    # 保存
+    # 保存：资源兜底字段已在选择结算类型前完成物理 Tab 往返和 DOM/model
+    # 回读；结算类型也已完成原生选择、下拉关闭及 DOM/model 闭环。该组件
+    # 在选择后拒绝额外 Tab 切换，不能以无关切换阻断已经证明稳定的保存。
     _set_stage(execution_id, "正在保存应用")
-    if not _go_tab(page, "悬浮球配置"):
-        return {"success": False, "error": err("TAB_SWITCH_FAILED", "SAVE", f"无法切换到悬浮球配置Tab", NEXT_MANUAL)}
     page.evaluate("""() => {
       const wrappers = document.querySelectorAll('.el-dialog__wrapper');
       for (const w of wrappers) {
