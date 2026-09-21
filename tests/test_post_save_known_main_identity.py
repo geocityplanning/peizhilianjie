@@ -7,6 +7,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 def _cap():
     if "actions.ensure_login" not in sys.modules:
@@ -131,7 +133,8 @@ def test_known_locator_no_request_uses_only_one_scoped_refresh(monkeypatch):
     assert refreshes["count"] == 1
 
 
-def test_scoped_unfiltered_refresh_requires_unique_main_form_search():
+@pytest.mark.parametrize("form_count, expected", [(0, False), (1, True), (2, False)])
+def test_scoped_unfiltered_refresh_requires_unique_main_form_search(form_count, expected):
     cap = _cap()
 
     class Page:
@@ -139,13 +142,50 @@ def test_scoped_unfiltered_refresh_requires_unique_main_form_search():
             self.script = ""
         def evaluate(self, script):
             self.script = script
-            return True
+            return form_count == 1
 
     page = Page()
-    assert cap._trigger_unfiltered_list_refresh(page) is True
-    assert ".el-form" in page.script
-    assert "buttons.length !== 1" in page.script
+    assert cap._trigger_unfiltered_list_refresh(page) is expected
+    assert ".el-table" in page.script and ".el-pagination" in page.script
+    assert "scope.contains(pagers[0])" in page.script
+    assert "forms.length !== 1" in page.script
     assert "el-dialog" in page.script
+
+
+def test_refresh_exception_consumes_only_one_attempt(monkeypatch):
+    cap = _cap()
+    page = SequencePage([])
+    _install_navigation(monkeypatch, cap)
+    calls = {"count": 0}
+    monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: False)
+
+    def broken_refresh(page):
+        calls["count"] += 1
+        raise RuntimeError("after click")
+
+    monkeypatch.setattr(cap, "_trigger_unfiltered_list_refresh", broken_refresh)
+    cap._locate_known_main_row_for_resource_fallback(page, "secret-id", "secret-name", "secret-channel")
+    assert calls["count"] == 1
+
+
+@pytest.mark.parametrize("state", ["target_absent", "target_filtered", "unknown"])
+def test_observed_list_request_never_triggers_extra_refresh(monkeypatch, state):
+    cap = _cap()
+    page = SequencePage([])
+    _install_navigation(monkeypatch, cap)
+    refreshes = {"count": 0}
+
+    def observer(page):
+        result = cap._ListRequestObserver()
+        result.list_request_count = 1
+        setattr(result, state + "_request_count", 1)
+        return result
+
+    monkeypatch.setattr(cap, "_attach_list_response_observer", observer)
+    monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: False)
+    monkeypatch.setattr(cap, "_trigger_unfiltered_list_refresh", lambda page: refreshes.__setitem__("count", refreshes["count"] + 1) or True)
+    cap._locate_known_main_row_for_resource_fallback(page, "secret-id", "secret-name", "secret-channel")
+    assert refreshes["count"] == 0
 
 
 def test_known_locator_does_not_scan_id_without_fresh_unfiltered_restore(monkeypatch):

@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 import types
 
+import pytest
 from urllib.parse import quote
 
 LIST_URL = "https://example.invalid/backend/cloudTrial/appInfo/getAppInfoList"
@@ -99,9 +100,10 @@ class FakeResponse:
 
 
 class FakeRequest:
-    def __init__(self, url, post_data=""):
+    def __init__(self, url, post_data="", method="POST"):
         self.url = url
         self.post_data = post_data
+        self.method = method
 
 
 class FakeSearchPage:
@@ -699,6 +701,52 @@ def test_channel_names_empty_is_target_absent_but_nonempty_is_target_filtered():
     assert cap._list_request_filter_state(LIST_URL, '{"channelNames":["secret"]}') == "target_filtered"
 
 
+def test_channel_names_query_form_null_and_empty_array_classification():
+    cap = _stub_login_and_import()
+    assert cap._list_request_filter_state(LIST_URL + '?channelNames%5B%5D=', '') == "target_absent"
+    assert cap._list_request_filter_state(LIST_URL, 'channelNames=%5B%5D') == "target_absent"
+    assert cap._list_request_filter_state(LIST_URL, '{"channelNames":null}') == "target_absent"
+    assert cap._list_request_filter_state(LIST_URL, '{"channelNames":[""]}') == "target_filtered"
+
+
+@pytest.mark.parametrize("post_data", [None])
+def test_page_event_write_request_without_body_is_unknown_and_response_is_not_read(post_data):
+    cap = _stub_login_and_import()
+    page = FakePage(cdp_error=RuntimeError("no cdp"))
+    observations = cap._attach_list_response_observer(page)
+    request = FakeRequest(LIST_URL, post_data)
+    page.handlers["request"](request)
+
+    class Response(FakeResponse):
+        def text(self):
+            raise AssertionError("unknown request must not read response body")
+
+    page.handlers["response"](Response(LIST_URL, 200, request=request))
+    assert observations.request_filter_states[id(request)] == "unknown"
+    assert observations.success_records == []
+    assert observations.target_absent_2xx_count == 0
+
+
+def test_page_event_write_request_post_data_getter_error_is_unknown():
+    cap = _stub_login_and_import()
+    page = FakePage(cdp_error=RuntimeError("no cdp"))
+    observations = cap._attach_list_response_observer(page)
+
+    class BrokenRequest:
+        url = LIST_URL
+        method = "POST"
+        @property
+        def post_data(self):
+            raise RuntimeError("unavailable")
+
+    request = BrokenRequest()
+    page.handlers["request"](request)
+    page.handlers["response"](FakeResponse(LIST_URL, 200, request=request))
+    assert observations.request_filter_states[id(request)] == "unknown"
+    assert observations.success_records == []
+    assert observations.target_absent_2xx_count == 0
+
+
 def test_cdp_missing_post_data_is_unknown_and_cannot_unlock_gate():
     cap = _stub_login_and_import()
     session = FakeCdpSession(response_bodies={
@@ -732,7 +780,7 @@ def test_page_event_fallback_response_missing_target():
     cap = _stub_login_and_import()
     page = FakePage(cdp_error=RuntimeError("no cdp"))
     observations = cap._attach_list_response_observer(page, target_filter=SECRET_CHANNEL)
-    request = FakeRequest(LIST_URL, SECRET_CHANNEL)
+    request = FakeRequest(LIST_URL, '{"channelName":"' + SECRET_CHANNEL + '"}')
     page.handlers["request"](request)
     page.handlers["response"](FakeResponse(LIST_URL, 200, text='{"rows":[]}', request=request))
     assert observations.carried_target_filter is True

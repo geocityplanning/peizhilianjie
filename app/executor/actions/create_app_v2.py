@@ -1425,18 +1425,24 @@ def _locate_by_app_id(page, ref_app_id):
 
 
 def _trigger_unfiltered_list_refresh(page):
-    """At most one exact Search inside the visible main-list filter form."""
+    """At most one exact Search in the uniquely associated main-list filter form."""
     try:
         return bool(page.evaluate("""() => {
           const visible = element => Boolean(element) && element.offsetParent !== null;
-          const forms = Array.from(document.querySelectorAll('.el-form')).filter(form =>
-            visible(form)
-            && !form.closest('.el-dialog, .el-dialog__wrapper')
-            && form.querySelector('.el-select, input')
+          const outsideDialog = element => visible(element) && !element.closest('.el-dialog, .el-dialog__wrapper');
+          const tables = Array.from(document.querySelectorAll('.el-table')).filter(outsideDialog);
+          const pagers = Array.from(document.querySelectorAll('.el-pagination')).filter(outsideDialog);
+          if (tables.length !== 1 || pagers.length !== 1) return false;
+          const scopeOf = element => element.closest('.el-card, .el-main, .el-container');
+          const scope = scopeOf(tables[0]);
+          if (!scope || !scope.contains(pagers[0])) return false;
+          const forms = Array.from(scope.querySelectorAll('.el-form')).filter(form =>
+            outsideDialog(form) && form.querySelector('.el-select, input')
           );
-          const buttons = forms.flatMap(form => Array.from(form.querySelectorAll('button')).filter(button =>
+          if (forms.length !== 1) return false;
+          const buttons = Array.from(forms[0].querySelectorAll('button')).filter(button =>
             visible(button) && (button.innerText || '').replace(/\\s/g, '').trim() === '搜索'
-          ));
+          );
           if (buttons.length !== 1) return false;
           buttons[0].click();
           return true;
@@ -1810,7 +1816,10 @@ def _list_request_filter_state(url, post_data):
         return re.sub(r"[^a-z0-9]", "", str(key or "").lower())
 
     def empty(value):
-        return value is None or value == "" or value == [] or value == {}
+        return (
+            value is None or value == "" or value == [] or value == {}
+            or (isinstance(value, str) and value in {"[]", "null"})
+        )
 
     fields = []
     try:
@@ -1826,6 +1835,8 @@ def _list_request_filter_state(url, post_data):
             try:
                 form = parse_qsl(raw, keep_blank_values=True)
             except Exception:
+                return "unknown"
+            if not form:
                 return "unknown"
             fields.extend((normalized(key), value) for key, value in form)
         else:
@@ -2244,8 +2255,20 @@ def _attach_list_response_observer(page, target_filter=None):
 
     try:
         def _on_request(request):
-            post_data = getattr(request, "post_data", None) or ""
-            _mark_list_request(getattr(request, "url", ""), post_data, id(request))
+            try:
+                method = str(getattr(request, "method", "") or "").upper()
+            except Exception:
+                method = ""
+            payload_known = method in {"GET", "HEAD"}
+            post_data = ""
+            if method in {"POST", "PUT", "PATCH", "DELETE"}:
+                try:
+                    post_data = request.post_data
+                    payload_known = post_data is not None
+                    post_data = post_data or ""
+                except Exception:
+                    payload_known = False
+            _mark_list_request(getattr(request, "url", ""), post_data, id(request), payload_known)
 
         def _on_response(response):
             url = getattr(response, "url", "") or ""
@@ -2254,8 +2277,12 @@ def _attach_list_response_observer(page, target_filter=None):
             request_id = id(request) if request is not None else None
             _record_status(url, status, request_id)
             req_url = getattr(request, "url", url) if request is not None else url
-            post_data = getattr(request, "post_data", None) if request is not None else ""
-            if not _is_list_request_url(req_url or url):
+            request_state = observations.request_filter_states.get(request_id, "unknown")
+            if not _is_list_request_url(req_url or url) or request_state == "unknown":
+                return
+            try:
+                post_data = request.post_data if request is not None else ""
+            except Exception:
                 return
             need_target = _request_carries_target_filter(req_url or url, post_data or "", target_filter)
             try:
@@ -2943,13 +2970,14 @@ def _scan_known_main_id_pages(page, app_id, app_name, channel_name):
     return {"status": "failure", "snapshot": {}, "reason": "page_scan_limit_reached"}
 
 
-def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_attempted):
+def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_attempted, refresh_clicked):
     bounded = lambda value: min(max(int(value or 0), 0), _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS * 2)
     print("[create_app] unfiltered_list_gate=" + json.dumps({
         "reason": reason,
         "attempts": min(max(int(attempts or 0), 0), _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS),
         "gate_passed": bool(gate_passed),
         "refresh_attempted": bool(refresh_attempted),
+        "refresh_clicked": bool(refresh_clicked),
         "target_absent_requests": bounded(counts.get("target_absent_requests")),
         "target_filtered_requests": bounded(counts.get("target_filtered_requests")),
         "unknown_requests": bounded(counts.get("unknown_requests")),
@@ -2979,6 +3007,7 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
     gate_reasons = []
     gate_passed = False
     refresh_attempted = False
+    refresh_clicked = False
     gate_counts = {"target_absent_requests": 0, "target_filtered_requests": 0, "unknown_requests": 0, "target_absent_2xx": 0}
     for attempt in range(_POST_SAVE_KNOWN_ID_POLL_ATTEMPTS):
         if attempt:
@@ -2994,7 +3023,11 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
                 and not refresh_attempted
                 and not getattr(observations, "list_request_count", 0)
             ):
-                refresh_attempted = _trigger_unfiltered_list_refresh(page)
+                refresh_attempted = True
+                try:
+                    refresh_clicked = bool(_trigger_unfiltered_list_refresh(page))
+                except Exception:
+                    refresh_clicked = False
             restored = _wait_for_unfiltered_list_restore(
                 page,
                 previous_state,
@@ -3047,7 +3080,9 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
             "key_kind": second_decision["row"].get("key_kind"),
         }
     reason = _LIST_GATE_PASSED_ID_NOT_FOUND if gate_passed else _deepest_list_gate_reason(gate_reasons)
-    _log_unfiltered_list_gate(reason, _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS, gate_passed, gate_counts, refresh_attempted)
+    _log_unfiltered_list_gate(
+        reason, _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS, gate_passed, gate_counts, refresh_attempted, refresh_clicked
+    )
     return _known_main_failure("zero_candidates_after_poll", scanned.get("snapshot"))
 
 
