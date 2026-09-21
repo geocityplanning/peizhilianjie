@@ -5,8 +5,10 @@ These tests never connect to UAT, Chrome, or CDP.
 """
 from __future__ import annotations
 
+import json
 import sys
 import types
+from pathlib import Path
 
 import pytest
 from urllib.parse import quote
@@ -705,6 +707,38 @@ def test_channel_names_empty_is_target_absent_but_nonempty_is_target_filtered():
     cap = _stub_login_and_import()
     assert cap._list_request_filter_state(LIST_URL, '{"channelNames":[]}') == "target_absent"
     assert cap._list_request_filter_state(LIST_URL, '{"channelNames":["secret"]}') == "target_filtered"
+
+
+def test_contract_documents_confirmed_list_filters_and_platform_context():
+    contract = (Path(__file__).parents[1] / "contracts" / "hermes-http-v1.md").read_text(encoding="utf-8")
+    for field in ("appStatus", "appShortUrl", "appLongUrl", "placeList", "categoryList", "balanceType", "platformType"):
+        assert field in contract
+    assert "0/1/2" in contract
+
+
+def test_confirmed_app_list_filters_empty_are_target_absent_and_nonempty_is_filtered():
+    cap = _stub_login_and_import()
+    reset_shape = {
+        "platformType": 2, "pageNum": 1, "pageSize": 10,
+        "appName": "", "appStatus": "", "appShortUrl": "", "appLongUrl": "",
+        "channelNames": [], "placeList": [], "categoryList": [], "creator": "",
+        "balanceType": "", "basePlatform": "", "id": None,
+    }
+    assert cap._list_request_filter_state(LIST_URL, json.dumps(reset_shape)) == "target_absent"
+    reset_shape["appStatus"] = "nonempty"
+    assert cap._list_request_filter_state(LIST_URL, json.dumps(reset_shape)) == "target_filtered"
+
+
+@pytest.mark.parametrize("value", [0, 1, 2, "0", "1", "2", "02"])
+def test_confirmed_platform_type_context_values_are_not_filters(value):
+    cap = _stub_login_and_import()
+    assert cap._list_request_filter_state(LIST_URL, json.dumps({"platformType": value, "pageNum": 1})) == "target_absent"
+
+
+@pytest.mark.parametrize("value", [3, -1, True, None, [], {}, "other"])
+def test_platform_type_invalid_values_remain_unknown(value):
+    cap = _stub_login_and_import()
+    assert cap._list_request_filter_state(LIST_URL, json.dumps({"platformType": value, "pageNum": 1})) == "unknown"
 
 
 def test_channel_names_query_form_null_and_empty_array_classification():

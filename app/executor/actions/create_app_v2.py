@@ -1811,8 +1811,23 @@ def _locate_target_filter_field(url, post_data, target_filter):
 _LIST_PAGING_KEYS = {"pagenum", "pagenumber", "page", "pagesize", "size", "current", "limit", "sort", "order", "orderby"}
 _LIST_FILTER_KEYS = {
     "channelidlist", "channelname", "channelnames", "channelid", "appname", "applicationname", "appid", "appids",
+    "appstatus", "appshorturl", "applongurl", "placelist", "categorylist", "balancetype", "id",
     "baseplatform", "creator", "starttime", "endtime", "status", "type",
 }
+_LIST_PLATFORM_CONTEXT_KEY = "platformtype"
+
+
+def _is_valid_list_platform_context(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value in {0, 1, 2}
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        try:
+            return int(value.strip()) in {0, 1, 2}
+        except ValueError:
+            return False
+    return False
 
 
 def _list_request_filter_state(url, post_data):
@@ -1856,6 +1871,10 @@ def _list_request_filter_state(url, post_data):
     if not fields:
         return "target_absent"
     for key, value in fields:
+        if key == _LIST_PLATFORM_CONTEXT_KEY:
+            if not _is_valid_list_platform_context(value):
+                return "unknown"
+            continue
         if key in _LIST_FILTER_KEYS and not empty(value):
             return "target_filtered"
         if key not in _LIST_PAGING_KEYS and key not in _LIST_FILTER_KEYS:
