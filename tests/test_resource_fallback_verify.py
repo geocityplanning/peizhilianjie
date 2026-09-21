@@ -153,6 +153,9 @@ def _prepare_stage(monkeypatch, cap, page):
         return True
 
     monkeypatch.setattr(cap, "_click_save_button", counted_save)
+    monkeypatch.setattr(cap, "_attach_save_click_observer", lambda *args, **kwargs: cap._SaveClickObserver())
+    monkeypatch.setattr(cap, "_wait_for_save_click_observation", lambda *args, **kwargs: {"outcome": "success", "http_status": 200})
+    monkeypatch.setattr(cap, "_detach_save_click_observer", lambda *args, **kwargs: None)
 
 
 def _stage_data():
@@ -273,6 +276,42 @@ def test_native_locator_fill_and_tab_are_required(monkeypatch):
     assert page.input_locator.calls[0][0:2] == ("fill", EXPECTED)
     assert page.input_locator.calls[1][0:2] == ("press", "Tab")
     assert page.marker_cleared is True
+
+
+def _save_observer(cap, *records):
+    observer = cap._SaveClickObserver()
+    observer.candidates = {f"r{index}": record for index, record in enumerate(records)}
+    return observer
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        ({"completed": True, "http_status": 200, "business": {"outcome": "success"}}, "success"),
+        ({"completed": True, "http_status": 200, "business": {"outcome": "rejected"}}, "business_rejected"),
+        ({"completed": True, "http_status": 500, "business": {"outcome": "success"}}, "non_2xx"),
+        ({"completed": False}, "response_timeout"),
+    ],
+)
+def test_save_observation_never_treats_http_2xx_alone_as_success(record, expected):
+    cap = _stub_login_and_import()
+    assert cap._save_click_observation(_save_observer(cap, record))["outcome"] == expected
+
+
+def test_save_observation_rejects_missing_or_multiple_candidates():
+    cap = _stub_login_and_import()
+    assert cap._save_click_observation(_save_observer(cap))["outcome"] == "no_candidate"
+    assert cap._save_click_observation(_save_observer(cap, {"completed": True}, {"completed": True}))["outcome"] == "ambiguous_candidate"
+
+
+def test_save_business_summary_is_redacted():
+    cap = _stub_login_and_import()
+    summary = cap._save_business_summary('{"header":{"status":"500","code":"secret-code","message":"secret-message"}}')
+    assert summary["outcome"] == "rejected"
+    assert summary["code"]["present"] is True
+    assert summary["message"]["present"] is True
+    assert "secret-code" not in str(summary)
+    assert "secret-message" not in str(summary)
 
 
 def test_click_save_requires_unique_exact_enabled_handler_bound_control():
@@ -563,6 +602,24 @@ def test_save_dialog_still_open_after_click_is_unknown(monkeypatch):
     assert result["error"]["code"] == "SAVE_FAILED"
     assert result["error"]["next_action"] == cap.NEXT_QUERY
     assert result["save_may_have_occurred"] is True
+    assert page.save_clicks == 1
+
+
+@pytest.mark.parametrize("outcome", ["business_rejected", "non_2xx", "no_candidate", "response_timeout", "ambiguous_candidate"])
+def test_save_observer_uncertainty_stops_after_one_click(monkeypatch, outcome):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    _prepare_stage(monkeypatch, cap, page)
+    monkeypatch.setattr(cap, "_fill_and_verify_resource_fallback", lambda *args, **kwargs: {"success": True})
+    monkeypatch.setattr(cap, "_wait_for_save_click_observation", lambda *args, **kwargs: {"outcome": outcome})
+
+    result = cap._stage_create_save(
+        page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type"
+    )
+
+    assert result["success"] is False
+    assert result["save_may_have_occurred"] is True
+    assert result["error"]["next_action"] == cap.NEXT_QUERY
     assert page.save_clicks == 1
 
 

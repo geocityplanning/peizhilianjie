@@ -3,6 +3,7 @@
 创建应用 — 契约版（v2，JS 直操 DOM，绕过 Playwright :visible 伪类）。
 """
 import base64
+import hashlib
 import json
 import os
 import re
@@ -1628,6 +1629,14 @@ def _click_next_page_and_wait(page):
     return True
 
 
+class _SaveClickObserver:
+    """Bounded, redacted observer for exactly one write request after Save click."""
+
+    def __init__(self):
+        self.keepalive = None
+        self.candidates = {}
+
+
 class _ListRequestObserver(list):
     """记录列表请求的 HTTP 状态，并持有 CDP 会话引用避免被回收。
 
@@ -1786,6 +1795,141 @@ def _detach_list_response_observer(observations):
             observations.keepalive = None
         except Exception:
             pass
+
+
+def _redacted_text_summary(value):
+    text = _as_text(value)
+    return {
+        "present": bool(text),
+        "length": len(text),
+        "sha256_16": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16] if text else None,
+    }
+
+
+def _save_business_summary(body):
+    """Classify only an evidenced generic backend envelope; retain no body text."""
+    try:
+        payload = json.loads(_as_text(body))
+    except Exception:
+        return {"outcome": "unreadable", "code": _redacted_text_summary(""), "message": _redacted_text_summary("")}
+    if not isinstance(payload, dict):
+        return {"outcome": "unreadable", "code": _redacted_text_summary(""), "message": _redacted_text_summary("")}
+    header = payload.get("header") if isinstance(payload.get("header"), dict) else {}
+    status = header.get("status", payload.get("status"))
+    code = header.get("code", payload.get("code"))
+    message = header.get("message", header.get("msg", payload.get("message", payload.get("msg", ""))))
+    success = payload.get("success")
+    if str(status) == "200" or success is True:
+        outcome = "success"
+    elif status is not None or success is False or code is not None:
+        outcome = "rejected"
+    else:
+        outcome = "unreadable"
+    return {"outcome": outcome, "code": _redacted_text_summary(code), "message": _redacted_text_summary(message)}
+
+
+def _save_path_hash(url):
+    path = urlparse(_as_text(url)).path or ""
+    return hashlib.sha256(path.encode("utf-8")).hexdigest()[:16] if path else None
+
+
+def _save_click_observation(observer):
+    """Return a redacted atomic decision; never promote 2xx alone to success."""
+    if observer is None:
+        return {"outcome": "observer_unavailable"}
+    candidates = list(getattr(observer, "candidates", {}).values())
+    if len(candidates) != 1:
+        return {"outcome": "no_candidate" if not candidates else "ambiguous_candidate", "candidate_count": len(candidates)}
+    candidate = candidates[0]
+    if not candidate.get("completed"):
+        return {"outcome": "response_timeout", "candidate_count": 1}
+    status = candidate.get("http_status")
+    if not isinstance(status, int) or not 200 <= status < 300:
+        return {"outcome": "non_2xx", "candidate_count": 1, "http_status": status}
+    business = candidate.get("business") or {"outcome": "unreadable"}
+    if business.get("outcome") != "success":
+        return {"outcome": "business_" + str(business.get("outcome")), "candidate_count": 1, "http_status": status, "business": business}
+    return {"outcome": "success", "candidate_count": 1, "http_status": status, "business": business}
+
+
+def _wait_for_save_click_observation(page, observer, timeout_ms=6000, poll_interval_ms=150):
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    while time.monotonic() < deadline:
+        decision = _save_click_observation(observer)
+        if decision.get("outcome") not in {"no_candidate", "response_timeout"}:
+            return decision
+        page.wait_for_timeout(poll_interval_ms)
+    return _save_click_observation(observer)
+
+
+def _attach_save_click_observer(page):
+    """Observe one post-click same-origin non-list write request by request ID only."""
+    observer = _SaveClickObserver()
+    try:
+        session = page.context.new_cdp_session(page)
+        session.send("Network.enable")
+        origin = urlparse(BASE_URL_H5).netloc
+
+        def _on_request(params):
+            data = params or {}
+            request = data.get("request") or {}
+            url = request.get("url") or ""
+            method = str(request.get("method") or "").upper()
+            if method not in {"POST", "PUT", "PATCH", "DELETE"} or _is_list_request_url(url):
+                return
+            if urlparse(url).netloc != origin:
+                return
+            request_id = data.get("requestId")
+            if request_id:
+                observer.candidates[request_id] = {
+                    "method": method,
+                    "path_hash": _save_path_hash(url),
+                    "completed": False,
+                }
+
+        def _on_response(params):
+            data = params or {}
+            request_id = data.get("requestId")
+            candidate = observer.candidates.get(request_id)
+            if candidate is None:
+                return
+            response = data.get("response") or {}
+            try:
+                candidate["http_status"] = int(response.get("status") or 0)
+            except (TypeError, ValueError):
+                candidate["http_status"] = 0
+
+        def _on_finished(params):
+            request_id = (params or {}).get("requestId")
+            candidate = observer.candidates.get(request_id)
+            if candidate is None:
+                return
+            candidate["completed"] = True
+            try:
+                body = (session.send("Network.getResponseBody", {"requestId": request_id}) or {}).get("body")
+                candidate["business"] = _save_business_summary(body)
+            except Exception:
+                candidate["business"] = {"outcome": "unreadable"}
+
+        def _on_failed(params):
+            candidate = observer.candidates.get((params or {}).get("requestId"))
+            if candidate is not None:
+                candidate["completed"] = True
+                candidate["http_status"] = 0
+                candidate["business"] = {"outcome": "unreadable"}
+
+        session.on("Network.requestWillBeSent", _on_request)
+        session.on("Network.responseReceived", _on_response)
+        session.on("Network.loadingFinished", _on_finished)
+        session.on("Network.loadingFailed", _on_failed)
+        observer.keepalive = session
+        return observer
+    except Exception:
+        return None
+
+
+def _detach_save_click_observer(observer):
+    _detach_list_response_observer(observer)
 
 
 def _attach_list_response_observer(page, target_filter=None):
@@ -3214,9 +3358,20 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
       }
     }""")
     page.wait_for_timeout(300)
+    save_observer = _attach_save_click_observer(page)
     saved = _click_save_button(page)
     if not saved:
+        _detach_save_click_observer(save_observer)
         return {"success": False, "error": err("SAVE_FAILED", "SAVE", "未找到保存按钮", NEXT_MANUAL)}
+    try:
+        save_observation = _wait_for_save_click_observation(page, save_observer)
+    finally:
+        _detach_save_click_observer(save_observer)
+    if save_observation.get("outcome") != "success":
+        print("[create_app] 保存响应观察: outcome=" + str(save_observation.get("outcome")))
+        return _post_save_unconfirmed_failure(
+            err("SAVE_FAILED", "SAVE", "保存响应未能唯一确认业务成功，已停止", NEXT_MANUAL)
+        )
     try:
         page.wait_for_selector(".el-dialog__wrapper:not([style*='display: none'])", state="detached", timeout=8000)
     except Exception:
