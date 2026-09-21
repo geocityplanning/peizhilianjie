@@ -1965,14 +1965,32 @@ def _redacted_text_summary(value):
     }
 
 
-def _save_business_summary(body):
-    """Classify only an evidenced generic backend envelope; retain no body text."""
+_SAVE_BODY_FETCH_STATES = {"available", "missing", "read_error", "base64_decoded", "base64_decode_error"}
+_SAVE_BODY_PARSE_STATES = {"not_applicable", "json_unparsable", "json_non_object", "envelope_missing", "envelope_classified"}
+
+
+def _save_response_body(result):
+    """Return response text and fixed fetch state; never retain the CDP result."""
+    if not isinstance(result, dict) or "body" not in result:
+        return "", "missing"
+    body = result.get("body")
+    if result.get("base64Encoded"):
+        try:
+            raw = base64.b64decode(_as_text(body), validate=True)
+            return raw.decode("utf-8"), "base64_decoded"
+        except Exception:
+            return "", "base64_decode_error"
+    return _as_text(body), "available"
+
+
+def _save_business_summary_detail(body):
+    """Classify an evidenced generic envelope without retaining its text."""
     try:
         payload = json.loads(_as_text(body))
     except Exception:
-        return {"outcome": "unreadable", "code": _redacted_text_summary(""), "message": _redacted_text_summary("")}
+        return {"outcome": "unreadable", "code": _redacted_text_summary(""), "message": _redacted_text_summary("")}, "json_unparsable"
     if not isinstance(payload, dict):
-        return {"outcome": "unreadable", "code": _redacted_text_summary(""), "message": _redacted_text_summary("")}
+        return {"outcome": "unreadable", "code": _redacted_text_summary(""), "message": _redacted_text_summary("")}, "json_non_object"
     header = payload.get("header") if isinstance(payload.get("header"), dict) else {}
     status = header.get("status", payload.get("status"))
     code = header.get("code", payload.get("code"))
@@ -1984,7 +2002,12 @@ def _save_business_summary(body):
         outcome = "rejected"
     else:
         outcome = "unreadable"
-    return {"outcome": outcome, "code": _redacted_text_summary(code), "message": _redacted_text_summary(message)}
+    parse_state = "envelope_classified" if outcome != "unreadable" else "envelope_missing"
+    return {"outcome": outcome, "code": _redacted_text_summary(code), "message": _redacted_text_summary(message)}, parse_state
+
+
+def _save_business_summary(body):
+    return _save_business_summary_detail(body)[0]
 
 
 def _save_path_hash(url):
@@ -2013,10 +2036,17 @@ def _save_candidate_evidence(candidate):
     method = candidate.get("method")
     path_hash = candidate.get("path_hash")
     status = candidate.get("http_status")
+    body = candidate.get("response_body") if isinstance(candidate.get("response_body"), dict) else {}
+    fetch_state = body.get("fetch_state")
+    parse_state = body.get("parse_state")
     return {
         "method": method if method in {"POST", "PUT", "PATCH", "DELETE"} else None,
         "path_hash": path_hash if isinstance(path_hash, str) and re.fullmatch(r"[0-9a-f]{16}", path_hash) else None,
         "http_status": status if isinstance(status, int) else None,
+        "response_body": {
+            "fetch_state": fetch_state if fetch_state in _SAVE_BODY_FETCH_STATES else "missing",
+            "parse_state": parse_state if parse_state in _SAVE_BODY_PARSE_STATES else "not_applicable",
+        },
         "business": {
             "outcome": business_outcome,
             "code": _redacted_summary_projection(business.get("code")),
@@ -2117,9 +2147,13 @@ def _attach_save_click_observer(page):
                 return
             candidate["completed"] = True
             try:
-                body = (session.send("Network.getResponseBody", {"requestId": request_id}) or {}).get("body")
-                candidate["business"] = _save_business_summary(body)
+                result = session.send("Network.getResponseBody", {"requestId": request_id})
+                body, fetch_state = _save_response_body(result)
+                business, parse_state = _save_business_summary_detail(body)
+                candidate["response_body"] = {"fetch_state": fetch_state, "parse_state": parse_state}
+                candidate["business"] = business
             except Exception:
+                candidate["response_body"] = {"fetch_state": "read_error", "parse_state": "not_applicable"}
                 candidate["business"] = {"outcome": "unreadable"}
 
         def _on_failed(params):

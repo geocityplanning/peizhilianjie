@@ -2,6 +2,7 @@
 """Offline behavior tests for resource fallback framework/persistence verification."""
 from __future__ import annotations
 
+import base64
 import json
 import sys
 import types
@@ -334,7 +335,7 @@ def test_unique_save_decision_retains_only_whitelisted_evidence():
         "url": "https://secret.invalid/path?secret=query",
         "body": "secret-body",
     }))
-    assert set(decision) == {"outcome", "method", "path_hash", "http_status", "business"}
+    assert set(decision) == {"outcome", "method", "path_hash", "http_status", "response_body", "business"}
     assert decision["method"] == "POST"
     assert decision["path_hash"] == "0123456789abcdef"
     assert decision["business"]["code"]["sha256_16"] == "abcdef0123456789"
@@ -353,10 +354,24 @@ def test_zero_or_multiple_candidate_diagnostics_never_enumerate_paths(decision, 
     assert cap._save_click_diagnostic(decision) == expected
 
 
+def test_save_response_body_decodes_base64_and_keeps_http_2xx_non_success_without_envelope():
+    cap = _stub_login_and_import()
+    encoded = base64.b64encode(b'{"header":{"status":"200"}}').decode("ascii")
+    body, fetch_state = cap._save_response_body({"body": encoded, "base64Encoded": True})
+    business, parse_state = cap._save_business_summary_detail(body)
+    assert (fetch_state, parse_state, business["outcome"]) == ("base64_decoded", "envelope_classified", "success")
+
+    body, fetch_state = cap._save_response_body({"body": "not-json", "base64Encoded": False})
+    business, parse_state = cap._save_business_summary_detail(body)
+    assert (fetch_state, parse_state, business["outcome"]) == ("available", "json_unparsable", "unreadable")
+    assert cap._save_response_body({}) == ("", "missing")
+
+
 def test_save_diagnostic_is_single_redacted_json_line(capsys):
     cap = _stub_login_and_import()
     cap._log_save_click_observation({
         "outcome": "success", "method": "POST", "path_hash": "0123456789abcdef", "http_status": 200,
+        "response_body": {"fetch_state": "read_error", "parse_state": "not_applicable", "raw": "secret-body"},
         "business": {
             "outcome": "success",
             "code": {"present": True, "length": 11, "sha256_16": "abcdef0123456789", "raw": "secret-code"},
@@ -373,9 +388,10 @@ def test_save_diagnostic_is_single_redacted_json_line(capsys):
     assert logged["method"] == "POST"
     assert logged["path_hash"] == "0123456789abcdef"
     assert logged["business"]["outcome"] == "success"
+    assert logged["response_body"] == {"fetch_state": "read_error", "parse_state": "not_applicable"}
     assert "secret" not in lines[0]
     assert "url" not in lines[0]
-    assert "body" not in lines[0]
+    assert '"body":' not in lines[0]
 
 
 def test_click_save_requires_unique_exact_enabled_handler_bound_control():
