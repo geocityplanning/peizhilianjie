@@ -2,6 +2,7 @@
 """Offline behavior tests for resource fallback framework/persistence verification."""
 from __future__ import annotations
 
+import json
 import sys
 import types
 
@@ -154,7 +155,14 @@ def _prepare_stage(monkeypatch, cap, page):
 
     monkeypatch.setattr(cap, "_click_save_button", counted_save)
     monkeypatch.setattr(cap, "_attach_save_click_observer", lambda *args, **kwargs: cap._SaveClickObserver())
-    monkeypatch.setattr(cap, "_wait_for_save_click_observation", lambda *args, **kwargs: {"outcome": "success", "http_status": 200})
+    monkeypatch.setattr(cap, "_wait_for_save_click_observation", lambda *args, **kwargs: {
+        "outcome": "success", "method": "POST", "path_hash": "0123456789abcdef", "http_status": 200,
+        "business": {
+            "outcome": "success",
+            "code": {"present": True, "length": 3, "sha256_16": "abcdef0123456789"},
+            "message": {"present": True, "length": 2, "sha256_16": "fedcba9876543210"},
+        },
+    })
     monkeypatch.setattr(cap, "_detach_save_click_observer", lambda *args, **kwargs: None)
 
 
@@ -312,6 +320,62 @@ def test_save_business_summary_is_redacted():
     assert summary["message"]["present"] is True
     assert "secret-code" not in str(summary)
     assert "secret-message" not in str(summary)
+
+
+def test_unique_save_decision_retains_only_whitelisted_evidence():
+    cap = _stub_login_and_import()
+    decision = cap._save_click_observation(_save_observer(cap, {
+        "method": "POST", "path_hash": "0123456789abcdef", "completed": True, "http_status": 200,
+        "business": {
+            "outcome": "success",
+            "code": {"present": True, "length": 3, "sha256_16": "abcdef0123456789"},
+            "message": {"present": True, "length": 4, "sha256_16": "fedcba9876543210"},
+        },
+        "url": "https://secret.invalid/path?secret=query",
+        "body": "secret-body",
+    }))
+    assert set(decision) == {"outcome", "method", "path_hash", "http_status", "business"}
+    assert decision["method"] == "POST"
+    assert decision["path_hash"] == "0123456789abcdef"
+    assert decision["business"]["code"]["sha256_16"] == "abcdef0123456789"
+    assert "secret" not in str(decision)
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected"),
+    [
+        ({"outcome": "no_candidate", "candidate_count": 0}, {"outcome": "no_candidate", "candidate_count": 0}),
+        ({"outcome": "ambiguous_candidate", "candidate_count": 2, "path_hash": "0123456789abcdef"}, {"outcome": "ambiguous_candidate", "candidate_count": 2}),
+    ],
+)
+def test_zero_or_multiple_candidate_diagnostics_never_enumerate_paths(decision, expected):
+    cap = _stub_login_and_import()
+    assert cap._save_click_diagnostic(decision) == expected
+
+
+def test_save_diagnostic_is_single_redacted_json_line(capsys):
+    cap = _stub_login_and_import()
+    cap._log_save_click_observation({
+        "outcome": "success", "method": "POST", "path_hash": "0123456789abcdef", "http_status": 200,
+        "business": {
+            "outcome": "success",
+            "code": {"present": True, "length": 11, "sha256_16": "abcdef0123456789", "raw": "secret-code"},
+            "message": {"present": True, "length": 14, "sha256_16": "fedcba9876543210", "raw": "secret-message"},
+        },
+        "url": "https://secret.invalid/path?secret=query", "body": "secret-body",
+    })
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    prefix = "[create_app] save_observation="
+    assert lines[0].startswith(prefix)
+    logged = json.loads(lines[0][len(prefix):])
+    assert logged["outcome"] == "success"
+    assert logged["method"] == "POST"
+    assert logged["path_hash"] == "0123456789abcdef"
+    assert logged["business"]["outcome"] == "success"
+    assert "secret" not in lines[0]
+    assert "url" not in lines[0]
+    assert "body" not in lines[0]
 
 
 def test_click_save_requires_unique_exact_enabled_handler_bound_control():
@@ -603,6 +667,27 @@ def test_save_dialog_still_open_after_click_is_unknown(monkeypatch):
     assert result["error"]["next_action"] == cap.NEXT_QUERY
     assert result["save_may_have_occurred"] is True
     assert page.save_clicks == 1
+
+
+def test_stage_logs_successful_save_observation_before_followup_verification(monkeypatch, capsys):
+    cap = _stub_login_and_import()
+    page = StagePage()
+    _prepare_stage(monkeypatch, cap, page)
+    monkeypatch.setattr(cap, "_fill_and_verify_resource_fallback", lambda *args, **kwargs: {"success": True})
+    monkeypatch.setattr(cap, "capture_page_errors", lambda *args, **kwargs: {"dialog_open": False})
+    monkeypatch.setattr(cap, "_identify_new_app", lambda *args, **kwargs: {
+        "success": False, "error": cap.err("NEW_APP_ID_NOT_FOUND", "VERIFY", "not found", cap.NEXT_MANUAL)
+    })
+
+    cap._stage_create_save(
+        page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type"
+    )
+
+    output = capsys.readouterr().out
+    assert "[create_app] save_observation=" in output
+    assert '"outcome":"success"' in output
+    assert '"method":"POST"' in output
+    assert '"path_hash":"0123456789abcdef"' in output
 
 
 @pytest.mark.parametrize("outcome", ["business_rejected", "non_2xx", "no_candidate", "response_timeout", "ambiguous_candidate"])

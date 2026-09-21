@@ -1833,6 +1833,58 @@ def _save_path_hash(url):
     return hashlib.sha256(path.encode("utf-8")).hexdigest()[:16] if path else None
 
 
+def _redacted_summary_projection(summary):
+    summary = summary if isinstance(summary, dict) else {}
+    length = summary.get("length")
+    digest = summary.get("sha256_16")
+    return {
+        "present": summary.get("present") is True,
+        "length": length if isinstance(length, int) and length >= 0 else 0,
+        "sha256_16": digest if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{16}", digest) else None,
+    }
+
+
+def _save_candidate_evidence(candidate):
+    """Project a candidate to the sole fields permitted in logs and decisions."""
+    candidate = candidate if isinstance(candidate, dict) else {}
+    business = candidate.get("business") if isinstance(candidate.get("business"), dict) else {}
+    business_outcome = business.get("outcome")
+    if business_outcome not in {"success", "rejected", "unreadable"}:
+        business_outcome = "unreadable"
+    method = candidate.get("method")
+    path_hash = candidate.get("path_hash")
+    status = candidate.get("http_status")
+    return {
+        "method": method if method in {"POST", "PUT", "PATCH", "DELETE"} else None,
+        "path_hash": path_hash if isinstance(path_hash, str) and re.fullmatch(r"[0-9a-f]{16}", path_hash) else None,
+        "http_status": status if isinstance(status, int) else None,
+        "business": {
+            "outcome": business_outcome,
+            "code": _redacted_summary_projection(business.get("code")),
+            "message": _redacted_summary_projection(business.get("message")),
+        },
+    }
+
+
+def _save_click_diagnostic(decision):
+    """One stable, machine-readable and redacted log record for every outcome."""
+    decision = decision if isinstance(decision, dict) else {}
+    outcome = decision.get("outcome") if isinstance(decision.get("outcome"), str) else "unreadable"
+    if outcome in {"no_candidate", "ambiguous_candidate"}:
+        count = decision.get("candidate_count")
+        return {"outcome": outcome, "candidate_count": count if isinstance(count, int) and count >= 0 else 0}
+    if outcome == "observer_unavailable":
+        return {"outcome": outcome}
+    evidence = _save_candidate_evidence(decision)
+    return {"outcome": outcome, **evidence}
+
+
+def _log_save_click_observation(decision):
+    print("[create_app] save_observation=" + json.dumps(
+        _save_click_diagnostic(decision), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ))
+
+
 def _save_click_observation(observer):
     """Return a redacted atomic decision; never promote 2xx alone to success."""
     if observer is None:
@@ -1841,15 +1893,15 @@ def _save_click_observation(observer):
     if len(candidates) != 1:
         return {"outcome": "no_candidate" if not candidates else "ambiguous_candidate", "candidate_count": len(candidates)}
     candidate = candidates[0]
+    evidence = _save_candidate_evidence(candidate)
     if not candidate.get("completed"):
-        return {"outcome": "response_timeout", "candidate_count": 1}
-    status = candidate.get("http_status")
+        return {"outcome": "response_timeout", **evidence}
+    status = evidence["http_status"]
     if not isinstance(status, int) or not 200 <= status < 300:
-        return {"outcome": "non_2xx", "candidate_count": 1, "http_status": status}
-    business = candidate.get("business") or {"outcome": "unreadable"}
-    if business.get("outcome") != "success":
-        return {"outcome": "business_" + str(business.get("outcome")), "candidate_count": 1, "http_status": status, "business": business}
-    return {"outcome": "success", "candidate_count": 1, "http_status": status, "business": business}
+        return {"outcome": "non_2xx", **evidence}
+    if evidence["business"]["outcome"] != "success":
+        return {"outcome": "business_" + evidence["business"]["outcome"], **evidence}
+    return {"outcome": "success", **evidence}
 
 
 def _wait_for_save_click_observation(page, observer, timeout_ms=6000, poll_interval_ms=150):
@@ -3367,8 +3419,8 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
         save_observation = _wait_for_save_click_observation(page, save_observer)
     finally:
         _detach_save_click_observer(save_observer)
+    _log_save_click_observation(save_observation)
     if save_observation.get("outcome") != "success":
-        print("[create_app] 保存响应观察: outcome=" + str(save_observation.get("outcome")))
         return _post_save_unconfirmed_failure(
             err("SAVE_FAILED", "SAVE", "保存响应未能唯一确认业务成功，已停止", NEXT_MANUAL)
         )
