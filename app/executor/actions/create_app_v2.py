@@ -2622,11 +2622,32 @@ def _scan_known_main_id_pages(page, app_id, app_name, channel_name):
 
 
 def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel_name):
-    """Read-only post-save locator: two stable main reads before the Copy recheck."""
+    """Read-only post-save locator: require a fresh unfiltered response before scanning.
+
+    `_identify_new_app` may have found an ID in a channel-filtered view.  Resetting
+    filters must not immediately reuse stale unfiltered DOM: each reset is bound to
+    a newly observed complete 2xx list structure and its stable rendered DOM before
+    the known ID may be scanned.
+    """
+    scanned = {"snapshot": {}}
     for attempt in range(_POST_SAVE_KNOWN_ID_POLL_ATTEMPTS):
         if attempt:
             page.wait_for_timeout(_POST_SAVE_KNOWN_ID_POLL_MS)
-        _reset_list_filters(page)
+        previous_state = _read_list_restore_state(page) or {}
+        observations = _attach_list_response_observer(page)
+        records_before = len(getattr(observations, "success_records", []) or []) if observations is not None else 0
+        try:
+            _reset_list_filters(page)
+            restored = _wait_for_unfiltered_list_restore(
+                page,
+                previous_state,
+                observations=observations,
+                records_before=records_before,
+            )
+        finally:
+            _detach_list_response_observer(observations)
+        if not restored:
+            continue
         if not _go_to_first_page(page):
             return _known_main_failure("pagination_unstable")
         scanned = _scan_known_main_id_pages(page, app_id, app_name, channel_name)

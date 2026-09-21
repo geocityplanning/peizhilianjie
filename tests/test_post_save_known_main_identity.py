@@ -55,6 +55,10 @@ class SequencePage:
 def _install_navigation(monkeypatch, cap, *, next_results=()):
     resets = []
     next_results = iter(next_results)
+    monkeypatch.setattr(cap, "_read_list_restore_state", lambda page: {"table_signature": "filtered", "row_count": 1})
+    monkeypatch.setattr(cap, "_attach_list_response_observer", lambda page: cap._ListRequestObserver())
+    monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_detach_list_response_observer", lambda observations: None)
     monkeypatch.setattr(cap, "_reset_list_filters", lambda page: resets.append(True))
     monkeypatch.setattr(cap, "_go_to_first_page", lambda page: True)
     monkeypatch.setattr(cap, "_click_next_page_and_wait", lambda page: next(next_results, False))
@@ -74,6 +78,41 @@ def test_known_locator_zero_candidate_is_bounded_read_only_polling(monkeypatch):
     assert result["id_field_source"] == "main"
     assert len(resets) == cap._POST_SAVE_KNOWN_ID_POLL_ATTEMPTS
     assert page.waits == [cap._POST_SAVE_KNOWN_ID_POLL_MS] * (cap._POST_SAVE_KNOWN_ID_POLL_ATTEMPTS - 1)
+
+
+def test_known_locator_does_not_scan_id_without_fresh_unfiltered_restore(monkeypatch):
+    cap = _cap()
+    page = SequencePage([])
+    resets = _install_navigation(monkeypatch, cap)
+    monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: False)
+
+    result = cap._locate_known_main_row_for_resource_fallback(
+        page, "secret-id", "secret-name", "secret-channel"
+    )
+
+    assert result["success"] is False
+    assert result["reason"] == "zero_candidates_after_poll"
+    assert result["candidate_category"] == "0"
+    assert len(resets) == cap._POST_SAVE_KNOWN_ID_POLL_ATTEMPTS
+    assert page.payloads == []
+
+
+def test_known_locator_fresh_restore_can_find_id_on_new_page_15(monkeypatch):
+    cap = _cap()
+    page = SequencePage([
+        _payload(page=1),
+        _payload(("secret-id", "secret-name", "secret-channel", "row-15"), page=15),
+        _payload(("secret-id", "secret-name", "secret-channel", "row-15"), page=15),
+    ])
+    _install_navigation(monkeypatch, cap, next_results=(True, False))
+
+    result = cap._locate_known_main_row_for_resource_fallback(
+        page, "secret-id", "secret-name", "secret-channel"
+    )
+
+    assert result["success"] is True
+    assert result["page"] == 15
+    assert result["row_key"] == "row-15"
 
 
 def test_known_locator_never_accepts_detail_id(monkeypatch):
@@ -222,6 +261,10 @@ def test_known_locator_rejects_same_id_on_two_pages_as_true_conflict(monkeypatch
         def wait_for_timeout(self, milliseconds):
             return None
 
+    monkeypatch.setattr(cap, "_read_list_restore_state", lambda page: {"table_signature": "filtered", "row_count": 1})
+    monkeypatch.setattr(cap, "_attach_list_response_observer", lambda page: cap._ListRequestObserver())
+    monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_detach_list_response_observer", lambda observations: None)
     monkeypatch.setattr(cap, "_reset_list_filters", lambda page: None)
     monkeypatch.setattr(cap, "_go_to_first_page", lambda page: pages.__setitem__("current", 1) or True)
     monkeypatch.setattr(
@@ -252,6 +295,10 @@ def test_known_locator_restores_first_page_candidate_before_stable_read(monkeypa
         def wait_for_timeout(self, milliseconds):
             return None
 
+    monkeypatch.setattr(cap, "_read_list_restore_state", lambda page: {"table_signature": "filtered", "row_count": 1})
+    monkeypatch.setattr(cap, "_attach_list_response_observer", lambda page: cap._ListRequestObserver())
+    monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cap, "_detach_list_response_observer", lambda observations: None)
     monkeypatch.setattr(cap, "_reset_list_filters", lambda page: None)
     monkeypatch.setattr(cap, "_go_to_first_page", lambda page: pages.__setitem__("current", 1) or True)
     monkeypatch.setattr(
