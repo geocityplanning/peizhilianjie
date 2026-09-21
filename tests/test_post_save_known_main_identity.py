@@ -97,6 +97,20 @@ def test_known_locator_logs_gate_passed_id_not_found(monkeypatch, capsys):
     assert "secret-id" not in output and "secret-name" not in output and "secret-channel" not in output
 
 
+def test_unfiltered_gate_log_uses_fixed_diagnostics_only(capsys):
+    cap = _cap()
+    diagnostics = {key: 0 for key in cap._LIST_DIAGNOSTIC_KEYS}
+    diagnostics.update({"source_cdp": 1, "unknown_unsupported_key": 1, "secretField": 99})
+    cap._log_unfiltered_list_gate(
+        cap._LIST_GATE_NO_COMPLETE_RESPONSE, 3, False,
+        {"target_absent_requests": 0, "target_filtered_requests": 0, "unknown_requests": 1, "target_absent_2xx": 0},
+        False, False, diagnostics,
+    )
+    output = capsys.readouterr().out
+    assert '"source_cdp":1' in output and '"unknown_unsupported_key":1' in output
+    assert "secretField" not in output and "secretValue" not in output
+
+
 def test_known_locator_aggregates_gate_reason_by_deepest_evidence(monkeypatch, capsys):
     cap = _cap()
     page = SequencePage([])

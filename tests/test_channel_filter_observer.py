@@ -28,18 +28,24 @@ def _stub_login_and_import():
 
 
 class FakeCdpSession:
-    def __init__(self, response_bodies=None):
+    def __init__(self, response_bodies=None, request_bodies=None):
         self.enabled = False
         self.handlers = {}
         self.detached = False
         self.sends = []
         self.response_bodies = response_bodies or {}
+        self.request_bodies = request_bodies or {}
 
     def send(self, method, params=None):
         self.sends.append((method, params))
         if method == "Network.enable":
             self.enabled = True
             return {}
+        if method == "Network.getRequestPostData":
+            request_id = (params or {}).get("requestId")
+            if request_id in self.request_bodies:
+                return {"postData": self.request_bodies[request_id]}
+            raise RuntimeError("no request body")
         if method == "Network.getResponseBody":
             request_id = (params or {}).get("requestId")
             if request_id in self.response_bodies:
@@ -725,6 +731,8 @@ def test_page_event_write_request_without_body_is_unknown_and_response_is_not_re
     assert observations.request_filter_states[id(request)] == "unknown"
     assert observations.success_records == []
     assert observations.target_absent_2xx_count == 0
+    assert observations.diagnostic_counts["payload_unavailable"] == 1
+    assert observations.diagnostic_counts["unknown_unreadable_payload"] == 1
 
 
 def test_page_event_write_request_post_data_getter_error_is_unknown():
@@ -745,6 +753,8 @@ def test_page_event_write_request_post_data_getter_error_is_unknown():
     assert observations.request_filter_states[id(request)] == "unknown"
     assert observations.success_records == []
     assert observations.target_absent_2xx_count == 0
+    assert observations.diagnostic_counts["payload_read_error"] == 1
+    assert observations.diagnostic_counts["unknown_unreadable_payload"] == 1
 
 
 def test_cdp_missing_post_data_is_unknown_and_cannot_unlock_gate():
@@ -762,6 +772,58 @@ def test_cdp_missing_post_data_is_unknown_and_cannot_unlock_gate():
     assert observations.unknown_request_count == 1
     assert observations.target_absent_2xx_count == 0
     assert observations.success_records == []
+
+
+def test_cdp_diagnostics_keep_only_fixed_buckets_not_unknown_key_or_value():
+    cap = _stub_login_and_import()
+    session = FakeCdpSession()
+    observations = cap._attach_list_response_observer(FakePage(session=session))
+    session.emit("Network.requestWillBeSent", {
+        "requestId": "r1", "request": {"url": LIST_URL, "method": "POST", "postData": '{"secretField":"secretValue"}'},
+    })
+    counts = observations.diagnostic_counts
+    assert counts["source_cdp"] == counts["payload_inline"] == counts["shape_json_object"] == 1
+    assert counts["unknown_unsupported_key"] == 1
+    assert "secretField" not in str(vars(observations))
+    assert "secretValue" not in str(vars(observations))
+
+
+def test_cdp_fetched_payload_and_page_get_diagnostics_are_classified():
+    cap = _stub_login_and_import()
+    session = FakeCdpSession(request_bodies={"r1": '{"pageNum":1}'})
+    observations = cap._attach_list_response_observer(FakePage(session=session))
+    session.emit("Network.requestWillBeSent", {
+        "requestId": "r1", "request": {"url": LIST_URL, "method": "POST", "hasPostData": True},
+    })
+    assert observations.diagnostic_counts["payload_fetched"] == 1
+    assert observations.diagnostic_counts["body_known"] == 1
+
+    page = FakePage(cdp_error=RuntimeError("no cdp"))
+    fallback = cap._attach_list_response_observer(page)
+    request = FakeRequest(LIST_URL, "", method="GET")
+    page.handlers["request"](request)
+    assert fallback.diagnostic_counts["source_page_event"] == 1
+    assert fallback.diagnostic_counts["payload_not_applicable"] == 1
+    assert fallback.diagnostic_counts["shape_empty"] == 1
+
+
+@pytest.mark.parametrize(
+    ("body", "reason", "shape"),
+    [
+        ("[]", "unsupported-value-shape", "non_object"),
+        ("not=form&", "unsupported-key", "form_pairs"),
+        ("not-json-or-form", "unparsable", "unparsable"),
+    ],
+)
+def test_unknown_shape_diagnostics_are_allowlisted(body, reason, shape):
+    cap = _stub_login_and_import()
+    session = FakeCdpSession()
+    observations = cap._attach_list_response_observer(FakePage(session=session))
+    session.emit("Network.requestWillBeSent", {
+        "requestId": "r1", "request": {"url": LIST_URL, "method": "POST", "postData": body},
+    })
+    assert observations.diagnostic_counts["shape_" + shape] == 1
+    assert observations.diagnostic_counts["unknown_" + reason.replace("-", "_")] == 1
 
 
 def test_unknown_request_shape_cannot_unlock_unfiltered_structure_gate():

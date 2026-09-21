@@ -1665,6 +1665,15 @@ class _SaveClickObserver:
         self.candidates = {}
 
 
+_LIST_DIAGNOSTIC_KEYS = (
+    "source_cdp", "source_page_event", "payload_inline", "payload_fetched", "payload_unavailable",
+    "payload_read_error", "payload_not_applicable", "shape_empty", "shape_json_object",
+    "shape_form_pairs", "shape_non_object", "shape_unparsable", "unknown_unsupported_key",
+    "unknown_unsupported_value_shape", "unknown_unreadable_payload", "unknown_unsupported_method",
+    "unknown_unparsable", "query_known", "query_unknown", "body_known", "body_unknown",
+)
+
+
 class _ListRequestObserver(list):
     """记录列表请求的 HTTP 状态，并持有 CDP 会话引用避免被回收。
 
@@ -1687,6 +1696,7 @@ class _ListRequestObserver(list):
         self.target_filtered_request_count = 0
         self.unknown_request_count = 0
         self.page_event_handlers = []
+        self.diagnostic_counts = {key: 0 for key in _LIST_DIAGNOSTIC_KEYS}
 
 
 # 后台列表接口的实际路径是 /backend/cloudTrial/appInfo/getAppInfoList，
@@ -1853,6 +1863,53 @@ def _list_request_filter_state(url, post_data):
         if key in _LIST_FILTER_KEYS and not empty(value):
             return "target_filtered"
     return "target_absent"
+
+
+def _list_payload_shape(post_data):
+    raw = _as_text(post_data)
+    if not raw:
+        return "empty"
+    try:
+        return "json-object" if isinstance(json.loads(raw), dict) else "non-object"
+    except Exception:
+        if "=" not in raw:
+            return "unparsable"
+        try:
+            return "form-pairs" if parse_qsl(raw, keep_blank_values=True) else "unparsable"
+        except Exception:
+            return "unparsable"
+
+
+def _list_unknown_reason(url, post_data, payload_known, method):
+    if not payload_known:
+        return "unreadable-payload"
+    if _list_request_filter_state(url, post_data) != "unknown":
+        return None
+    if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}:
+        return "unsupported-method"
+    shape = _list_payload_shape(post_data)
+    if shape == "unparsable":
+        return "unparsable"
+    if shape == "non-object":
+        return "unsupported-value-shape"
+    return "unsupported-key"
+
+
+def _note_list_request_diagnostic(observations, url, post_data, *, source, payload_state, payload_known, method):
+    """Aggregate fixed diagnostic buckets only; discard all request text immediately."""
+    counts = observations.diagnostic_counts
+    counts["source_" + source] += 1
+    counts["payload_" + payload_state] += 1
+    counts["shape_" + _list_payload_shape(post_data).replace("-", "_")] += 1
+    try:
+        parse_qsl(urlparse(_as_text(url)).query, keep_blank_values=True)
+        counts["query_known"] += 1
+    except Exception:
+        counts["query_unknown"] += 1
+    counts["body_known" if payload_known else "body_unknown"] += 1
+    reason = _list_unknown_reason(url, post_data, payload_known, method)
+    if reason is not None:
+        counts["unknown_" + reason.replace("-", "_")] += 1
 
 
 def _request_carries_target_filter(url, post_data, target_filter):
@@ -2121,12 +2178,18 @@ def _attach_list_response_observer(page, target_filter=None):
     def _body_contains_target(body):
         return _request_carries_target_filter("", body, target_filter)
 
-    def _mark_list_request(url, post_data, request_id=None, payload_known=True):
+    def _mark_list_request(
+        url, post_data, request_id=None, payload_known=True, source="cdp", payload_state="inline", method="POST"
+    ):
         if not _is_list_request_url(url):
             return False
         if request_id is not None:
             list_request_ids.add(request_id)
             state = _list_request_filter_state(url, post_data) if payload_known else "unknown"
+            _note_list_request_diagnostic(
+                observations, url, post_data, source=source, payload_state=payload_state,
+                payload_known=payload_known, method=method,
+            )
             observations.request_filter_states[request_id] = state
             observations.list_request_count += 1
             if state == "target_absent":
@@ -2209,17 +2272,24 @@ def _attach_list_response_observer(page, target_filter=None):
                 request_id = data.get("requestId")
                 url = request.get("url") or ""
                 post_data = request.get("postData") or ""
+                method = str(request.get("method") or "").upper()
                 payload_known = True
+                payload_state = "not_applicable" if method in {"GET", "HEAD"} else "inline"
                 if not post_data and request.get("hasPostData") and request_id:
                     try:
                         extra = session.send("Network.getRequestPostData", {"requestId": request_id}) or {}
                         if not isinstance(extra, dict) or "postData" not in extra:
                             payload_known = False
+                            payload_state = "unavailable"
                         else:
                             post_data = extra.get("postData") or ""
+                            payload_state = "fetched"
                     except Exception:
                         payload_known = False
-                _mark_list_request(url, post_data, request_id, payload_known)
+                        payload_state = "read_error"
+                _mark_list_request(
+                    url, post_data, request_id, payload_known, "cdp", payload_state, method
+                )
             except Exception:
                 pass
 
@@ -2260,15 +2330,21 @@ def _attach_list_response_observer(page, target_filter=None):
             except Exception:
                 method = ""
             payload_known = method in {"GET", "HEAD"}
+            payload_state = "not_applicable" if payload_known else "unavailable"
             post_data = ""
             if method in {"POST", "PUT", "PATCH", "DELETE"}:
                 try:
                     post_data = request.post_data
                     payload_known = post_data is not None
+                    payload_state = "inline" if payload_known else "unavailable"
                     post_data = post_data or ""
                 except Exception:
                     payload_known = False
-            _mark_list_request(getattr(request, "url", ""), post_data, id(request), payload_known)
+                    payload_state = "read_error"
+            _mark_list_request(
+                getattr(request, "url", ""), post_data, id(request), payload_known,
+                "page_event", payload_state, method,
+            )
 
         def _on_response(response):
             url = getattr(response, "url", "") or ""
@@ -2970,7 +3046,7 @@ def _scan_known_main_id_pages(page, app_id, app_name, channel_name):
     return {"status": "failure", "snapshot": {}, "reason": "page_scan_limit_reached"}
 
 
-def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_attempted, refresh_clicked):
+def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_attempted, refresh_clicked, diagnostics):
     bounded = lambda value: min(max(int(value or 0), 0), _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS * 2)
     print("[create_app] unfiltered_list_gate=" + json.dumps({
         "reason": reason,
@@ -2982,6 +3058,7 @@ def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_att
         "target_filtered_requests": bounded(counts.get("target_filtered_requests")),
         "unknown_requests": bounded(counts.get("unknown_requests")),
         "target_absent_2xx": bounded(counts.get("target_absent_2xx")),
+        "observer_diagnostics": {key: bounded(diagnostics.get(key)) for key in _LIST_DIAGNOSTIC_KEYS},
     }, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
 
 
@@ -3009,6 +3086,7 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
     refresh_attempted = False
     refresh_clicked = False
     gate_counts = {"target_absent_requests": 0, "target_filtered_requests": 0, "unknown_requests": 0, "target_absent_2xx": 0}
+    gate_diagnostics = {key: 0 for key in _LIST_DIAGNOSTIC_KEYS}
     for attempt in range(_POST_SAVE_KNOWN_ID_POLL_ATTEMPTS):
         if attempt:
             page.wait_for_timeout(_POST_SAVE_KNOWN_ID_POLL_MS)
@@ -3042,6 +3120,8 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
                 gate_counts["target_filtered_requests"] += int(getattr(observations, "target_filtered_request_count", 0) or 0)
                 gate_counts["unknown_requests"] += int(getattr(observations, "unknown_request_count", 0) or 0)
                 gate_counts["target_absent_2xx"] += int(getattr(observations, "target_absent_2xx_count", 0) or 0)
+                for key in _LIST_DIAGNOSTIC_KEYS:
+                    gate_diagnostics[key] += int(getattr(observations, "diagnostic_counts", {}).get(key, 0) or 0)
             _detach_list_response_observer(observations)
         if not isinstance(restored, dict):
             restored = {"restored": bool(restored), "reason": _LIST_GATE_NO_COMPLETE_RESPONSE}
@@ -3081,7 +3161,8 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
         }
     reason = _LIST_GATE_PASSED_ID_NOT_FOUND if gate_passed else _deepest_list_gate_reason(gate_reasons)
     _log_unfiltered_list_gate(
-        reason, _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS, gate_passed, gate_counts, refresh_attempted, refresh_clicked
+        reason, _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS, gate_passed, gate_counts, refresh_attempted, refresh_clicked,
+        gate_diagnostics,
     )
     return _known_main_failure("zero_candidates_after_poll", scanned.get("snapshot"))
 
