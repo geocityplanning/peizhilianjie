@@ -6,6 +6,7 @@ import base64
 import json
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -352,6 +353,17 @@ def test_unique_save_decision_retains_only_whitelisted_evidence():
 def test_zero_or_multiple_candidate_diagnostics_never_enumerate_paths(decision, expected):
     cap = _stub_login_and_import()
     assert cap._save_click_diagnostic(decision) == expected
+
+
+def test_contract_save_response_body_enums_match_runtime_constants():
+    cap = _stub_login_and_import()
+    contract = (Path(__file__).parents[1] / "contracts" / "hermes-http-v1.md").read_text(encoding="utf-8")
+    clause = contract.split("固定 `response_body.fetch_state`", 1)[1].split("；零或多候选", 1)[0]
+    for state in cap._SAVE_BODY_FETCH_STATES | cap._SAVE_BODY_PARSE_STATES:
+        assert state in clause
+    assert "read-error" not in clause
+    assert "base64-decoded" not in clause
+    assert "json-unparsable" not in clause
 
 
 def test_save_response_body_decodes_base64_and_keeps_http_2xx_non_success_without_envelope():

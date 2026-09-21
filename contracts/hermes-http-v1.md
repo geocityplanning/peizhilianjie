@@ -164,7 +164,7 @@ Content-Type: application/json
 }
 ```
 
-从保存按钮成功点击开始，保存窗口必须唯一归因至一个同 request-id 完成响应且业务信封明确成功的同源写请求；HTTP 2xx 本身不构成业务成功。保存观察等待结束后、进入判定分支前，执行端恰好输出一条机器可读的脱敏诊断：唯一候选仅可含 method、path 哈希、HTTP 状态、固定 `response_body.fetch_state`（available/missing/read-error/base64-decoded/base64-decode-error）、固定 `response_body.parse_state`（not-applicable/json-unparsable/json-non-object/envelope-missing/envelope-classified）及业务 outcome/code/message 的 present/length/hash；零或多候选仅可含 outcome/candidate_count，严禁 URL、query、headers、body 或原文。若候选不唯一、无响应/超时、非2xx、业务拒绝或业务信封无法判断，以及对话框未关闭、新应用 ID 无法唯一确认、主表 ID/应用名/渠道三锚不可读或不匹配、无法从已核验主表行打开复制对话框、资源不足兜底页不可核验、两次稳定回读不一致或验证对话框无法确认关闭，执行端均保留原错误码和阶段、返回 `next_action=QUERY`，并使 HTTP 原单保持 `UNKNOWN` / `UNKNOWN` / `adjudicated=false`。不得更换幂等键重建，只能查询或人工核验原单。保存点击前的失败仍是普通失败，不被扩张为 UNKNOWN。
+从保存按钮成功点击开始，保存窗口必须唯一归因至一个同 request-id 完成响应且业务信封明确成功的同源写请求；HTTP 2xx 本身不构成业务成功。保存观察等待结束后、进入判定分支前，执行端恰好输出一条机器可读的脱敏诊断：唯一候选仅可含 method、path 哈希、HTTP 状态、固定 `response_body.fetch_state`（available/missing/read_error/base64_decoded/base64_decode_error）、固定 `response_body.parse_state`（not_applicable/json_unparsable/json_non_object/envelope_missing/envelope_classified）及业务 outcome/code/message 的 present/length/hash；零或多候选仅可含 outcome/candidate_count，严禁 URL、query、headers、body 或原文。若候选不唯一、无响应/超时、非2xx、业务拒绝或业务信封无法判断，以及对话框未关闭、新应用 ID 无法唯一确认、主表 ID/应用名/渠道三锚不可读或不匹配、无法从已核验主表行打开复制对话框、资源不足兜底页不可核验、两次稳定回读不一致或验证对话框无法确认关闭，执行端均保留原错误码和阶段、返回 `next_action=QUERY`，并使 HTTP 原单保持 `UNKNOWN` / `UNKNOWN` / `adjudicated=false`。不得更换幂等键重建，只能查询或人工核验原单。保存点击前的失败仍是普通失败，不被扩张为 UNKNOWN。
 
 ### 应用执行结果字段
 
