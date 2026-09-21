@@ -1665,6 +1665,11 @@ class _SaveClickObserver:
         self.candidates = {}
 
 
+_LIST_STRUCTURE_BUCKETS = (
+    "response_body_missing", "response_body_read_error", "base64_decode_error", "json_unparsable",
+    "json_non_object", "required_structure_missing", "complete",
+)
+
 _LIST_DIAGNOSTIC_KEYS = (
     "source_cdp", "source_page_event", "payload_inline", "payload_fetched", "payload_unavailable",
     "payload_read_error", "payload_not_applicable", "shape_empty", "shape_json_object",
@@ -1697,6 +1702,7 @@ class _ListRequestObserver(list):
         self.unknown_request_count = 0
         self.page_event_handlers = []
         self.diagnostic_counts = {key: 0 for key in _LIST_DIAGNOSTIC_KEYS}
+        self.structure_diagnostic_counts = {key: 0 for key in _LIST_STRUCTURE_BUCKETS}
 
 
 # 后台列表接口的实际路径是 /backend/cloudTrial/appInfo/getAppInfoList，
@@ -2196,6 +2202,46 @@ def _detach_save_click_observer(observer):
     _detach_list_response_observer(observer)
 
 
+def _classify_list_structure_body(body, *, base64_encoded=False):
+    """Return one fixed structure bucket and in-memory meta; never retain body text."""
+    if body is None:
+        return "response_body_missing", None
+    text = _as_text(body)
+    if base64_encoded:
+        try:
+            text = base64.b64decode(text, validate=True).decode("utf-8")
+        except Exception:
+            return "base64_decode_error", None
+    if not text:
+        return "response_body_missing", None
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return "json_unparsable", None
+    if not isinstance(payload, dict):
+        return "json_non_object", None
+    meta = _extract_list_structure(text)
+    if not meta:
+        return "required_structure_missing", None
+    return "complete", meta
+
+
+def _record_target_absent_structure(observations, body, *, base64_encoded=False, read_error=False):
+    """Record exactly one fixed bucket for one completed target-absent 2xx response."""
+    observations.target_absent_2xx_count += 1
+    if read_error:
+        bucket, meta = "response_body_read_error", None
+    else:
+        bucket, meta = _classify_list_structure_body(body, base64_encoded=base64_encoded)
+    observations.structure_diagnostic_counts[bucket] += 1
+    if meta:
+        meta = dict(meta)
+        observations.success_records.append(meta)
+    else:
+        observations.target_absent_structure_invalid_count += 1
+    return meta
+
+
 def _attach_list_response_observer(page, target_filter=None):
     """只读网络观察器：列表请求、HTTP 状态、是否携带筛选、响应是否含目标。
 
@@ -2292,29 +2338,24 @@ def _attach_list_response_observer(page, target_filter=None):
                 result = session.send("Network.getResponseBody", {"requestId": request_id})
             except Exception:
                 if need_structure:
-                    observations.target_absent_2xx_count += 1
-                    observations.target_absent_structure_invalid_count += 1
+                    _record_target_absent_structure(observations, None, read_error=True)
                 return
             if not isinstance(result, dict) or "body" not in result:
                 if need_structure:
-                    observations.target_absent_2xx_count += 1
-                    observations.target_absent_structure_invalid_count += 1
+                    _record_target_absent_structure(observations, None)
                 return
-            body = result.get("body") or ""
+            body = result.get("body")
             try:
-                if result.get("base64Encoded") and isinstance(body, str):
-                    body = base64.b64decode(body).decode("utf-8", "ignore")
                 if need_target:
-                    _note_response_contains_target(_body_contains_target(body))
+                    target_body, target_bucket = _save_response_body(result)
+                    if target_bucket in {"available", "base64_decoded"}:
+                        _note_response_contains_target(_body_contains_target(target_body))
                 if need_structure:
-                    observations.target_absent_2xx_count += 1
-                    meta = _extract_list_structure(body)
+                    meta = _record_target_absent_structure(
+                        observations, body, base64_encoded=bool(result.get("base64Encoded"))
+                    )
                     if meta:
-                        meta = dict(meta)
                         meta["status"] = int(status)
-                        observations.success_records.append(meta)
-                    else:
-                        observations.target_absent_structure_invalid_count += 1
             finally:
                 body = None
 
@@ -2428,24 +2469,21 @@ def _attach_list_response_observer(page, target_filter=None):
                 elif hasattr(response, "body"):
                     raw = response.body()
                     body = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else raw
+            except Exception:
+                if need_structure:
+                    _record_target_absent_structure(observations, None, read_error=True)
+                return
+            try:
                 if body is None:
                     if need_structure:
-                        observations.target_absent_2xx_count += 1
-                        observations.target_absent_structure_invalid_count += 1
+                        _record_target_absent_structure(observations, None)
                     return
                 if need_target:
                     _note_response_contains_target(_body_contains_target(body))
                 if need_structure:
-                    observations.target_absent_2xx_count += 1
-                    meta = _extract_list_structure(body)
+                    meta = _record_target_absent_structure(observations, body)
                     if meta:
-                        meta = dict(meta)
                         meta["status"] = int(status or 0)
-                        observations.success_records.append(meta)
-                    else:
-                        observations.target_absent_structure_invalid_count += 1
-            except Exception:
-                return
             finally:
                 body = None
 
@@ -3099,7 +3137,7 @@ def _scan_known_main_id_pages(page, app_id, app_name, channel_name):
     return {"status": "failure", "snapshot": {}, "reason": "page_scan_limit_reached"}
 
 
-def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_attempted, refresh_clicked, diagnostics):
+def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_attempted, refresh_clicked, diagnostics, structure_diagnostics):
     bounded = lambda value: min(max(int(value or 0), 0), _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS * 2)
     print("[create_app] unfiltered_list_gate=" + json.dumps({
         "reason": reason,
@@ -3112,6 +3150,7 @@ def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_att
         "unknown_requests": bounded(counts.get("unknown_requests")),
         "target_absent_2xx": bounded(counts.get("target_absent_2xx")),
         "observer_diagnostics": {key: bounded(diagnostics.get(key)) for key in _LIST_DIAGNOSTIC_KEYS},
+        "response_structure": {key: bounded(structure_diagnostics.get(key)) for key in _LIST_STRUCTURE_BUCKETS},
     }, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
 
 
@@ -3140,6 +3179,7 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
     refresh_clicked = False
     gate_counts = {"target_absent_requests": 0, "target_filtered_requests": 0, "unknown_requests": 0, "target_absent_2xx": 0}
     gate_diagnostics = {key: 0 for key in _LIST_DIAGNOSTIC_KEYS}
+    gate_structure_diagnostics = {key: 0 for key in _LIST_STRUCTURE_BUCKETS}
     for attempt in range(_POST_SAVE_KNOWN_ID_POLL_ATTEMPTS):
         if attempt:
             page.wait_for_timeout(_POST_SAVE_KNOWN_ID_POLL_MS)
@@ -3175,6 +3215,8 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
                 gate_counts["target_absent_2xx"] += int(getattr(observations, "target_absent_2xx_count", 0) or 0)
                 for key in _LIST_DIAGNOSTIC_KEYS:
                     gate_diagnostics[key] += int(getattr(observations, "diagnostic_counts", {}).get(key, 0) or 0)
+                for key in _LIST_STRUCTURE_BUCKETS:
+                    gate_structure_diagnostics[key] += int(getattr(observations, "structure_diagnostic_counts", {}).get(key, 0) or 0)
             _detach_list_response_observer(observations)
         if not isinstance(restored, dict):
             restored = {"restored": bool(restored), "reason": _LIST_GATE_NO_COMPLETE_RESPONSE}
@@ -3215,7 +3257,7 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
     reason = _LIST_GATE_PASSED_ID_NOT_FOUND if gate_passed else _deepest_list_gate_reason(gate_reasons)
     _log_unfiltered_list_gate(
         reason, _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS, gate_passed, gate_counts, refresh_attempted, refresh_clicked,
-        gate_diagnostics,
+        gate_diagnostics, gate_structure_diagnostics,
     )
     return _known_main_failure("zero_candidates_after_poll", scanned.get("snapshot"))
 

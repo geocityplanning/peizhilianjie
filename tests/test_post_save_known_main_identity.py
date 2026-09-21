@@ -105,9 +105,11 @@ def test_unfiltered_gate_log_uses_fixed_diagnostics_only(capsys):
         cap._LIST_GATE_NO_COMPLETE_RESPONSE, 3, False,
         {"target_absent_requests": 0, "target_filtered_requests": 0, "unknown_requests": 1, "target_absent_2xx": 0},
         False, False, diagnostics,
+        {key: (1 if key == "json_unparsable" else 0) for key in cap._LIST_STRUCTURE_BUCKETS},
     )
     output = capsys.readouterr().out
     assert '"source_cdp":1' in output and '"unknown_unsupported_key":1' in output
+    assert '"json_unparsable":1' in output
     assert "secretField" not in output and "secretValue" not in output
 
 

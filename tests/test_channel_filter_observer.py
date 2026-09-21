@@ -691,6 +691,62 @@ def test_observer_does_not_read_body_when_request_missing_filter():
     assert observations.carried_target_filter is False
 
 
+def test_contract_documents_runtime_response_structure_buckets():
+    cap = _stub_login_and_import()
+    contract = (Path(__file__).parents[1] / "contracts" / "hermes-http-v1.md").read_text(encoding="utf-8")
+    for bucket in cap._LIST_STRUCTURE_BUCKETS:
+        assert bucket in contract
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("read_error", "response_body_read_error"),
+        ("missing", "response_body_missing"),
+        ("base64", "base64_decode_error"),
+        ("json", "json_unparsable"),
+        ("non_object", "json_non_object"),
+        ("structure", "required_structure_missing"),
+        ("complete", "complete"),
+    ],
+)
+def test_cdp_target_absent_structure_diagnostics_are_exclusive(case, expected):
+    cap = _stub_login_and_import()
+    bodies = {
+        "missing": {},
+        "base64": {"body": "%%%", "base64Encoded": True},
+        "json": {"body": "not-json", "base64Encoded": False},
+        "non_object": {"body": "[]", "base64Encoded": False},
+        "structure": {"body": '{"data":{}}', "base64Encoded": False},
+        "complete": {"body": '{"data":{"totalCount":1,"pageCount":1,"list":[{}]}}', "base64Encoded": False},
+    }
+    response_bodies = {} if case == "read_error" else {"r1": bodies[case]}
+    session = FakeCdpSession(response_bodies=response_bodies)
+    observations = cap._attach_list_response_observer(FakePage(session=session))
+    _emit_filtered_list_cycle(session, post_data='{"pageNum":1}')
+    assert observations.target_absent_2xx_count == 1
+    assert observations.structure_diagnostic_counts[expected] == 1
+    assert sum(observations.structure_diagnostic_counts.values()) == 1
+    assert bool(observations.success_records) is (expected == "complete")
+
+
+def test_page_event_structure_read_error_is_fail_closed():
+    cap = _stub_login_and_import()
+    page = FakePage(cdp_error=RuntimeError("no cdp"))
+    observations = cap._attach_list_response_observer(page)
+    request = FakeRequest(LIST_URL, '{"pageNum":1}')
+    page.handlers["request"](request)
+
+    class BrokenResponse(FakeResponse):
+        def text(self):
+            raise RuntimeError("body unavailable")
+
+    page.handlers["response"](BrokenResponse(LIST_URL, 200, request=request))
+    assert observations.target_absent_2xx_count == 1
+    assert observations.structure_diagnostic_counts["response_body_read_error"] == 1
+    assert observations.success_records == []
+
+
 def test_target_filtered_request_cannot_unlock_unfiltered_structure_gate():
     cap = _stub_login_and_import()
     session = FakeCdpSession(response_bodies={
