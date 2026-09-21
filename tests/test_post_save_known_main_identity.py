@@ -80,6 +80,40 @@ def test_known_locator_zero_candidate_is_bounded_read_only_polling(monkeypatch):
     assert page.waits == [cap._POST_SAVE_KNOWN_ID_POLL_MS] * (cap._POST_SAVE_KNOWN_ID_POLL_ATTEMPTS - 1)
 
 
+def test_known_locator_logs_gate_passed_id_not_found(monkeypatch, capsys):
+    cap = _cap()
+    page = SequencePage([_payload(), _payload(), _payload()])
+    _install_navigation(monkeypatch, cap)
+
+    result = cap._locate_known_main_row_for_resource_fallback(page, "secret-id", "secret-name", "secret-channel")
+
+    assert result["reason"] == "zero_candidates_after_poll"
+    output = capsys.readouterr().out
+    assert '"reason":"unfiltered_gate_passed_id_not_found"' in output
+    assert '"gate_passed":true' in output
+    assert "secret-id" not in output and "secret-name" not in output and "secret-channel" not in output
+
+
+def test_known_locator_aggregates_gate_reason_by_deepest_evidence(monkeypatch, capsys):
+    cap = _cap()
+    page = SequencePage([])
+    _install_navigation(monkeypatch, cap)
+    reasons = iter([
+        cap._LIST_GATE_STRUCTURE_UNPARSEABLE,
+        cap._LIST_GATE_RESPONSE_DOM_MISMATCH,
+        cap._LIST_GATE_DOM_UNSTABLE,
+    ])
+    monkeypatch.setattr(
+        cap, "_wait_for_unfiltered_list_restore",
+        lambda *args, **kwargs: {"restored": False, "reason": next(reasons)},
+    )
+
+    result = cap._locate_known_main_row_for_resource_fallback(page, "secret-id", "secret-name", "secret-channel")
+
+    assert result["reason"] == "zero_candidates_after_poll"
+    assert '"reason":"unfiltered_dom_unstable"' in capsys.readouterr().out
+
+
 def test_known_locator_does_not_scan_id_without_fresh_unfiltered_restore(monkeypatch):
     cap = _cap()
     page = SequencePage([])
@@ -95,6 +129,72 @@ def test_known_locator_does_not_scan_id_without_fresh_unfiltered_restore(monkeyp
     assert result["candidate_category"] == "0"
     assert len(resets) == cap._POST_SAVE_KNOWN_ID_POLL_ATTEMPTS
     assert page.payloads == []
+
+
+def _restore_state(signature="fresh", *, total=2, rows=2, next_enabled=False):
+    return {"table_signature": signature, "total_count": total, "row_count": rows, "next_enabled": next_enabled}
+
+
+def _restore_observer(cap, *, valid=True):
+    observer = cap._ListRequestObserver()
+    observer.target_absent_2xx_count = 1
+    if valid:
+        observer.success_records.append({"total_count": 2, "item_count": 2, "page_count": 1, "status": 200})
+    else:
+        observer.target_absent_structure_invalid_count = 1
+    return observer
+
+
+def test_unfiltered_restore_reason_no_complete_response():
+    cap = _cap()
+    observer = cap._ListRequestObserver()
+    result = cap._wait_for_unfiltered_list_restore(
+        SequencePage([]), _restore_state("old"), read_state=lambda page: _restore_state(),
+        observations=observer, timeout_ms=1, poll_interval_ms=1, return_detail=True,
+    )
+    assert result == {"restored": False, "reason": cap._LIST_GATE_NO_COMPLETE_RESPONSE}
+
+
+def test_unfiltered_restore_reason_structure_unparseable():
+    cap = _cap()
+    result = cap._wait_for_unfiltered_list_restore(
+        SequencePage([]), _restore_state("old"), read_state=lambda page: _restore_state(),
+        observations=_restore_observer(cap, valid=False), target_absent_before=0,
+        timeout_ms=1, poll_interval_ms=1, return_detail=True,
+    )
+    assert result == {"restored": False, "reason": cap._LIST_GATE_STRUCTURE_UNPARSEABLE}
+
+
+def test_unfiltered_restore_reason_response_dom_mismatch():
+    cap = _cap()
+    result = cap._wait_for_unfiltered_list_restore(
+        SequencePage([]), _restore_state("old"), read_state=lambda page: _restore_state(total=3),
+        observations=_restore_observer(cap), target_absent_before=0,
+        timeout_ms=1, poll_interval_ms=1, return_detail=True,
+    )
+    assert result == {"restored": False, "reason": cap._LIST_GATE_RESPONSE_DOM_MISMATCH}
+
+
+def test_unfiltered_restore_reason_dom_unstable():
+    cap = _cap()
+    states = iter([_restore_state("one"), _restore_state("two")])
+    result = cap._wait_for_unfiltered_list_restore(
+        SequencePage([]), _restore_state("old"), read_state=lambda page: next(states),
+        observations=_restore_observer(cap), target_absent_before=0,
+        timeout_ms=2, poll_interval_ms=1, return_detail=True,
+    )
+    assert result == {"restored": False, "reason": cap._LIST_GATE_DOM_UNSTABLE}
+
+
+def test_unfiltered_restore_does_not_reuse_pre_reset_record():
+    cap = _cap()
+    observer = _restore_observer(cap)
+    result = cap._wait_for_unfiltered_list_restore(
+        SequencePage([]), _restore_state("old"), read_state=lambda page: _restore_state(),
+        observations=observer, records_before=1, target_absent_before=1,
+        timeout_ms=1, poll_interval_ms=1, return_detail=True,
+    )
+    assert result == {"restored": False, "reason": cap._LIST_GATE_NO_COMPLETE_RESPONSE}
 
 
 def test_known_locator_fresh_restore_can_find_id_on_new_page_15(monkeypatch):

@@ -1651,6 +1651,10 @@ class _ListRequestObserver(list):
         self.target_filter_field = None
         self.target_filter_field_is_channel = None
         self.success_records = []
+        self.request_filter_states = {}
+        self.target_absent_2xx_count = 0
+        self.target_absent_structure_invalid_count = 0
+        self.page_event_handlers = []
 
 
 # 后台列表接口的实际路径是 /backend/cloudTrial/appInfo/getAppInfoList，
@@ -1762,6 +1766,58 @@ def _locate_target_filter_field(url, post_data, target_filter):
     return _pick_filter_location(json_paths, query_keys, raw_hit)
 
 
+_LIST_PAGING_KEYS = {"pagenum", "pagenumber", "page", "pagesize", "size", "current", "limit", "sort", "order", "orderby"}
+_LIST_FILTER_KEYS = {
+    "channelidlist", "channelname", "channelid", "appname", "applicationname", "appid", "appids",
+    "baseplatform", "creator", "starttime", "endtime", "status", "type",
+}
+
+
+def _list_request_filter_state(url, post_data):
+    """Classify one list request without retaining any request values.
+
+    target_absent is deliberately conservative: all parsed fields must be known
+    pagination/filter fields and every filter field must be empty.  Anything else
+    is unknown and cannot unlock the post-reset restore gate.
+    """
+    def normalized(key):
+        return re.sub(r"[^a-z0-9]", "", str(key or "").lower())
+
+    def empty(value):
+        return value is None or value == "" or value == [] or value == {}
+
+    fields = []
+    try:
+        query = parse_qsl(urlparse(_as_text(url)).query, keep_blank_values=True)
+    except Exception:
+        return "unknown"
+    fields.extend((normalized(key), value) for key, value in query)
+    raw = _as_text(post_data)
+    if raw:
+        try:
+            body = json.loads(raw)
+        except Exception:
+            try:
+                form = parse_qsl(raw, keep_blank_values=True)
+            except Exception:
+                return "unknown"
+            fields.extend((normalized(key), value) for key, value in form)
+        else:
+            if not isinstance(body, dict):
+                return "unknown"
+            fields.extend((normalized(key), value) for key, value in body.items())
+    if not fields:
+        return "target_absent"
+    for key, value in fields:
+        if key in _LIST_FILTER_KEYS and not empty(value):
+            return "target_filtered"
+        if key not in _LIST_PAGING_KEYS and key not in _LIST_FILTER_KEYS:
+            return "unknown"
+        if key in _LIST_FILTER_KEYS and not empty(value):
+            return "target_filtered"
+    return "target_absent"
+
+
 def _request_carries_target_filter(url, post_data, target_filter):
     """Return whether a list request payload contains the target filter value.
 
@@ -1782,7 +1838,16 @@ def _filter_field_rank(field, is_channel):
 
 
 def _detach_list_response_observer(observations):
-    """用完即释放 CDP 会话，避免长时间占用调试通道。"""
+    """Release CDP and page-event observers; no handler may outlive its reset."""
+    for page, event, handler in getattr(observations, "page_event_handlers", []) or []:
+        off = getattr(page, "off", None)
+        if callable(off):
+            try:
+                off(event, handler)
+            except Exception:
+                pass
+    if observations is not None:
+        observations.page_event_handlers = []
     sidecar = getattr(observations, "keepalive", None)
     detach = getattr(sidecar, "detach", None)
     if callable(detach):
@@ -2024,6 +2089,7 @@ def _attach_list_response_observer(page, target_filter=None):
             return False
         if request_id is not None:
             list_request_ids.add(request_id)
+            observations.request_filter_states[request_id] = _list_request_filter_state(url, post_data)
         location = _locate_target_filter_field(url, post_data, target_filter)
         if location is not None:
             observations.carried_target_filter = True
@@ -2055,6 +2121,7 @@ def _attach_list_response_observer(page, target_filter=None):
             need_target = request_id in carried_request_ids
             need_structure = (
                 request_id in list_request_ids
+                and observations.request_filter_states.get(request_id) == "target_absent"
                 and status is not None
                 and 200 <= int(status) < 300
             )
@@ -2063,8 +2130,14 @@ def _attach_list_response_observer(page, target_filter=None):
             try:
                 result = session.send("Network.getResponseBody", {"requestId": request_id})
             except Exception:
+                if need_structure:
+                    observations.target_absent_2xx_count += 1
+                    observations.target_absent_structure_invalid_count += 1
                 return
             if not isinstance(result, dict) or "body" not in result:
+                if need_structure:
+                    observations.target_absent_2xx_count += 1
+                    observations.target_absent_structure_invalid_count += 1
                 return
             body = result.get("body") or ""
             try:
@@ -2073,11 +2146,14 @@ def _attach_list_response_observer(page, target_filter=None):
                 if need_target:
                     _note_response_contains_target(_body_contains_target(body))
                 if need_structure:
+                    observations.target_absent_2xx_count += 1
                     meta = _extract_list_structure(body)
                     if meta:
                         meta = dict(meta)
                         meta["status"] = int(status)
                         observations.success_records.append(meta)
+                    else:
+                        observations.target_absent_structure_invalid_count += 1
             finally:
                 body = None
 
@@ -2131,23 +2207,24 @@ def _attach_list_response_observer(page, target_filter=None):
     try:
         def _on_request(request):
             post_data = getattr(request, "post_data", None) or ""
-            _mark_list_request(getattr(request, "url", ""), post_data)
+            _mark_list_request(getattr(request, "url", ""), post_data, id(request))
 
         def _on_response(response):
             url = getattr(response, "url", "") or ""
             status = getattr(response, "status", 0)
-            _record_status(url, status)
             request = getattr(response, "request", None)
+            request_id = id(request) if request is not None else None
+            _record_status(url, status, request_id)
             req_url = getattr(request, "url", url) if request is not None else url
             post_data = getattr(request, "post_data", None) if request is not None else ""
             if not _is_list_request_url(req_url or url):
                 return
             need_target = _request_carries_target_filter(req_url or url, post_data or "", target_filter)
-            need_structure = False
             try:
-                need_structure = 200 <= int(status or 0) < 300
+                is_2xx = 200 <= int(status or 0) < 300
             except (TypeError, ValueError):
-                need_structure = False
+                is_2xx = False
+            need_structure = is_2xx and observations.request_filter_states.get(request_id) == "target_absent"
             if not need_target and not need_structure:
                 return
             body = None
@@ -2158,26 +2235,37 @@ def _attach_list_response_observer(page, target_filter=None):
                     raw = response.body()
                     body = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else raw
                 if body is None:
+                    if need_structure:
+                        observations.target_absent_2xx_count += 1
+                        observations.target_absent_structure_invalid_count += 1
                     return
                 if need_target:
                     _note_response_contains_target(_body_contains_target(body))
                 if need_structure:
+                    observations.target_absent_2xx_count += 1
                     meta = _extract_list_structure(body)
                     if meta:
                         meta = dict(meta)
                         meta["status"] = int(status or 0)
                         observations.success_records.append(meta)
+                    else:
+                        observations.target_absent_structure_invalid_count += 1
             except Exception:
                 return
             finally:
                 body = None
 
         def _on_request_failed(request):
-            _record_status(getattr(request, "url", ""), 0)
+            _record_status(getattr(request, "url", ""), 0, id(request))
 
         page.on("request", _on_request)
         page.on("response", _on_response)
         page.on("requestfailed", _on_request_failed)
+        observations.page_event_handlers = [
+            (page, "request", _on_request),
+            (page, "response", _on_response),
+            (page, "requestfailed", _on_request_failed),
+        ]
     except Exception:
         return None
     return observations
@@ -2817,6 +2905,24 @@ def _scan_known_main_id_pages(page, app_id, app_name, channel_name):
     return {"status": "failure", "snapshot": {}, "reason": "page_scan_limit_reached"}
 
 
+def _log_unfiltered_list_gate(reason, attempts, gate_passed):
+    print("[create_app] unfiltered_list_gate=" + json.dumps({
+        "reason": reason,
+        "attempts": min(max(int(attempts or 0), 0), _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS),
+        "gate_passed": bool(gate_passed),
+    }, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+
+
+def _deepest_list_gate_reason(reasons):
+    ranks = {
+        _LIST_GATE_NO_COMPLETE_RESPONSE: 1,
+        _LIST_GATE_STRUCTURE_UNPARSEABLE: 2,
+        _LIST_GATE_RESPONSE_DOM_MISMATCH: 3,
+        _LIST_GATE_DOM_UNSTABLE: 4,
+    }
+    return max(reasons, key=lambda reason: ranks.get(reason, 0), default=_LIST_GATE_NO_COMPLETE_RESPONSE)
+
+
 def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel_name):
     """Read-only post-save locator: require a fresh unfiltered response before scanning.
 
@@ -2826,12 +2932,15 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
     the known ID may be scanned.
     """
     scanned = {"snapshot": {}}
+    gate_reasons = []
+    gate_passed = False
     for attempt in range(_POST_SAVE_KNOWN_ID_POLL_ATTEMPTS):
         if attempt:
             page.wait_for_timeout(_POST_SAVE_KNOWN_ID_POLL_MS)
         previous_state = _read_list_restore_state(page) or {}
         observations = _attach_list_response_observer(page)
         records_before = len(getattr(observations, "success_records", []) or []) if observations is not None else 0
+        target_absent_before = int(getattr(observations, "target_absent_2xx_count", 0) or 0) if observations is not None else 0
         try:
             _reset_list_filters(page)
             restored = _wait_for_unfiltered_list_restore(
@@ -2839,11 +2948,17 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
                 previous_state,
                 observations=observations,
                 records_before=records_before,
+                target_absent_before=target_absent_before,
+                return_detail=True,
             )
         finally:
             _detach_list_response_observer(observations)
-        if not restored:
+        if not isinstance(restored, dict):
+            restored = {"restored": bool(restored), "reason": _LIST_GATE_NO_COMPLETE_RESPONSE}
+        if not restored.get("restored"):
+            gate_reasons.append(restored.get("reason"))
             continue
+        gate_passed = True
         if not _go_to_first_page(page):
             return _known_main_failure("pagination_unstable")
         scanned = _scan_known_main_id_pages(page, app_id, app_name, channel_name)
@@ -2874,6 +2989,8 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
             "row_key": second_decision["row"].get("logical_key"),
             "key_kind": second_decision["row"].get("key_kind"),
         }
+    reason = _LIST_GATE_PASSED_ID_NOT_FOUND if gate_passed else _deepest_list_gate_reason(gate_reasons)
+    _log_unfiltered_list_gate(reason, _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS, gate_passed)
     return _known_main_failure("zero_candidates_after_poll", scanned.get("snapshot"))
 
 
@@ -3105,6 +3222,18 @@ def _complete_reset_records(observations, records_before=0):
     return list(records)[int(records_before or 0):]
 
 
+_LIST_GATE_NO_COMPLETE_RESPONSE = "no_complete_unfiltered_response"
+_LIST_GATE_STRUCTURE_UNPARSEABLE = "unfiltered_response_structure_unparseable"
+_LIST_GATE_RESPONSE_DOM_MISMATCH = "unfiltered_response_dom_mismatch"
+_LIST_GATE_DOM_UNSTABLE = "unfiltered_dom_unstable"
+_LIST_GATE_PASSED_ID_NOT_FOUND = "unfiltered_gate_passed_id_not_found"
+
+
+def _unfiltered_restore_result(success, reason, return_detail):
+    result = {"restored": bool(success), "reason": reason}
+    return result if return_detail else result["restored"]
+
+
 def _wait_for_unfiltered_list_restore(
     page,
     previous_state,
@@ -3112,31 +3241,41 @@ def _wait_for_unfiltered_list_restore(
     observations=None,
     records_before=0,
     requests_before=None,
+    target_absent_before=None,
     timeout_ms=6000,
     poll_interval_ms=250,
+    return_detail=False,
 ):
-    """Wait until a complete 2xx+structure record for this reset has been rendered."""
+    """Require this reset's complete 2xx target-absent response and stable DOM."""
     baseline = records_before if requests_before is None else requests_before
+    if target_absent_before is None:
+        target_absent_before = int(getattr(observations, "target_absent_2xx_count", 0) or 0)
     reader = read_state or _read_list_restore_state
     previous_table = (previous_state or {}).get("table_signature")
     stable_candidate = None
     stable_reads = 0
+    saw_dom_match = False
+    saw_stability_candidate = False
     polls = max(1, (int(timeout_ms) + int(poll_interval_ms) - 1) // int(poll_interval_ms))
     for _ in range(polls):
         page.wait_for_timeout(poll_interval_ms)
         current = reader(page) or {}
         records = _complete_reset_records(observations, baseline)
         meta = records[-1] if records else None
+        if not records or not _dom_matches_success_structure(current, meta):
+            stable_candidate = None
+            stable_reads = 0
+            continue
+        saw_dom_match = True
         if (
-            not records
-            or current.get("table_signature") == previous_table
+            current.get("table_signature") == previous_table
             or current.get("row_count", 0) <= 0
             or not _pagination_synced_with_unfiltered_list(current)
-            or not _dom_matches_success_structure(current, meta)
         ):
             stable_candidate = None
             stable_reads = 0
             continue
+        saw_stability_candidate = True
         candidate = _restore_fingerprint(current)
         if candidate == stable_candidate:
             stable_reads += 1
@@ -3144,8 +3283,18 @@ def _wait_for_unfiltered_list_restore(
             stable_candidate = candidate
             stable_reads = 1
         if stable_reads >= 2:
-            return True
-    return False
+            return _unfiltered_restore_result(True, None, return_detail)
+    fresh_2xx = int(getattr(observations, "target_absent_2xx_count", 0) or 0) > target_absent_before
+    structured = bool(_complete_reset_records(observations, baseline))
+    if not fresh_2xx:
+        reason = _LIST_GATE_NO_COMPLETE_RESPONSE
+    elif not structured:
+        reason = _LIST_GATE_STRUCTURE_UNPARSEABLE
+    elif not saw_dom_match:
+        reason = _LIST_GATE_RESPONSE_DOM_MISMATCH
+    else:
+        reason = _LIST_GATE_DOM_UNSTABLE
+    return _unfiltered_restore_result(False, reason, return_detail)
 
 
 def _find_target_row_by_id(page, app_id, expected_channel_name=""):

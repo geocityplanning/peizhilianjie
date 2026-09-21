@@ -77,6 +77,15 @@ class FakePage:
             raise self.page_event_error
         self.handlers[event] = handler
 
+    def off(self, event, handler):
+        if self.handlers.get(event) is handler:
+            del self.handlers[event]
+
+    def emit(self, event, payload):
+        handler = self.handlers.get(event)
+        if handler is not None:
+            handler(payload)
+
 
 class FakeResponse:
     def __init__(self, url, status, text="", request=None):
@@ -672,6 +681,30 @@ def test_observer_does_not_read_body_when_request_missing_filter():
     assert observations.carried_target_filter is False
 
 
+def test_target_filtered_request_cannot_unlock_unfiltered_structure_gate():
+    cap = _stub_login_and_import()
+    session = FakeCdpSession(response_bodies={
+        "r1": {"body": '{"data":{"totalCount":1,"pageCount":1,"list":[{}]}}', "base64Encoded": False}
+    })
+    observations = cap._attach_list_response_observer(FakePage(session=session))
+    _emit_filtered_list_cycle(session, post_data='{"channelName":"secret-filter"}')
+    assert observations.request_filter_states["r1"] == "target_filtered"
+    assert observations.target_absent_2xx_count == 0
+    assert observations.success_records == []
+
+
+def test_unknown_request_shape_cannot_unlock_unfiltered_structure_gate():
+    cap = _stub_login_and_import()
+    session = FakeCdpSession(response_bodies={
+        "r1": {"body": '{"data":{"totalCount":1,"pageCount":1,"list":[{}]}}', "base64Encoded": False}
+    })
+    observations = cap._attach_list_response_observer(FakePage(session=session))
+    _emit_filtered_list_cycle(session, post_data='{"unrecognizedFilter":"secret"}')
+    assert observations.request_filter_states["r1"] == "unknown"
+    assert observations.target_absent_2xx_count == 0
+    assert observations.success_records == []
+
+
 def test_page_event_fallback_response_missing_target():
     cap = _stub_login_and_import()
     page = FakePage(cdp_error=RuntimeError("no cdp"))
@@ -682,6 +715,18 @@ def test_page_event_fallback_response_missing_target():
     assert observations.carried_target_filter is True
     assert observations.response_contains_target_channel is False
     assert SECRET_CHANNEL not in str(vars(observations))
+
+
+def test_page_event_fallback_detach_unregisters_all_handlers():
+    cap = _stub_login_and_import()
+    page = FakePage(cdp_error=RuntimeError("no cdp"))
+    observations = cap._attach_list_response_observer(page)
+    cap._detach_list_response_observer(observations)
+    assert page.handlers == {}
+    assert observations.page_event_handlers == []
+    page.emit("request", FakeRequest(LIST_URL, '{"pageNum":1}'))
+    assert list(observations) == []
+    assert observations.success_records == []
 
 
 def test_search_case_response_missing_target(monkeypatch):
