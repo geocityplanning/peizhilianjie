@@ -693,6 +693,29 @@ def test_target_filtered_request_cannot_unlock_unfiltered_structure_gate():
     assert observations.success_records == []
 
 
+def test_channel_names_empty_is_target_absent_but_nonempty_is_target_filtered():
+    cap = _stub_login_and_import()
+    assert cap._list_request_filter_state(LIST_URL, '{"channelNames":[]}') == "target_absent"
+    assert cap._list_request_filter_state(LIST_URL, '{"channelNames":["secret"]}') == "target_filtered"
+
+
+def test_cdp_missing_post_data_is_unknown_and_cannot_unlock_gate():
+    cap = _stub_login_and_import()
+    session = FakeCdpSession(response_bodies={
+        "r1": {"body": '{"data":{"totalCount":1,"pageCount":1,"list":[{}]}}', "base64Encoded": False}
+    })
+    observations = cap._attach_list_response_observer(FakePage(session=session))
+    session.emit("Network.requestWillBeSent", {
+        "requestId": "r1", "request": {"url": LIST_URL, "hasPostData": True},
+    })
+    session.emit("Network.responseReceived", {"requestId": "r1", "response": {"url": LIST_URL, "status": 200}})
+    session.emit("Network.loadingFinished", {"requestId": "r1"})
+    assert observations.request_filter_states["r1"] == "unknown"
+    assert observations.unknown_request_count == 1
+    assert observations.target_absent_2xx_count == 0
+    assert observations.success_records == []
+
+
 def test_unknown_request_shape_cannot_unlock_unfiltered_structure_gate():
     cap = _stub_login_and_import()
     session = FakeCdpSession(response_bodies={

@@ -60,6 +60,7 @@ def _install_navigation(monkeypatch, cap, *, next_results=()):
     monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: True)
     monkeypatch.setattr(cap, "_detach_list_response_observer", lambda observations: None)
     monkeypatch.setattr(cap, "_reset_list_filters", lambda page: resets.append(True))
+    monkeypatch.setattr(cap, "_trigger_unfiltered_list_refresh", lambda page: False)
     monkeypatch.setattr(cap, "_go_to_first_page", lambda page: True)
     monkeypatch.setattr(cap, "_click_next_page_and_wait", lambda page: next(next_results, False))
     return resets
@@ -112,6 +113,39 @@ def test_known_locator_aggregates_gate_reason_by_deepest_evidence(monkeypatch, c
 
     assert result["reason"] == "zero_candidates_after_poll"
     assert '"reason":"unfiltered_dom_unstable"' in capsys.readouterr().out
+
+
+def test_known_locator_no_request_uses_only_one_scoped_refresh(monkeypatch):
+    cap = _cap()
+    page = SequencePage([])
+    _install_navigation(monkeypatch, cap)
+    refreshes = {"count": 0}
+    monkeypatch.setattr(cap, "_wait_for_unfiltered_list_restore", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        cap, "_trigger_unfiltered_list_refresh",
+        lambda page: refreshes.__setitem__("count", refreshes["count"] + 1) or True,
+    )
+
+    cap._locate_known_main_row_for_resource_fallback(page, "secret-id", "secret-name", "secret-channel")
+
+    assert refreshes["count"] == 1
+
+
+def test_scoped_unfiltered_refresh_requires_unique_main_form_search():
+    cap = _cap()
+
+    class Page:
+        def __init__(self):
+            self.script = ""
+        def evaluate(self, script):
+            self.script = script
+            return True
+
+    page = Page()
+    assert cap._trigger_unfiltered_list_refresh(page) is True
+    assert ".el-form" in page.script
+    assert "buttons.length !== 1" in page.script
+    assert "el-dialog" in page.script
 
 
 def test_known_locator_does_not_scan_id_without_fresh_unfiltered_restore(monkeypatch):

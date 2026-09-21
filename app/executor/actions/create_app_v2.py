@@ -1424,6 +1424,27 @@ def _locate_by_app_id(page, ref_app_id):
     return {"clicked": False, "error": "COPY_FAILED"}
 
 
+def _trigger_unfiltered_list_refresh(page):
+    """At most one exact Search inside the visible main-list filter form."""
+    try:
+        return bool(page.evaluate("""() => {
+          const visible = element => Boolean(element) && element.offsetParent !== null;
+          const forms = Array.from(document.querySelectorAll('.el-form')).filter(form =>
+            visible(form)
+            && !form.closest('.el-dialog, .el-dialog__wrapper')
+            && form.querySelector('.el-select, input')
+          );
+          const buttons = forms.flatMap(form => Array.from(form.querySelectorAll('button')).filter(button =>
+            visible(button) && (button.innerText || '').replace(/\\s/g, '').trim() === '搜索'
+          ));
+          if (buttons.length !== 1) return false;
+          buttons[0].click();
+          return true;
+        }"""))
+    except Exception:
+        return False
+
+
 def _reset_list_filters(page):
     """Clear list filters without depending on fuzzy text locators."""
     clicked = page.evaluate("""() => {
@@ -1448,6 +1469,7 @@ def _reset_list_filters(page):
           }
         }""")
     page.wait_for_timeout(1200)
+    return bool(clicked)
 
 
 _MAIN_LIST_COLLECT_JS = """
@@ -1654,6 +1676,10 @@ class _ListRequestObserver(list):
         self.request_filter_states = {}
         self.target_absent_2xx_count = 0
         self.target_absent_structure_invalid_count = 0
+        self.list_request_count = 0
+        self.target_absent_request_count = 0
+        self.target_filtered_request_count = 0
+        self.unknown_request_count = 0
         self.page_event_handlers = []
 
 
@@ -1768,7 +1794,7 @@ def _locate_target_filter_field(url, post_data, target_filter):
 
 _LIST_PAGING_KEYS = {"pagenum", "pagenumber", "page", "pagesize", "size", "current", "limit", "sort", "order", "orderby"}
 _LIST_FILTER_KEYS = {
-    "channelidlist", "channelname", "channelid", "appname", "applicationname", "appid", "appids",
+    "channelidlist", "channelname", "channelnames", "channelid", "appname", "applicationname", "appid", "appids",
     "baseplatform", "creator", "starttime", "endtime", "status", "type",
 }
 
@@ -2084,12 +2110,20 @@ def _attach_list_response_observer(page, target_filter=None):
     def _body_contains_target(body):
         return _request_carries_target_filter("", body, target_filter)
 
-    def _mark_list_request(url, post_data, request_id=None):
+    def _mark_list_request(url, post_data, request_id=None, payload_known=True):
         if not _is_list_request_url(url):
             return False
         if request_id is not None:
             list_request_ids.add(request_id)
-            observations.request_filter_states[request_id] = _list_request_filter_state(url, post_data)
+            state = _list_request_filter_state(url, post_data) if payload_known else "unknown"
+            observations.request_filter_states[request_id] = state
+            observations.list_request_count += 1
+            if state == "target_absent":
+                observations.target_absent_request_count += 1
+            elif state == "target_filtered":
+                observations.target_filtered_request_count += 1
+            else:
+                observations.unknown_request_count += 1
         location = _locate_target_filter_field(url, post_data, target_filter)
         if location is not None:
             observations.carried_target_filter = True
@@ -2164,13 +2198,17 @@ def _attach_list_response_observer(page, target_filter=None):
                 request_id = data.get("requestId")
                 url = request.get("url") or ""
                 post_data = request.get("postData") or ""
+                payload_known = True
                 if not post_data and request.get("hasPostData") and request_id:
                     try:
                         extra = session.send("Network.getRequestPostData", {"requestId": request_id}) or {}
-                        post_data = extra.get("postData") or ""
+                        if not isinstance(extra, dict) or "postData" not in extra:
+                            payload_known = False
+                        else:
+                            post_data = extra.get("postData") or ""
                     except Exception:
-                        post_data = ""
-                _mark_list_request(url, post_data, request_id)
+                        payload_known = False
+                _mark_list_request(url, post_data, request_id, payload_known)
             except Exception:
                 pass
 
@@ -2905,11 +2943,17 @@ def _scan_known_main_id_pages(page, app_id, app_name, channel_name):
     return {"status": "failure", "snapshot": {}, "reason": "page_scan_limit_reached"}
 
 
-def _log_unfiltered_list_gate(reason, attempts, gate_passed):
+def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_attempted):
+    bounded = lambda value: min(max(int(value or 0), 0), _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS * 2)
     print("[create_app] unfiltered_list_gate=" + json.dumps({
         "reason": reason,
         "attempts": min(max(int(attempts or 0), 0), _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS),
         "gate_passed": bool(gate_passed),
+        "refresh_attempted": bool(refresh_attempted),
+        "target_absent_requests": bounded(counts.get("target_absent_requests")),
+        "target_filtered_requests": bounded(counts.get("target_filtered_requests")),
+        "unknown_requests": bounded(counts.get("unknown_requests")),
+        "target_absent_2xx": bounded(counts.get("target_absent_2xx")),
     }, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
 
 
@@ -2934,6 +2978,8 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
     scanned = {"snapshot": {}}
     gate_reasons = []
     gate_passed = False
+    refresh_attempted = False
+    gate_counts = {"target_absent_requests": 0, "target_filtered_requests": 0, "unknown_requests": 0, "target_absent_2xx": 0}
     for attempt in range(_POST_SAVE_KNOWN_ID_POLL_ATTEMPTS):
         if attempt:
             page.wait_for_timeout(_POST_SAVE_KNOWN_ID_POLL_MS)
@@ -2943,6 +2989,12 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
         target_absent_before = int(getattr(observations, "target_absent_2xx_count", 0) or 0) if observations is not None else 0
         try:
             _reset_list_filters(page)
+            if (
+                observations is not None
+                and not refresh_attempted
+                and not getattr(observations, "list_request_count", 0)
+            ):
+                refresh_attempted = _trigger_unfiltered_list_refresh(page)
             restored = _wait_for_unfiltered_list_restore(
                 page,
                 previous_state,
@@ -2952,6 +3004,11 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
                 return_detail=True,
             )
         finally:
+            if observations is not None:
+                gate_counts["target_absent_requests"] += int(getattr(observations, "target_absent_request_count", 0) or 0)
+                gate_counts["target_filtered_requests"] += int(getattr(observations, "target_filtered_request_count", 0) or 0)
+                gate_counts["unknown_requests"] += int(getattr(observations, "unknown_request_count", 0) or 0)
+                gate_counts["target_absent_2xx"] += int(getattr(observations, "target_absent_2xx_count", 0) or 0)
             _detach_list_response_observer(observations)
         if not isinstance(restored, dict):
             restored = {"restored": bool(restored), "reason": _LIST_GATE_NO_COMPLETE_RESPONSE}
@@ -2990,7 +3047,7 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
             "key_kind": second_decision["row"].get("key_kind"),
         }
     reason = _LIST_GATE_PASSED_ID_NOT_FOUND if gate_passed else _deepest_list_gate_reason(gate_reasons)
-    _log_unfiltered_list_gate(reason, _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS, gate_passed)
+    _log_unfiltered_list_gate(reason, _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS, gate_passed, gate_counts, refresh_attempted)
     return _known_main_failure("zero_candidates_after_poll", scanned.get("snapshot"))
 
 
