@@ -9,7 +9,6 @@ import os
 import re
 import stat
 import sys
-import tempfile
 import time
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, quote_plus, urlparse
@@ -1685,11 +1684,15 @@ _LIST_DIAGNOSTIC_KEYS = (
 _PRIVATE_OUTLINE_SWITCH = "HERMES_LIST_RESPONSE_SCHEMA_OUTLINE_ONCE"
 _PRIVATE_OUTLINE_PATH = "HERMES_LIST_RESPONSE_SCHEMA_OUTLINE_PATH"
 _PRIVATE_OUTLINE_MAX_RECORDS = 3
+_PRIVATE_OUTLINE_MAX_BODY_BYTES = 1 << 20
+_PRIVATE_OUTLINE_MAX_UNSAFE_KEYS = 128
+_PRIVATE_OUTLINE_MAX_UNSAFE_SCAN_KEYS = _PRIVATE_OUTLINE_MAX_UNSAFE_KEYS + 1
+_PRIVATE_OUTLINE_TMP_ROOT = Path("/private/tmp")
 _PRIVATE_OUTLINE_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
-def _private_outline_target():
-    """Return a safe new private file target, or None without side effects."""
+def _safe_private_outline_target():
+    """Create this-run's private parent and return its new target, or None."""
     if ex.ENVIRONMENT != "TEST":
         return None
     if os.getenv(_PRIVATE_OUTLINE_SWITCH, "").strip().lower() not in {"1", "true", "yes", "on"}:
@@ -1698,20 +1701,34 @@ def _private_outline_target():
     if not raw_path:
         return None
     target = Path(raw_path)
-    if not target.is_absolute() or target.exists():
+    root = _PRIVATE_OUTLINE_TMP_ROOT
+    if (
+        not target.is_absolute() or target.parent.parent != root or os.path.lexists(target)
+        or target.is_relative_to(PROJECT_ROOT.resolve())
+    ):
         return None
     try:
-        parent = target.parent.resolve(strict=True)
-        if not parent.is_dir() or (stat.S_IMODE(parent.stat().st_mode) & 0o077):
+        for ancestor in (root.parent, root):
+            info = os.lstat(ancestor)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                return None
+        os.mkdir(target.parent, 0o700)
+        parent_info = os.lstat(target.parent)
+        if (
+            stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != os.getuid() or stat.S_IMODE(parent_info.st_mode) != 0o700
+        ):
             return None
-        if parent.is_relative_to(PROJECT_ROOT.resolve()):
+        if os.path.lexists(target):
             return None
     except (OSError, RuntimeError, ValueError):
         return None
-    resolved_target = parent / target.name
-    if resolved_target.exists():
-        return None
-    return resolved_target
+    return target
+
+
+def _private_outline_target():
+    """Compatibility alias for tests; this has no effect outside explicit TEST mode."""
+    return _safe_private_outline_target()
 
 
 def _json_outline_type(value):
@@ -1732,26 +1749,62 @@ def _response_schema_outline_v1(payload, observer_source):
     """Pure, value-free schema outline for a parsed response JSON object."""
     if observer_source not in {"cdp", "page_event"} or not isinstance(payload, dict):
         return None
-    root_items = list(payload.items())
-    object_children = [(key, value) for key, value in root_items if isinstance(value, dict)]
-    entry_count = len(root_items) + sum(len(value) for _, value in object_children)
-    unsafe_key_count = sum(
-        1 for key, _ in root_items if not isinstance(key, str) or not _PRIVATE_OUTLINE_KEY_RE.fullmatch(key)
-    )
+    unsafe_key_count = 0
+    unsafe_key_count_capped = False
+
+    def note_key(key):
+        nonlocal unsafe_key_count, unsafe_key_count_capped
+        if isinstance(key, str) and _PRIVATE_OUTLINE_KEY_RE.fullmatch(key):
+            return True
+        if unsafe_key_count < _PRIVATE_OUTLINE_MAX_UNSAFE_KEYS:
+            unsafe_key_count += 1
+        else:
+            unsafe_key_count_capped = True
+        return False
+
+    root_items = []
+    object_children = []
+    root_exceeded = False
+    for key, value in payload.items():
+        if len(root_items) >= 32:
+            root_exceeded = True
+            note_key(key)
+            break
+        note_key(key)
+        root_items.append((key, value))
+        if isinstance(value, dict):
+            if len(object_children) >= 8:
+                root_exceeded = True
+                break
+            object_children.append((key, value))
+    if root_exceeded:
+        return {
+            "schema_version": "response_schema_outline_v1", "observer_source": observer_source,
+            "unsafe_key_count": unsafe_key_count, "unsafe_key_count_capped": unsafe_key_count_capped,
+            "outline_status": "truncated", "limit_exceeded": True,
+        }
+    entry_count = len(root_items)
     for _, child in object_children:
-        unsafe_key_count += sum(
-            1 for key in child if not isinstance(key, str) or not _PRIVATE_OUTLINE_KEY_RE.fullmatch(key)
-        )
+        if len(child) > 64 or entry_count + len(child) > 128:
+            for scanned_keys, key in enumerate(child, start=1):
+                note_key(key)
+                if unsafe_key_count_capped or scanned_keys >= _PRIVATE_OUTLINE_MAX_UNSAFE_SCAN_KEYS:
+                    unsafe_key_count_capped = True
+                    break
+            return {
+                "schema_version": "response_schema_outline_v1", "observer_source": observer_source,
+                "unsafe_key_count": unsafe_key_count, "unsafe_key_count_capped": unsafe_key_count_capped,
+                "outline_status": "truncated", "limit_exceeded": True,
+            }
+        entry_count += len(child)
+        for key in child:
+            note_key(key)
     base = {
         "schema_version": "response_schema_outline_v1",
         "observer_source": observer_source,
-        "unsafe_key_count": min(unsafe_key_count, 128),
+        "unsafe_key_count": unsafe_key_count,
+        "unsafe_key_count_capped": unsafe_key_count_capped,
     }
-    if (
-        len(root_items) > 32 or len(object_children) > 8 or entry_count > 128
-        or any(len(child) > 64 for _, child in object_children)
-    ):
-        return {**base, "outline_status": "truncated", "limit_exceeded": True}
     root = [
         {"key": key, "type": _json_outline_type(value)}
         for key, value in root_items
@@ -1783,6 +1836,7 @@ class _PrivateOutlineBatch:
         self.target = target
         self.records = []
         self.overflow_count = 0
+        self.write_attempted = False
 
     def add(self, record):
         if not isinstance(record, dict):
@@ -1793,36 +1847,50 @@ class _PrivateOutlineBatch:
         self.records.append(record)
 
     def write_once(self):
-        if self.target is None or not self.records:
+        if self.write_attempted or self.target is None or not self.records:
             return False
+        self.write_attempted = True
+        temporary = None
+        parent_fd = None
         try:
+            parent_info = os.lstat(self.target.parent)
+            if (
+                stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode)
+                or parent_info.st_uid != os.getuid() or stat.S_IMODE(parent_info.st_mode) != 0o700
+                or os.path.lexists(self.target)
+            ):
+                return False
             payload = json.dumps({
                 "schema_version": "response_schema_outline_batch_v1",
                 "outlines": self.records,
                 "outline_overflow_count": self.overflow_count,
             }, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            fd, temporary = tempfile.mkstemp(prefix=f".{self.target.name}.", dir=self.target.parent)
-            try:
-                os.fchmod(fd, 0o600)
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(payload)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.link(temporary, self.target)
-                os.unlink(temporary)
-                return stat.S_IMODE(self.target.stat().st_mode) == 0o600
-            except Exception:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                try:
-                    os.unlink(temporary)
-                except OSError:
-                    pass
+            parent_fd = os.open(self.target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            temporary = f".{self.target.name}.tmp"
+            fd = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd
+            )
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary, self.target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
+            os.unlink(temporary, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            return stat.S_IMODE(self.target.stat().st_mode) == 0o600
         except Exception:
-            pass
-        return False
+            if temporary is not None and parent_fd is not None:
+                try:
+                    os.unlink(temporary, dir_fd=parent_fd)
+                except OSError:
+                    pass
+            return False
+        finally:
+            if parent_fd is not None:
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
 
 
 class _ListRequestObserver(list):
@@ -1831,7 +1899,7 @@ class _ListRequestObserver(list):
     只保留状态码和布尔结果，不保存 URL、请求体、响应正文或筛选原文。
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, private_outline_batch=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.keepalive = None
         self.carried_target_filter = False
@@ -1849,7 +1917,7 @@ class _ListRequestObserver(list):
         self.page_event_handlers = []
         self.diagnostic_counts = {key: 0 for key in _LIST_DIAGNOSTIC_KEYS}
         self.structure_diagnostic_counts = {key: 0 for key in _LIST_STRUCTURE_BUCKETS}
-        self.private_outline_batch = _PrivateOutlineBatch(_private_outline_target())
+        self.private_outline_batch = private_outline_batch
 
 
 # 后台列表接口的实际路径是 /backend/cloudTrial/appInfo/getAppInfoList，
@@ -2126,10 +2194,6 @@ def _detach_list_response_observer(observations):
             observations.keepalive = None
         except Exception:
             pass
-        try:
-            observations.private_outline_batch.write_once()
-        except Exception:
-            pass
 
 
 def _redacted_text_summary(value):
@@ -2353,6 +2417,18 @@ def _detach_save_click_observer(observer):
     _detach_list_response_observer(observer)
 
 
+def _body_exceeds_private_outline_limit(body, *, base64_encoded=False):
+    text = _as_text(body)
+    if base64_encoded:
+        if len(text) > ((_PRIVATE_OUTLINE_MAX_BODY_BYTES + 2) // 3) * 4:
+            return True
+        try:
+            return len(base64.b64decode(text, validate=True)) > _PRIVATE_OUTLINE_MAX_BODY_BYTES
+        except Exception:
+            return False
+    return len(text) > _PRIVATE_OUTLINE_MAX_BODY_BYTES or len(text.encode("utf-8")) > _PRIVATE_OUTLINE_MAX_BODY_BYTES
+
+
 def _classify_list_structure_body(body, *, base64_encoded=False):
     """Return one fixed structure bucket and in-memory meta; never retain body text."""
     if body is None:
@@ -2378,17 +2454,22 @@ def _classify_list_structure_body(body, *, base64_encoded=False):
 
 
 def _capture_private_structure_outline(observations, body, *, base64_encoded, observer_source):
-    """Capture only a value-free outline; failures intentionally remain invisible publicly."""
+    """Capture only a bounded value-free outline; failures remain invisible publicly."""
     batch = getattr(observations, "private_outline_batch", None)
     if batch is None or batch.target is None or body is None:
         return
     try:
+        if _body_exceeds_private_outline_limit(body, base64_encoded=base64_encoded):
+            batch.add({
+                "schema_version": "response_schema_outline_v1", "observer_source": observer_source,
+                "outline_status": "too_large_not_outlined", "body_size_capped": True,
+            })
+            return
         text = _as_text(body)
         if base64_encoded:
             text = base64.b64decode(text, validate=True).decode("utf-8")
         payload = json.loads(text)
-        record = _response_schema_outline_v1(payload, observer_source)
-        batch.add(record)
+        batch.add(_response_schema_outline_v1(payload, observer_source))
     except Exception:
         pass
 
@@ -2413,7 +2494,7 @@ def _record_target_absent_structure(observations, body, *, base64_encoded=False,
     return meta
 
 
-def _attach_list_response_observer(page, target_filter=None):
+def _attach_list_response_observer(page, target_filter=None, private_outline_batch=None):
     """只读网络观察器：列表请求、HTTP 状态、是否携带筛选、响应是否含目标。
 
     只记录状态码和布尔结果。响应正文只在内存中为已携带目标筛选的请求做
@@ -2423,7 +2504,7 @@ def _attach_list_response_observer(page, target_filter=None):
     失败再退回 Playwright 页面事件监听。两者都不可用时返回 None，调用方据此
     给出"未观察到请求"而不是失败。
     """
-    observations = _ListRequestObserver()
+    observations = _ListRequestObserver(private_outline_batch=private_outline_batch)
     list_request_ids = set()
     carried_request_ids = set()
     list_status_by_id = {}
@@ -3335,7 +3416,7 @@ def _deepest_list_gate_reason(reasons):
     return max(reasons, key=lambda reason: ranks.get(reason, 0), default=_LIST_GATE_NO_COMPLETE_RESPONSE)
 
 
-def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel_name):
+def _locate_known_main_row_for_resource_fallback_impl(page, app_id, app_name, channel_name, private_outline_batch):
     """Read-only post-save locator: require a fresh unfiltered response before scanning.
 
     `_identify_new_app` may have found an ID in a channel-filtered view.  Resetting
@@ -3355,7 +3436,10 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
         if attempt:
             page.wait_for_timeout(_POST_SAVE_KNOWN_ID_POLL_MS)
         previous_state = _read_list_restore_state(page) or {}
-        observations = _attach_list_response_observer(page)
+        observations = (
+            _attach_list_response_observer(page, private_outline_batch=private_outline_batch)
+            if private_outline_batch.target is not None else _attach_list_response_observer(page)
+        )
         records_before = len(getattr(observations, "success_records", []) or []) if observations is not None else 0
         target_absent_before = int(getattr(observations, "target_absent_2xx_count", 0) or 0) if observations is not None else 0
         try:
@@ -3431,6 +3515,17 @@ def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel
         gate_diagnostics, gate_structure_diagnostics,
     )
     return _known_main_failure("zero_candidates_after_poll", scanned.get("snapshot"))
+
+
+def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel_name):
+    """Run the entire post-save locator with one optional private outline batch."""
+    batch = _PrivateOutlineBatch(_safe_private_outline_target())
+    try:
+        return _locate_known_main_row_for_resource_fallback_impl(
+            page, app_id, app_name, channel_name, batch
+        )
+    finally:
+        batch.write_once()
 
 
 def _identify_new_app(page, before_ids, actual_channel_name, app_name):
