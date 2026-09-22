@@ -7,7 +7,9 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, quote_plus, urlparse
@@ -46,6 +48,7 @@ DEFAULT_REF_SOURCES = {
 }
 
 DIR = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 OUT = DIR / "output"
 OUT.mkdir(exist_ok=True)
 
@@ -1679,6 +1682,149 @@ _LIST_DIAGNOSTIC_KEYS = (
 )
 
 
+_PRIVATE_OUTLINE_SWITCH = "HERMES_LIST_RESPONSE_SCHEMA_OUTLINE_ONCE"
+_PRIVATE_OUTLINE_PATH = "HERMES_LIST_RESPONSE_SCHEMA_OUTLINE_PATH"
+_PRIVATE_OUTLINE_MAX_RECORDS = 3
+_PRIVATE_OUTLINE_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+def _private_outline_target():
+    """Return a safe new private file target, or None without side effects."""
+    if ex.ENVIRONMENT != "TEST":
+        return None
+    if os.getenv(_PRIVATE_OUTLINE_SWITCH, "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    raw_path = os.getenv(_PRIVATE_OUTLINE_PATH, "").strip()
+    if not raw_path:
+        return None
+    target = Path(raw_path)
+    if not target.is_absolute() or target.exists():
+        return None
+    try:
+        parent = target.parent.resolve(strict=True)
+        if not parent.is_dir() or (stat.S_IMODE(parent.stat().st_mode) & 0o077):
+            return None
+        if parent.is_relative_to(PROJECT_ROOT.resolve()):
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    resolved_target = parent / target.name
+    if resolved_target.exists():
+        return None
+    return resolved_target
+
+
+def _json_outline_type(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return "object"
+
+
+def _response_schema_outline_v1(payload, observer_source):
+    """Pure, value-free schema outline for a parsed response JSON object."""
+    if observer_source not in {"cdp", "page_event"} or not isinstance(payload, dict):
+        return None
+    root_items = list(payload.items())
+    object_children = [(key, value) for key, value in root_items if isinstance(value, dict)]
+    entry_count = len(root_items) + sum(len(value) for _, value in object_children)
+    unsafe_key_count = sum(
+        1 for key, _ in root_items if not isinstance(key, str) or not _PRIVATE_OUTLINE_KEY_RE.fullmatch(key)
+    )
+    for _, child in object_children:
+        unsafe_key_count += sum(
+            1 for key in child if not isinstance(key, str) or not _PRIVATE_OUTLINE_KEY_RE.fullmatch(key)
+        )
+    base = {
+        "schema_version": "response_schema_outline_v1",
+        "observer_source": observer_source,
+        "unsafe_key_count": min(unsafe_key_count, 128),
+    }
+    if (
+        len(root_items) > 32 or len(object_children) > 8 or entry_count > 128
+        or any(len(child) > 64 for _, child in object_children)
+    ):
+        return {**base, "outline_status": "truncated", "limit_exceeded": True}
+    root = [
+        {"key": key, "type": _json_outline_type(value)}
+        for key, value in root_items
+        if isinstance(key, str) and _PRIVATE_OUTLINE_KEY_RE.fullmatch(key)
+    ]
+    children = []
+    for key, child in object_children:
+        if not isinstance(key, str) or not _PRIVATE_OUTLINE_KEY_RE.fullmatch(key):
+            continue
+        children.append({
+            "path": [key],
+            "keys": sorted([
+                {"key": child_key, "type": _json_outline_type(child_value)}
+                for child_key, child_value in child.items()
+                if isinstance(child_key, str) and _PRIVATE_OUTLINE_KEY_RE.fullmatch(child_key)
+            ], key=lambda item: item["key"]),
+        })
+    return {
+        **base,
+        "outline_status": "complete",
+        "limit_exceeded": False,
+        "root": sorted(root, key=lambda item: item["key"]),
+        "object_children": sorted(children, key=lambda item: item["path"]),
+    }
+
+
+class _PrivateOutlineBatch:
+    def __init__(self, target):
+        self.target = target
+        self.records = []
+        self.overflow_count = 0
+
+    def add(self, record):
+        if not isinstance(record, dict):
+            return
+        if len(self.records) >= _PRIVATE_OUTLINE_MAX_RECORDS:
+            self.overflow_count = min(self.overflow_count + 1, _PRIVATE_OUTLINE_MAX_RECORDS)
+            return
+        self.records.append(record)
+
+    def write_once(self):
+        if self.target is None or not self.records:
+            return False
+        try:
+            payload = json.dumps({
+                "schema_version": "response_schema_outline_batch_v1",
+                "outlines": self.records,
+                "outline_overflow_count": self.overflow_count,
+            }, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            fd, temporary = tempfile.mkstemp(prefix=f".{self.target.name}.", dir=self.target.parent)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.link(temporary, self.target)
+                os.unlink(temporary)
+                return stat.S_IMODE(self.target.stat().st_mode) == 0o600
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        return False
+
+
 class _ListRequestObserver(list):
     """记录列表请求的 HTTP 状态，并持有 CDP 会话引用避免被回收。
 
@@ -1703,6 +1849,7 @@ class _ListRequestObserver(list):
         self.page_event_handlers = []
         self.diagnostic_counts = {key: 0 for key in _LIST_DIAGNOSTIC_KEYS}
         self.structure_diagnostic_counts = {key: 0 for key in _LIST_STRUCTURE_BUCKETS}
+        self.private_outline_batch = _PrivateOutlineBatch(_private_outline_target())
 
 
 # 后台列表接口的实际路径是 /backend/cloudTrial/appInfo/getAppInfoList，
@@ -1957,7 +2104,7 @@ def _filter_field_rank(field, is_channel):
 
 
 def _detach_list_response_observer(observations):
-    """Release CDP and page-event observers; no handler may outlive its reset."""
+    """Release observers and atomically flush any enabled private value-free outline."""
     for page, event, handler in getattr(observations, "page_event_handlers", []) or []:
         off = getattr(page, "off", None)
         if callable(off):
@@ -1977,6 +2124,10 @@ def _detach_list_response_observer(observations):
     if observations is not None:
         try:
             observations.keepalive = None
+        except Exception:
+            pass
+        try:
+            observations.private_outline_batch.write_once()
         except Exception:
             pass
 
@@ -2226,7 +2377,23 @@ def _classify_list_structure_body(body, *, base64_encoded=False):
     return "complete", meta
 
 
-def _record_target_absent_structure(observations, body, *, base64_encoded=False, read_error=False):
+def _capture_private_structure_outline(observations, body, *, base64_encoded, observer_source):
+    """Capture only a value-free outline; failures intentionally remain invisible publicly."""
+    batch = getattr(observations, "private_outline_batch", None)
+    if batch is None or batch.target is None or body is None:
+        return
+    try:
+        text = _as_text(body)
+        if base64_encoded:
+            text = base64.b64decode(text, validate=True).decode("utf-8")
+        payload = json.loads(text)
+        record = _response_schema_outline_v1(payload, observer_source)
+        batch.add(record)
+    except Exception:
+        pass
+
+
+def _record_target_absent_structure(observations, body, *, base64_encoded=False, read_error=False, observer_source="cdp"):
     """Record exactly one fixed bucket for one completed target-absent 2xx response."""
     observations.target_absent_2xx_count += 1
     if read_error:
@@ -2239,6 +2406,10 @@ def _record_target_absent_structure(observations, body, *, base64_encoded=False,
         observations.success_records.append(meta)
     else:
         observations.target_absent_structure_invalid_count += 1
+        if bucket == "required_structure_missing":
+            _capture_private_structure_outline(
+                observations, body, base64_encoded=base64_encoded, observer_source=observer_source
+            )
     return meta
 
 
@@ -2352,7 +2523,7 @@ def _attach_list_response_observer(page, target_filter=None):
                         _note_response_contains_target(_body_contains_target(target_body))
                 if need_structure:
                     meta = _record_target_absent_structure(
-                        observations, body, base64_encoded=bool(result.get("base64Encoded"))
+                        observations, body, base64_encoded=bool(result.get("base64Encoded")), observer_source="cdp"
                     )
                     if meta:
                         meta["status"] = int(status)
@@ -2481,7 +2652,7 @@ def _attach_list_response_observer(page, target_filter=None):
                 if need_target:
                     _note_response_contains_target(_body_contains_target(body))
                 if need_structure:
-                    meta = _record_target_absent_structure(observations, body)
+                    meta = _record_target_absent_structure(observations, body, observer_source="page_event")
                     if meta:
                         meta["status"] = int(status or 0)
             finally:
