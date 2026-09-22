@@ -1852,6 +1852,9 @@ class _PrivateOutlineBatch:
         self.write_attempted = True
         temporary = None
         parent_fd = None
+        fd = None
+        installed_identity = None
+        result = False
         try:
             parent_info = os.lstat(self.target.parent)
             if (
@@ -1870,27 +1873,49 @@ class _PrivateOutlineBatch:
             fd = os.open(
                 temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd
             )
+            os.fchmod(fd, 0o600)
+            installed_identity = os.fstat(fd)
             with os.fdopen(fd, "wb") as handle:
+                fd = None
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.link(temporary, self.target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
-            os.unlink(temporary, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-            return stat.S_IMODE(self.target.stat().st_mode) == 0o600
+            target_info = os.lstat(self.target)
+            valid_target = (
+                stat.S_ISREG(target_info.st_mode) and stat.S_IMODE(target_info.st_mode) == 0o600
+                and (target_info.st_dev, target_info.st_ino) == (installed_identity.st_dev, installed_identity.st_ino)
+            )
+            if not valid_target:
+                if (target_info.st_dev, target_info.st_ino) == (installed_identity.st_dev, installed_identity.st_ino):
+                    os.unlink(self.target.name, dir_fd=parent_fd)
+                return False
+            result = True
         except Exception:
+            result = False
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             if temporary is not None and parent_fd is not None:
                 try:
                     os.unlink(temporary, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
                 except OSError:
                     pass
-            return False
-        finally:
             if parent_fd is not None:
+                try:
+                    os.fsync(parent_fd)
+                except OSError:
+                    pass
                 try:
                     os.close(parent_fd)
                 except OSError:
                     pass
+        return result
 
 
 class _ListRequestObserver(list):

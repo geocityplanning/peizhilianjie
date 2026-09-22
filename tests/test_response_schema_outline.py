@@ -329,6 +329,33 @@ def test_private_write_rejects_non_owner_directory(monkeypatch, tmp_path):
     assert not target.exists()
 
 
+def test_non_0600_installed_target_is_removed(monkeypatch, tmp_path):
+    cap = _cap()
+    parent = _private_parent(tmp_path)
+    target = parent / "outline.json"
+    batch = cap._PrivateOutlineBatch(target)
+    batch.add(cap._response_schema_outline_v1({"data": {}}, "cdp"))
+    monkeypatch.setattr(cap.os, "fchmod", lambda fd, mode: None)
+    old_umask = cap.os.umask(0o477)
+    try:
+        assert batch.write_once() is False
+    finally:
+        cap.os.umask(old_umask)
+    assert not target.exists()
+    assert list(parent.iterdir()) == []
+
+
+def test_keyboard_interrupt_cleans_temporary_and_propagates(monkeypatch, tmp_path):
+    cap = _cap()
+    parent = _private_parent(tmp_path)
+    batch = cap._PrivateOutlineBatch(parent / "outline.json")
+    batch.add(cap._response_schema_outline_v1({"data": {}}, "cdp"))
+    monkeypatch.setattr(cap.os, "link", lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        batch.write_once()
+    assert list(parent.iterdir()) == []
+
+
 def test_private_write_failure_leaves_no_temporary_file(monkeypatch, tmp_path):
     cap = _cap()
     parent = _private_parent(tmp_path)
