@@ -329,7 +329,7 @@ def test_private_write_rejects_non_owner_directory(monkeypatch, tmp_path):
     assert not target.exists()
 
 
-def test_non_0600_installed_target_is_removed(monkeypatch, tmp_path):
+def test_non_0600_installed_target_is_preserved_fail_closed(monkeypatch, tmp_path):
     cap = _cap()
     parent = _private_parent(tmp_path)
     target = parent / "outline.json"
@@ -341,8 +341,44 @@ def test_non_0600_installed_target_is_removed(monkeypatch, tmp_path):
         assert batch.write_once() is False
     finally:
         cap.os.umask(old_umask)
+    assert target.exists()
+    assert stat.S_IMODE(target.stat().st_mode) != 0o600
+    assert [path.name for path in parent.iterdir()] == ["outline.json"]
+
+
+def test_preexisting_temporary_file_is_never_removed(monkeypatch, tmp_path):
+    cap = _cap()
+    parent = _private_parent(tmp_path)
+    target = parent / "outline.json"
+    temporary = parent / ".outline.json.tmp"
+    temporary.write_text("preexisting", encoding="utf-8")
+    batch = cap._PrivateOutlineBatch(target)
+    batch.add(cap._response_schema_outline_v1({"data": {}}, "cdp"))
+    assert batch.write_once() is False
+    assert temporary.read_text(encoding="utf-8") == "preexisting"
     assert not target.exists()
-    assert list(parent.iterdir()) == []
+
+
+def test_replaced_target_is_never_deleted_after_lstat_mismatch(monkeypatch, tmp_path):
+    cap = _cap()
+    parent = _private_parent(tmp_path)
+    target = parent / "outline.json"
+    batch = cap._PrivateOutlineBatch(target)
+    batch.add(cap._response_schema_outline_v1({"data": {}}, "cdp"))
+    actual_lstat = cap.os.lstat
+    replaced = {"done": False}
+
+    def replace_target(path):
+        if Path(path) == target and target.exists() and not replaced["done"]:
+            target.unlink()
+            target.write_text("replacement", encoding="utf-8")
+            replaced["done"] = True
+        return actual_lstat(path)
+
+    monkeypatch.setattr(cap.os, "lstat", replace_target)
+    assert batch.write_once() is False
+    assert target.read_text(encoding="utf-8") == "replacement"
+    assert [path.name for path in parent.iterdir()] == ["outline.json"]
 
 
 def test_keyboard_interrupt_cleans_temporary_and_propagates(monkeypatch, tmp_path):

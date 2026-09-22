@@ -1851,6 +1851,7 @@ class _PrivateOutlineBatch:
             return False
         self.write_attempted = True
         temporary = None
+        temporary_created = False
         parent_fd = None
         fd = None
         installed_identity = None
@@ -1873,6 +1874,7 @@ class _PrivateOutlineBatch:
             fd = os.open(
                 temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd
             )
+            temporary_created = True
             os.fchmod(fd, 0o600)
             installed_identity = os.fstat(fd)
             with os.fdopen(fd, "wb") as handle:
@@ -1887,8 +1889,8 @@ class _PrivateOutlineBatch:
                 and (target_info.st_dev, target_info.st_ino) == (installed_identity.st_dev, installed_identity.st_ino)
             )
             if not valid_target:
-                if (target_info.st_dev, target_info.st_ino) == (installed_identity.st_dev, installed_identity.st_ino):
-                    os.unlink(self.target.name, dir_fd=parent_fd)
+                # A path check and unlink cannot be atomic against a same-UID
+                # replacement.  Fail closed and preserve the unknown path.
                 return False
             result = True
         except Exception:
@@ -1899,7 +1901,7 @@ class _PrivateOutlineBatch:
                     os.close(fd)
                 except OSError:
                     pass
-            if temporary is not None and parent_fd is not None:
+            if temporary_created and temporary is not None and parent_fd is not None:
                 try:
                     os.unlink(temporary, dir_fd=parent_fd)
                 except FileNotFoundError:
