@@ -373,6 +373,17 @@ def test_save_page_fallback_rejects_zero_ambiguous_or_nonmatching_responses(resp
     assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
 
 
+def test_save_page_fallback_overflow_does_not_read_or_promote_body():
+    cap = _stub_login_and_import()
+    response = _PageSaveResponse('{"header":{"status":"200"}}')
+    observer = _page_fallback_observer(cap, responses=[{
+        "method": "POST", "path_hash": "0123456789abcdef", "http_status": 200, "response": response,
+    }])
+    observer.page_response_overflow = True
+    assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
+    assert response.text_calls == 0
+
+
 def test_save_page_fallback_no_body_or_invalid_envelope_stays_fail_closed():
     cap = _stub_login_and_import()
     for response in (_PageSaveResponse(None), _PageSaveResponse('not-json'), _PageSaveResponse('{"data":{}}'), _PageSaveResponse('', raise_on_text=True)):
@@ -417,7 +428,7 @@ def test_save_page_event_listener_requires_current_window_request_and_detaches()
                 del self.handlers[event]
 
     class Request:
-        url = "https://uat-cloud.139.com/save"
+        url = "https://uat-cloud.139.com/save?secret=query"
         method = "POST"
 
     class Response:
@@ -439,11 +450,28 @@ def test_save_page_event_listener_requires_current_window_request_and_detaches()
     assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
 
     page.handlers["request"](request)
-    page.handlers["response"](Response(request))
+    same_request_different_wrapper = Request()
+    assert same_request_different_wrapper is not request
+    assert same_request_different_wrapper.url == request.url
+    assert same_request_different_wrapper.method == request.method
+    page.handlers["response"](Response(same_request_different_wrapper))
+    # Playwright callback wrappers need not preserve Python object identity; the
+    # observer must associate only through the fixed safe projection.
+    assert len(observer.page_responses) == 1
+    projected = observer.page_responses[0]
+    assert set(projected) == {"method", "path_hash", "http_status", "response"}
+    assert request.url not in str({key: value for key, value in projected.items() if key != "response"})
+    assert "secret=query" not in str({key: value for key, value in projected.items() if key != "response"})
     assert cap._save_click_observation(observer)["outcome"] == "success"
     cap._detach_save_click_observer(observer)
     assert page.handlers == {}
     assert session.detached is True
+
+
+def test_contract_documents_wrapper_safe_page_response_fallback():
+    contract = (Path(__file__).parents[1] / "contracts" / "hermes-http-v1.md").read_text(encoding="utf-8")
+    assert "不得依赖 Python wrapper 对象身份" in contract
+    assert "response.request` 即时投影 method/path-hash/status" in contract
 
 
 def test_save_observation_rejects_missing_or_multiple_candidates():

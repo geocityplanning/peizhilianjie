@@ -1666,7 +1666,7 @@ class _SaveClickObserver:
     def __init__(self):
         self.keepalive = None
         self.candidates = {}
-        self.page_request_meta = {}
+        self.page_write_request_count = 0
         self.page_responses = []
         self.page_response_overflow = False
         self.page_event_handlers = []
@@ -2567,20 +2567,24 @@ def _attach_save_click_observer(page):
                 method = str(getattr(request, "method", "") or "").upper()
                 if not _is_save_write(url, method):
                     return
-                if len(observer.page_request_meta) >= _SAVE_PAGE_RESPONSE_LIMIT:
+                if observer.page_write_request_count >= _SAVE_PAGE_RESPONSE_LIMIT:
                     observer.page_response_overflow = True
                     return
-                observer.page_request_meta[id(request)] = {
-                    "method": method, "path_hash": _save_path_hash(url),
-                }
+                observer.page_write_request_count += 1
             except Exception:
                 return
 
         def _on_page_response(response):
             try:
+                # Playwright may wrap the same protocol request in distinct Python
+                # objects across callbacks. Re-project response.request immediately;
+                # neither its URL nor an object identity is retained.
                 request = getattr(response, "request", None)
-                meta = observer.page_request_meta.pop(id(request), None) if request is not None else None
-                if meta is None:
+                if request is None or observer.page_write_request_count <= 0:
+                    return
+                url = getattr(request, "url", "") or ""
+                method = str(getattr(request, "method", "") or "").upper()
+                if not _is_save_write(url, method):
                     return
                 if len(observer.page_responses) >= _SAVE_PAGE_RESPONSE_LIMIT:
                     observer.page_response_overflow = True
@@ -2589,7 +2593,12 @@ def _attach_save_click_observer(page):
                     status = int(getattr(response, "status", 0) or 0)
                 except (TypeError, ValueError):
                     status = 0
-                observer.page_responses.append({**meta, "http_status": status, "response": response})
+                observer.page_responses.append({
+                    "method": method,
+                    "path_hash": _save_path_hash(url),
+                    "http_status": status,
+                    "response": response,
+                })
             except Exception:
                 return
 
