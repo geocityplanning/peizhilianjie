@@ -1759,19 +1759,91 @@ def _click_next_page_and_wait(page):
     return True
 
 
+_ACTION_DIAGNOSTIC_COUNT_LIMIT = 3
+_ACTION_DIAGNOSTIC_PATH_LIMIT = 3
+_ACTION_DIAGNOSTIC_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}
+
+
+class _ActionWriteDiagnostics:
+    """Bounded value-free request classification for one enable action window."""
+
+    def __init__(self):
+        self.counts = {
+            "accepted_write": 0,
+            "method_rejected": 0,
+            "list_rejected": 0,
+            "origin_rejected": 0,
+            "missing_request_id": 0,
+        }
+        self.origin_counts = {"same_origin": 0, "cross_origin": 0}
+        self.methods = set()
+        self.path_hashes = set()
+        self.observer_event_unseen = 0
+
+    @staticmethod
+    def _bounded_add(mapping, key):
+        mapping[key] = min(int(mapping.get(key, 0) or 0) + 1, _ACTION_DIAGNOSTIC_COUNT_LIMIT)
+
+    def classify(self, url, method, origin, request_id_required=False, request_id=None):
+        """Classify a request without retaining its URL or other request values."""
+        fixed_method = str(method or "").upper()
+        if fixed_method not in _ACTION_DIAGNOSTIC_METHODS:
+            fixed_method = "OTHER"
+        self.methods.add(fixed_method)
+        same_origin = urlparse(_as_text(url)).netloc == origin
+        self._bounded_add(self.origin_counts, "same_origin" if same_origin else "cross_origin")
+        path_hash = _save_path_hash(url)
+        if path_hash and len(self.path_hashes) < _ACTION_DIAGNOSTIC_PATH_LIMIT:
+            self.path_hashes.add(path_hash)
+        if fixed_method not in {"POST", "PUT", "PATCH", "DELETE"}:
+            self._bounded_add(self.counts, "method_rejected")
+            return False
+        if _is_list_request_url(url):
+            self._bounded_add(self.counts, "list_rejected")
+            return False
+        if not same_origin:
+            self._bounded_add(self.counts, "origin_rejected")
+            return False
+        if request_id_required and not request_id:
+            self._bounded_add(self.counts, "missing_request_id")
+            return False
+        self._bounded_add(self.counts, "accepted_write")
+        return True
+
+    def projection(self):
+        return {
+            **{key: min(max(int(self.counts.get(key, 0) or 0), 0), _ACTION_DIAGNOSTIC_COUNT_LIMIT)
+               for key in ("accepted_write", "method_rejected", "list_rejected", "origin_rejected", "missing_request_id")},
+            "observer_event_unseen": min(max(int(self.observer_event_unseen or 0), 0), 1),
+            "origin": {key: min(max(int(self.origin_counts.get(key, 0) or 0), 0), _ACTION_DIAGNOSTIC_COUNT_LIMIT)
+                       for key in ("same_origin", "cross_origin")},
+            "methods": sorted(method for method in self.methods if method in _ACTION_DIAGNOSTIC_METHODS | {"OTHER"})[:_ACTION_DIAGNOSTIC_PATH_LIMIT],
+            "path_hashes": sorted(self.path_hashes)[:_ACTION_DIAGNOSTIC_PATH_LIMIT],
+        }
+
+
 class _SaveClickObserver:
     """Bounded, redacted observer for exactly one write request after Save click."""
 
     def __init__(self):
         self.keepalive = None
         self.candidates = {}
+        self.candidate_overflow = False
         self.page_write_request_count = 0
         self.page_responses = []
         self.page_response_overflow = False
         self.page_event_handlers = []
+        self.detached = False
+        self.cdp_diagnostics = _ActionWriteDiagnostics()
+        self.page_diagnostics = _ActionWriteDiagnostics()
+        self.confirmation_trace = "none_seen"
+        self.confirmation_clicked = False
+        self.confirmation_closed = False
+        self.post_action_switch_state = "not_inferable"
 
 
 _SAVE_PAGE_RESPONSE_LIMIT = 2
+_SAVE_CANDIDATE_LIMIT = 2
 
 
 _LIST_STRUCTURE_BUCKETS = (
@@ -2605,6 +2677,7 @@ def _wait_for_switch_action_observation(page, observer, timeout_ms=6000, poll_in
     while time.monotonic() < deadline:
         box_count = _visible_message_box_count(page)
         if box_count is None:
+            observer.confirmation_trace = "unreadable"
             return {"outcome": "message_box_unreadable"}
         candidate_count = len(getattr(observer, "candidates", {}) or {})
         if candidate_count > 1:
@@ -2612,26 +2685,67 @@ def _wait_for_switch_action_observation(page, observer, timeout_ms=6000, poll_in
         if box_count:
             # The original box may remain visible through its close animation;
             # only a box before it or after it closed is ambiguous.
-            if box_count != 1 or confirm_closed:
+            if box_count != 1:
+                observer.confirmation_trace = "multiple_visible"
+                return {"outcome": "message_box_ambiguous"}
+            if confirm_closed:
+                observer.confirmation_trace = "reappeared"
                 return {"outcome": "message_box_ambiguous"}
             if not saw_box:
                 if candidate_count:
+                    observer.confirmation_trace = "request_before_confirmation"
                     return {"outcome": "message_box_ambiguous"}
                 saw_box = True
+                observer.confirmation_trace = "unique_seen"
                 if not _click_unique_new_message_box_confirm(page):
+                    observer.confirmation_trace = "confirm_button_rejected"
                     return {"outcome": "message_box_confirm_rejected"}
                 confirm_clicked = True
+                observer.confirmation_clicked = True
         elif confirm_clicked:
             confirm_closed = True
+            observer.confirmation_closed = True
+            observer.confirmation_trace = "unique_clicked_closed"
         page.wait_for_timeout(poll_interval_ms)
     if saw_box and (not confirm_clicked or not confirm_closed):
+        observer.confirmation_trace = "unclosed"
         return {"outcome": "message_box_ambiguous"}
+    if not saw_box:
+        observer.confirmation_trace = "none_seen"
     return _save_click_observation(observer)
 
 
-def _log_enable_click_observation(decision):
+def _enable_action_observation_diagnostic(observer, decision):
+    """Value-free enable-only observer facts; never upgrade an observation outcome."""
+    cdp = getattr(observer, "cdp_diagnostics", None)
+    page = getattr(observer, "page_diagnostics", None)
+    cdp_projection = cdp.projection() if isinstance(cdp, _ActionWriteDiagnostics) else _ActionWriteDiagnostics().projection()
+    page_projection = page.projection() if isinstance(page, _ActionWriteDiagnostics) else _ActionWriteDiagnostics().projection()
+    # Record directional visibility after the window has closed. A double miss is
+    # represented by both accepted counts being zero, without inventing an event.
+    cdp_projection["observer_event_unseen"] = int(cdp_projection["accepted_write"] == 0 and page_projection["accepted_write"] > 0)
+    page_projection["observer_event_unseen"] = int(page_projection["accepted_write"] == 0 and cdp_projection["accepted_write"] > 0)
+    trace = getattr(observer, "confirmation_trace", "not_inferable")
+    if trace not in {"none_seen", "unique_seen", "unique_clicked_closed", "multiple_visible", "reappeared", "request_before_confirmation", "confirm_button_rejected", "unclosed", "unreadable"}:
+        trace = "not_inferable"
+    switch_state = getattr(observer, "post_action_switch_state", "not_inferable")
+    if switch_state not in _NARROW_ROW_SWITCH_STATES:
+        switch_state = "not_inferable"
+    return {
+        "observation": _save_click_diagnostic(decision),
+        "request_observer": {"cdp": cdp_projection, "page_event": page_projection},
+        "confirmation": {
+            "trace": trace,
+            "unique_confirm_clicked": bool(getattr(observer, "confirmation_clicked", False)),
+            "confirmation_closed": bool(getattr(observer, "confirmation_closed", False)),
+        },
+        "post_action_switch_state": switch_state,
+    }
+
+
+def _log_enable_click_observation(observer, decision):
     print("[create_app] enable_observation=" + json.dumps(
-        _save_click_diagnostic(decision), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        _enable_action_observation_diagnostic(observer, decision), ensure_ascii=True, sort_keys=True, separators=(",", ":")
     ))
 
 
@@ -2651,21 +2765,29 @@ def _attach_save_click_observer(page):
             )
 
         def _on_request(params):
+            if observer.detached:
+                return
             data = params or {}
             request = data.get("request") or {}
             url = request.get("url") or ""
             method = str(request.get("method") or "").upper()
-            if not _is_save_write(url, method):
-                return
             request_id = data.get("requestId")
-            if request_id:
-                observer.candidates[request_id] = {
-                    "method": method,
-                    "path_hash": _save_path_hash(url),
-                    "completed": False,
-                }
+            if not observer.cdp_diagnostics.classify(
+                url, method, origin, request_id_required=True, request_id=request_id
+            ):
+                return
+            if request_id not in observer.candidates and len(observer.candidates) >= _SAVE_CANDIDATE_LIMIT:
+                observer.candidate_overflow = True
+                return
+            observer.candidates[request_id] = {
+                "method": method,
+                "path_hash": _save_path_hash(url),
+                "completed": False,
+            }
 
         def _on_response(params):
+            if observer.detached:
+                return
             data = params or {}
             request_id = data.get("requestId")
             candidate = observer.candidates.get(request_id)
@@ -2678,6 +2800,8 @@ def _attach_save_click_observer(page):
                 candidate["http_status"] = 0
 
         def _on_finished(params):
+            if observer.detached:
+                return
             request_id = (params or {}).get("requestId")
             candidate = observer.candidates.get(request_id)
             if candidate is None:
@@ -2694,6 +2818,8 @@ def _attach_save_click_observer(page):
                 candidate["business"] = {"outcome": "unreadable"}
 
         def _on_failed(params):
+            if observer.detached:
+                return
             candidate = observer.candidates.get((params or {}).get("requestId"))
             if candidate is not None:
                 candidate["completed"] = True
@@ -2707,9 +2833,11 @@ def _attach_save_click_observer(page):
 
         def _on_page_request(request):
             try:
+                if observer.detached:
+                    return
                 url = getattr(request, "url", "") or ""
                 method = str(getattr(request, "method", "") or "").upper()
-                if not _is_save_write(url, method):
+                if not observer.page_diagnostics.classify(url, method, origin):
                     return
                 if observer.page_write_request_count >= _SAVE_PAGE_RESPONSE_LIMIT:
                     observer.page_response_overflow = True
@@ -2720,6 +2848,8 @@ def _attach_save_click_observer(page):
 
         def _on_page_response(response):
             try:
+                if observer.detached:
+                    return
                 # Playwright may wrap the same protocol request in distinct Python
                 # objects across callbacks. Re-project response.request immediately;
                 # neither its URL nor an object identity is retained.
@@ -2759,6 +2889,11 @@ def _attach_save_click_observer(page):
 
 
 def _detach_save_click_observer(observer):
+    if observer is not None:
+        try:
+            observer.detached = True
+        except Exception:
+            pass
     _detach_list_response_observer(observer)
 
 
@@ -4712,12 +4847,18 @@ def _stage_enable(page, execution_id, target_app_id, app_name, actual_channel_na
         _detach_save_click_observer(observer)
     if not clicked:
         return _enable_unknown_failure("上线同行开关未通过原子复核或不可点击，已停止")
-    _log_enable_click_observation(observation)
+    try:
+        observer.post_action_switch_state = _post_save_narrow_row_switch_state(
+            page, target_app_id, app_name, actual_channel_name
+        )
+    except Exception:
+        observer.post_action_switch_state = "unreadable"
+    _log_enable_click_observation(observer, observation)
     if observation.get("outcome") != "success":
         return _enable_unknown_failure("上线响应未能唯一确认业务成功，已停止")
 
     # Checked state is diagnostic only and never substitutes for the write proof.
-    if _post_save_narrow_row_switch_state(page, target_app_id, app_name, actual_channel_name) != "switch_checked":
+    if observer.post_action_switch_state != "switch_checked":
         return _enable_unknown_failure("上线后开关状态未能连续稳定回读，已停止")
 
     # Throw away every narrow locator, response and DOM observation.  The final

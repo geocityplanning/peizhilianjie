@@ -168,6 +168,8 @@ Content-Type: application/json
 
 保存业务成功后，执行端先在**当前渠道窄视图**从第一页跨页定位唯一主表行，要求 ID、应用名、渠道三锚、页码、行位及稳定逻辑键连续两次一致；以该仅内存 handle 打开复制对话框完成资源兜底页 DOM/model 连续双读，关闭后再次取得完全相同 handle。随后仅可对该行唯一未启用、未禁用开关执行一次原子点击：点击前可见 `.el-message-box__wrapper` 基线必须为零，观察器仅接受唯一同源非列表写请求的完整 2xx 响应和明确业务成功信封。确认框仅可为本次动作后唯一新出现的框，且其中唯一可见可用、规范化精确为“确定”的按钮最多点击一次；无框直发必须在整个有界窗口均无确认框。已启用/不可读开关、确认框歧义、零或多写请求、非 2xx、正文/信封不可判定均不得再次点击，返回 `UNKNOWN` / `QUERY`。写成功后丢弃所有窄视图 locator、响应和 DOM 观察，重新安装观察器、重置筛选并通过新鲜完整未筛选列表门跨页唯一定位同一三锚后，方可分组或返回成功；终验失败同样保持原单 `UNKNOWN` / `QUERY`，不得重试、换幂等键、重建、删除或处理历史对象。开关 UI checked 仅在写成功后连续双读作辅助证据，不能单独认定成功；稳定 handle 不写日志、HTTP 回执、数据库或外部信封。
 
+启用动作窗口的 `no_candidate` 脱敏诊断按 CDP 与 page-event 分别记录有界 `accepted_write`、`method_rejected`、`list_rejected`、`origin_rejected`、`missing_request_id`、`observer_event_unseen`，并仅允许 same/cross-origin 计数、固定 HTTP method 枚举及最多三个 16 位 path 哈希；确认框仅记录固定轨迹、唯一确认按钮是否点击/关闭和窗口结束后的开关枚举。不得记录 URL、host、query、headers、body 或业务原值。该诊断不参与成功判定：`no_candidate`、观察器异常、不可读响应、非 2xx、业务拒绝或多候选仍为既有 `PUBLISH_FAILED` / `PUBLISH` / `UNKNOWN` / `QUERY`。
+
 ### 应用执行结果字段
 
 | JSON 字段 | 含义 | Excel/业务对应 |
