@@ -5,6 +5,8 @@ from __future__ import annotations
 import inspect
 import sys
 from pathlib import Path
+
+from playwright.sync_api import sync_playwright
 import types
 
 import pytest
@@ -640,26 +642,6 @@ def test_prepare_failure_branches_never_reach_lower_option_or_search(monkeypatch
         assert ("click", "application") not in calls if failure == "app_open" else calls.count(("click", "application")) == 1
 
 
-def test_state_reader_uses_dom_fixture_buckets_without_returning_values():
-    cap = _cap()
-
-    class FixturePage:
-        def __init__(self, facts):
-            self.facts = facts
-            self.scripts = []
-        def evaluate(self, script, payload):
-            self.scripts.append(script)
-            return self.facts[payload["stage"]]
-
-    exact = {"pre_state": "exact_one", "physical_tag_count": 1, "visible_tag_count": 1, "readable_leaf_count": 1, "exact_match_count": 1, "main_input_present": True, "main_input_matches": True}
-    empty = {"pre_state": "empty", "physical_tag_count": 0, "visible_tag_count": 0, "readable_leaf_count": 0, "exact_match_count": 0, "main_input_present": True, "main_input_has_value": False}
-    page = FixturePage({"channel": exact, "application": empty})
-    assert cap._read_exact_terminal_select_state(page, "channel-secret", "channel")["pre_state"] == "exact_one"
-    assert cap._read_exact_terminal_select_state(page, "application-secret", "application")["pre_state"] == "empty"
-    assert all("selected_item_present" in script and "search_input_has_value" in script for script in page.scripts)
-    assert "channel-secret" not in str(page.scripts) and "application-secret" not in str(page.scripts)
-
-
 def test_state_reader_blocks_selected_item_search_input_and_tag_input_conflict_by_dom_rules():
     cap = _cap()
     source = inspect.getsource(cap._read_exact_terminal_select_state)
@@ -679,19 +661,91 @@ def test_unstable_double_read_stops_without_another_click(monkeypatch):
     assert calls == ["close"]
 
 
+@pytest.fixture(scope="module")
+def local_dom_page():
+    chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    if not Path(chrome).is_file():
+        pytest.fail("local Chromium runtime is required for terminal resolver DOM tests")
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(executable_path=chrome, headless=True)
+        page = browser.new_page()
+        try:
+            yield page
+        finally:
+            browser.close()
+
+
+def _resolver_dom(*, shape="nested", value="", readonly=True, disabled=False, selects=1, inputs=1, search=False, cascader=False):
+    select = "".join('<div class="el-select"><input class="el-select__input"></div>' for _ in range(selects))
+    main = "".join(f'<input class="el-input__inner" {"readonly" if readonly else ""} {"disabled" if disabled else ""} value="{value}">' for _ in range(inputs))
+    if shape == "nested":
+        select = ''.join(f'<div class="el-select">{main if index == 0 else ""}<input class="el-select__input"></div>' for index in range(selects))
+        main = ""
+    elif shape == "search_only":
+        select = '<div class="el-select"><input class="el-select__input"></div>'
+        main = ""
+    elif shape == "plain":
+        select = ""
+    cascader_html = '<div class="el-cascader"></div>' if cascader else ""
+    return f'''<style>.el-form,.el-form-item,.el-select,input,button{{display:block;width:20px;height:20px}}</style>
+    <div class="el-form"><div class="el-form-item"><label class="el-form-item__label">渠道</label><div class="el-select"><input class="el-input__inner" readonly value="channel"></div></div>
+    <div class="el-form-item"><label class="el-form-item__label">应用名称</label>{select}{main}{cascader_html}</div><button onclick="window.searches=(window.searches||0)+1">搜索</button></div>'''
+
+
+def test_application_resolver_runs_production_js_for_nested_sibling_read_open_and_search(local_dom_page):
+    cap = _cap()
+    for shape in ("nested", "sibling"):
+        local_dom_page.set_content(_resolver_dom(shape=shape, value="app"))
+        local_dom_page.evaluate("window.searches = 0")
+        facts = cap._read_exact_terminal_select_state(local_dom_page, "app", "application")
+        assert facts["pre_state"] == "exact_one"
+        expected_shape = "legacy_nested" if shape == "nested" else "legacy_item_sibling"
+        assert facts["control_shape"] == expected_shape and facts["resolver_reason"] == "success"
+        assert cap._click_exact_terminal_search_once(local_dom_page, "channel", "app") is True
+        assert local_dom_page.evaluate("window.searches") == 1
+    local_dom_page.set_content(_resolver_dom(shape="sibling", value=""))
+    assert cap._read_exact_terminal_select_state(local_dom_page, "app", "application")["pre_state"] == "empty"
+    assert cap._open_exact_terminal_filter(local_dom_page, "application") is True
+
+
+@pytest.mark.parametrize("shape, kwargs", [
+    ("plain", {}), ("nested", {"cascader": True}), ("search_only", {}),
+    ("sibling", {"selects": 0}), ("sibling", {"selects": 2}),
+    ("sibling", {"inputs": 0}), ("sibling", {"inputs": 2}),
+    ("sibling", {"readonly": False}), ("sibling", {"disabled": True}),
+])
+def test_application_resolver_real_dom_rejects_unsupported_or_ambiguous_shapes(local_dom_page, shape, kwargs):
+    cap = _cap()
+    local_dom_page.set_content(_resolver_dom(shape=shape, **kwargs))
+    local_dom_page.evaluate("window.searches = 0")
+    facts = cap._read_exact_terminal_select_state(local_dom_page, "app", "application")
+    assert facts["pre_state"] == "unreadable"
+    assert cap._open_exact_terminal_filter(local_dom_page, "application") is False
+    assert cap._click_exact_terminal_search_once(local_dom_page, "channel", "app") is False
+    assert local_dom_page.evaluate("window.searches || 0") == 0
+
+
+def test_application_resolver_real_dom_distinguishes_form_and_item_ambiguity(local_dom_page):
+    cap = _cap()
+    local_dom_page.set_content('<div class="el-form-item"><label class="el-form-item__label">应用名称</label></div>')
+    facts = cap._read_exact_terminal_select_state(local_dom_page, "app", "application")
+    assert facts["pre_state"] == "unreadable" and facts["resolver_reason"] == "form_unreadable"
+
+    content = _resolver_dom(shape="sibling").replace('</div><button', '<div class="el-form-item"><label class="el-form-item__label">应用名称</label><div class="el-select"></div><input class="el-input__inner" readonly></div></div><button', 1)
+    local_dom_page.set_content(content)
+    facts = cap._read_exact_terminal_select_state(local_dom_page, "app", "application")
+    assert facts["pre_state"] == "unreadable" and facts["resolver_reason"] == "app_item_unreadable"
+
+
 def test_terminal_tag_guards_count_physical_containers_in_all_three_gates():
     cap = _cap()
-    source = inspect.getsource(cap._read_exact_terminal_select_state) + inspect.getsource(cap._click_exact_terminal_search_once)
-    # The shared pre/post reader covers channel and application; search repeats
-    # the same physical-container guard before consuming its one-click budget.
+    source = inspect.getsource(cap._read_exact_terminal_application_state) + inspect.getsource(cap._click_exact_terminal_search_once)
+    # Reader and search both consume physical tag containers only once.
     assert "const containers = Array.from(select.querySelectorAll('.el-tag'))" in source
-    assert "const tagContainers = Array.from(select.querySelectorAll('.el-tag'))" in source
     assert "containers.length ? containers.map" in source
-    assert "tagContainers.map(tag =>" in source
     assert "const text = Array.from(select.querySelectorAll('.el-select__tags-text'))" in source
-    assert "fallbackText = Array.from(select.querySelectorAll('.el-select__tags-text'))" in source
     assert ".el-tag__content, .el-select__tags-text" not in source
-    assert source.count("length === 1") >= 3
+    assert source.count("length === 1") + source.count("length===1") >= 3
 
 
 def test_contract_documents_exact_terminal_dropdown_close_and_no_extra_tag_guards():
@@ -701,6 +755,8 @@ def test_contract_documents_exact_terminal_dropdown_close_and_no_extra_tag_guard
     assert "tag/输入值必须恰好为目标且无额外值" in contract
     assert "tag 按物理 `.el-tag` 容器计数，每个容器只取一个叶子文本" in contract
     assert "已精确预选的渠道或应用必须零 option 点击复用" in contract
+    assert "legacy nested/item-sibling 结构" in contract
+    assert "读取、打开和搜索前复核必须复用该同一内部句柄规则" in contract
     assert "同一唯一表单连续两次稳定精确复核" in contract
     assert "两个筛选才原子触发一次精确“搜索”" in contract
 
@@ -717,10 +773,10 @@ def test_exact_terminal_search_rechecks_readonly_app_value_without_model_write()
 
     page = SearchPage()
     assert cap._click_exact_terminal_search_once(page, "channel", "application") is False
-    assert "input.readOnly" in page.script
-    assert "selects.length === 1" in page.script
+    assert "mainInput.readOnly" in page.script
+    assert "selects.length !== 1" in page.script
     assert "appTags" in page.script
-    assert "channelTags.length === 1" in page.script and "appTags.length === 1" in page.script
+    assert "channelTags.length===1" in page.script and "appTags.length===1" in page.script
     assert "buttons.length !== 1" in page.script
     assert "HTMLInputElement.prototype" not in page.script
     assert "dispatchEvent" not in page.script

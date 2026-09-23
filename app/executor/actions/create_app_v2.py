@@ -5047,6 +5047,17 @@ def _log_exact_select_diagnostic(stage, reason, dropdown_count=0, option_count=0
         "selected_item_present": bool(selection.get("selected_item_present")),
         "escape_attempted": bool(close.get("escape_attempted")),
         "close_mode": fixed_state(close.get("close_mode"), {"passive", "escape", "not_needed"}, "not_needed"),
+        "visible_form_count": bounded(selection.get("visible_form_count")),
+        "app_item_count": bounded(selection.get("app_item_count")),
+        "app_select_count": bounded(selection.get("app_select_count")),
+        "app_item_main_input_count": bounded(selection.get("app_item_main_input_count")),
+        "app_select_main_input_count": bounded(selection.get("app_select_main_input_count")),
+        "app_select_search_input_count": bounded(selection.get("app_select_search_input_count")),
+        "input_inside_select": bool(selection.get("input_inside_select")),
+        "readonly": bool(selection.get("readonly")),
+        "disabled": bool(selection.get("disabled")),
+        "control_shape": fixed_state(selection.get("control_shape"), {"legacy_nested", "legacy_item_sibling", "select_search_only", "cascader", "plain_input", "ambiguous", "none"}, "none"),
+        "resolver_reason": fixed_state(selection.get("resolver_reason"), {"success", "form_unreadable", "app_item_unreadable", "app_select_unreadable", "app_main_input_unreadable", "input_outside_item", "main_input_not_readonly", "main_input_disabled"}, "form_unreadable"),
     }, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
 
 
@@ -5158,8 +5169,52 @@ def _click_unique_exact_visible_select_option(page, target_text, stage):
         return False
 
 
+def _exact_terminal_application_resolver_js():
+    """One local-DOM resolver shared by application read, open and search actions."""
+    return r"""
+      const resolveApplication = () => {
+        const visible = n => { if (!n || n.closest('.el-dialog, .el-dialog__wrapper')) return false; const s = getComputedStyle(n), r = n.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' && n.getAttribute('aria-hidden') !== 'true' && r.width > 0 && r.height > 0; };
+        const cap = n => Math.min(Math.max(Number.isInteger(n) ? n : 0, 0), 2);
+        const facts = {visible_form_count: 0, app_item_count: 0, app_select_count: 0, app_item_main_input_count: 0, app_select_main_input_count: 0, app_select_search_input_count: 0, input_inside_select: false, readonly: false, disabled: false, control_shape: 'none', resolver_reason: 'form_unreadable'};
+        const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible); facts.visible_form_count = cap(forms.length);
+        if (forms.length !== 1) { facts.control_shape = forms.length > 1 ? 'ambiguous' : 'none'; return {ok:false, facts}; }
+        const items = Array.from(forms[0].querySelectorAll('.el-form-item')).filter(item => { const label = item.querySelector('.el-form-item__label'); return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '')); }); facts.app_item_count = cap(items.length);
+        if (items.length !== 1) { facts.control_shape = items.length > 1 ? 'ambiguous' : 'none'; facts.resolver_reason = 'app_item_unreadable'; return {ok:false, facts}; }
+        const item = items[0], selects = Array.from(item.querySelectorAll('.el-select')).filter(visible), mains = Array.from(item.querySelectorAll('input.el-input__inner')).filter(visible); facts.app_select_count = cap(selects.length); facts.app_item_main_input_count = cap(mains.length);
+        if (item.querySelector('.el-cascader')) { facts.control_shape = 'cascader'; facts.resolver_reason = 'app_select_unreadable'; return {ok:false, facts}; }
+        if (selects.length !== 1 || mains.length !== 1) { facts.control_shape = item.querySelector('.el-cascader') ? 'cascader' : (selects.length === 0 && mains.length ? 'plain_input' : (selects.length === 1 && mains.length === 0 ? 'select_search_only' : 'ambiguous')); facts.resolver_reason = selects.length !== 1 ? 'app_select_unreadable' : 'app_main_input_unreadable'; return {ok:false, facts}; }
+        const select = selects[0], mainInput = mains[0], selectMains = Array.from(select.querySelectorAll('input.el-input__inner')).filter(visible), searchInputs = Array.from(select.querySelectorAll('input.el-select__input')).filter(visible); facts.app_select_main_input_count = cap(selectMains.length); facts.app_select_search_input_count = cap(searchInputs.length); facts.input_inside_select = select.contains(mainInput); facts.readonly = Boolean(mainInput.readOnly); facts.disabled = Boolean(mainInput.disabled);
+        if (mainInput.closest('.el-form-item') !== item || mainInput.disabled || !mainInput.readOnly) { facts.control_shape = facts.input_inside_select ? 'legacy_nested' : 'legacy_item_sibling'; facts.resolver_reason = mainInput.closest('.el-form-item') !== item ? 'input_outside_item' : (!mainInput.readOnly ? 'main_input_not_readonly' : 'main_input_disabled'); return {ok:false, facts}; }
+        facts.control_shape = facts.input_inside_select ? 'legacy_nested' : 'legacy_item_sibling'; facts.resolver_reason = 'success'; return {ok:true, item, select, mainInput, facts};
+      };
+    """
+
+
+def _read_exact_terminal_application_state(page, target):
+    try:
+        result = page.evaluate(f"""
+        target => {{
+          {_exact_terminal_application_resolver_js()}
+          const resolved = resolveApplication();
+          const base = Object.assign({{pre_state:'unreadable', physical_tag_count:0, visible_tag_count:0, readable_leaf_count:0, exact_match_count:0, main_input_present:false, main_input_has_value:false, main_input_matches:false, search_input_present:false, search_input_has_value:false, selected_item_present:false}}, resolved.facts);
+          if (!resolved.ok) return base;
+          const select = resolved.select, main = resolved.mainInput, search = select.querySelector('input.el-select__input');
+          base.main_input_present = true; base.main_input_has_value = Boolean((main.value || '').trim()); base.main_input_matches = Boolean((main.value || '').trim() === target); base.search_input_present = Boolean(search); base.search_input_has_value = Boolean(search && (search.value || '').trim()); base.selected_item_present = Boolean(select.querySelector('.selected-item, [aria-selected="true"]'));
+          const containers = Array.from(select.querySelectorAll('.el-tag')); base.physical_tag_count = containers.length; base.visible_tag_count = containers.filter(n => {{ const s=getComputedStyle(n), r=n.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0; }}).length;
+          const leaves = containers.length ? containers.map(tag => tag.querySelector('.el-tag__content') || tag.querySelector('.el-select__tags-text')) : (() => {{ const text = Array.from(select.querySelectorAll('.el-select__tags-text')); return text.length ? text : Array.from(select.querySelectorAll('.el-tag__content')); }})(); base.readable_leaf_count = leaves.filter(Boolean).length; base.exact_match_count = leaves.filter(leaf => leaf && (leaf.innerText || '').trim() === target).length;
+          if (containers.length || leaves.length) {{ if (leaves.some(leaf => !leaf) || (base.main_input_has_value && !base.main_input_matches)) {{ base.pre_state='other'; return base; }} base.pre_state = leaves.length === 1 && base.exact_match_count === 1 ? 'exact_one' : 'other'; return base; }}
+          if (base.selected_item_present || base.search_input_has_value) {{ base.pre_state='other'; return base; }} base.pre_state = base.main_input_matches ? 'exact_one' : (base.main_input_has_value ? 'other' : 'empty'); return base;
+        }}
+        """, target)
+        return result if isinstance(result, dict) else {"pre_state": "unreadable"}
+    except Exception:
+        return {"pre_state": "unreadable"}
+
+
 def _read_exact_terminal_select_state(page, target, stage):
     """Read one terminal filter's fixed pre-state without returning values to Python."""
+    if stage == "application":
+        return _read_exact_terminal_application_state(page, target)
     try:
         result = page.evaluate("""
         ({target, stage}) => {
@@ -5212,6 +5267,11 @@ def _read_exact_terminal_option_selected_state(page, target):
 
 def _open_exact_terminal_filter(page, stage):
     """Physically open only the unique empty filter; no model mutation."""
+    if stage == "application":
+        try:
+            return page.evaluate(f"""() => {{ {_exact_terminal_application_resolver_js()} const resolved = resolveApplication(); if (!resolved.ok) return false; resolved.mainInput.click(); return true; }}""") is True
+        except Exception:
+            return False
     try:
         return page.evaluate("""
         stage => { const visible = n => { if (!n || n.closest('.el-dialog, .el-dialog__wrapper')) return false; const s = getComputedStyle(n), r = n.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' && r.width > 0 && r.height > 0; }; const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible); const matches = forms.map(form => { const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => { const item = select.closest('.el-form-item'), label = item && item.querySelector('.el-form-item__label'); return visible(select) && Boolean(label && /渠道/.test(label.innerText || '')); }); const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => { const label=item.querySelector('.el-form-item__label'), input=item.querySelector('input.el-input__inner'); return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && input && visible(input) && !input.disabled); }); return channels.length===1 && apps.length===1 ? {channel: channels[0], app: apps[0].querySelector('input.el-input__inner')} : null; }).filter(Boolean); if (matches.length !== 1) return false; const input = stage === 'channel' ? (matches[0].channel.querySelector('input.el-select__input') || matches[0].channel.querySelector('input.el-input__inner')) : matches[0].app; if (!input || input.disabled || (stage === 'application' && !input.readOnly)) return false; input.click(); return true; }
@@ -5274,58 +5334,26 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
 
 
 def _click_exact_terminal_search_once(page, channel_name, app_name):
-    """Atomically recheck both exact filters and consume the one-search budget."""
-    result = page.evaluate("""
-    ({channelName, appName}) => {
-      const visible = node => {
-        if (!node || node.closest('.el-dialog, .el-dialog__wrapper')) return false;
-        const style = window.getComputedStyle(node); const rect = node.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
-          node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
-      };
-      const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible);
-      const matches = forms.map(form => {
-        const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => {
-          const item = select.closest('.el-form-item'); const label = item && item.querySelector('.el-form-item__label');
-          const input = select.querySelector('input'); const metadata = input ? `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}` : '';
-          return visible(select) && (/渠道/.test(metadata) || Boolean(label && /渠道/.test(label.innerText || '')));
-        });
-        const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => {
-          const label = item.querySelector('.el-form-item__label'); const selects = item.querySelectorAll('.el-select'); const input = item.querySelector('input.el-input__inner');
-          return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && selects.length === 1 && input && visible(input) && !input.disabled && input.readOnly);
-        });
-        return channels.length === 1 && apps.length === 1 ? {form, channel: channels[0], app: apps[0].querySelector('input.el-input__inner'), appSelect: apps[0].querySelector('.el-select')} : null;
-      }).filter(Boolean);
-      if (matches.length !== 1) return false;
-      const channelInput = matches[0].channel.querySelector('input.el-input__inner');
-      const tagValues = select => {
-        const tagContainers = Array.from(select.querySelectorAll('.el-tag'));
-        if (tagContainers.length) return tagContainers.map(tag => {
-          const leaf = tag.querySelector('.el-tag__content') || tag.querySelector('.el-select__tags-text');
-          return leaf ? (leaf.innerText || '').trim() : null;
-        });
-        const fallbackText = Array.from(select.querySelectorAll('.el-select__tags-text'));
-        return (fallbackText.length ? fallbackText : Array.from(select.querySelectorAll('.el-tag__content')))
-          .map(tag => (tag.innerText || '').trim());
-      };
-      const channelTags = tagValues(matches[0].channel);
-      const appTags = tagValues(matches[0].appSelect);
-      const channelSelected = channelTags.length
-        ? channelTags.length === 1 && channelTags[0] === channelName
-        : Boolean(channelInput && (channelInput.value || '').trim() === channelName);
-      const appSelected = appTags.length
-        ? appTags.length === 1 && appTags[0] === appName
-        : Boolean(matches[0].app && (matches[0].app.value || '').trim() === appName);
-      if (!channelSelected || !appSelected) return false;
-      const buttons = Array.from(matches[0].form.querySelectorAll('button')).filter(button =>
-        visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
-        (button.innerText || '').replace(/\\s/g, '').trim() === '搜索'
-      );
-      if (buttons.length !== 1) return false;
-      buttons[0].click(); return true;
-    }
-    """, {"channelName": channel_name, "appName": app_name})
-    return result is True
+    """Atomically use the shared application resolver before consuming one search."""
+    try:
+        script = """({channelName, appName}) => {
+          """ + _exact_terminal_application_resolver_js() + """
+          const resolved = resolveApplication(); if (!resolved.ok) return false;
+          const form = resolved.item.closest('.el-form'); if (!form) return false;
+          const visible = n => { if (!n || n.closest('.el-dialog, .el-dialog__wrapper')) return false; const s=getComputedStyle(n), r=n.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' && n.getAttribute('aria-hidden') !== 'true' && r.width > 0 && r.height > 0; };
+          const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => { const item=select.closest('.el-form-item'), label=item && item.querySelector('.el-form-item__label'), input=select.querySelector('input'); const meta=input ? `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}` : ''; return visible(select) && (/渠道/.test(meta) || Boolean(label && /渠道/.test(label.innerText || ''))); });
+          if (channels.length !== 1) return false;
+          const tagValues = select => { const containers=Array.from(select.querySelectorAll('.el-tag')); if (containers.length) return containers.map(tag => { const leaf=tag.querySelector('.el-tag__content') || tag.querySelector('.el-select__tags-text'); return leaf ? (leaf.innerText || '').trim() : null; }); const text=Array.from(select.querySelectorAll('.el-select__tags-text')); return (text.length ? text : Array.from(select.querySelectorAll('.el-tag__content'))).map(tag => (tag.innerText || '').trim()); };
+          const channelInput=channels[0].querySelector('input.el-input__inner'), channelTags=tagValues(channels[0]), appTags=tagValues(resolved.select);
+          const channelSelected=channelTags.length ? channelTags.length===1 && channelTags[0]===channelName : Boolean(channelInput && (channelInput.value || '').trim()===channelName);
+          const appSelected=appTags.length ? appTags.length===1 && appTags[0]===appName : (resolved.mainInput.value || '').trim()===appName;
+          if (!channelSelected || !appSelected) return false;
+          const buttons=Array.from(form.querySelectorAll('button')).filter(button => visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' && (button.innerText || '').replace(/\\s/g,'').trim()==='搜索');
+          if (buttons.length !== 1) return false; buttons[0].click(); return true;
+        }"""
+        return page.evaluate(script, {"channelName": channel_name, "appName": app_name}) is True
+    except Exception:
+        return False
 
 
 def _wait_for_fresh_exact_terminal_proof(page, observations, records_before, requests_before, app_id, app_name, channel_name):
