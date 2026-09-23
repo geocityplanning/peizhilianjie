@@ -158,8 +158,118 @@ def test_terminal_query_fails_when_exact_filter_form_is_not_unique(monkeypatch):
     assert calls == ["attach", "prepare", "detach"]
 
 
+class _Option:
+    def __init__(self, *, text="target", visible=True, classes="", aria_disabled=None, box=None):
+        self.text = text
+        self.visible = visible
+        self.classes = classes
+        self.aria_disabled = aria_disabled
+        self.box = {"x": 10, "y": 20, "width": 30, "height": 40} if box is None else box
+
+    def is_visible(self):
+        return self.visible
+
+    def get_attribute(self, name):
+        if name == "class":
+            return self.classes
+        if name == "aria-disabled":
+            return self.aria_disabled
+        return None
+
+    def inner_text(self):
+        return self.text
+
+    def bounding_box(self):
+        return self.box
+
+
+class _Locator:
+    def __init__(self, items):
+        self.items = list(items)
+        self.filter_calls = []
+
+    def count(self):
+        return len(self.items)
+
+    def nth(self, index):
+        return self.items[index]
+
+    def filter(self, **kwargs):
+        self.filter_calls.append(kwargs)
+        return self
+
+
+class _Dropdown(_Option):
+    def __init__(self, options, **kwargs):
+        super().__init__(**kwargs)
+        self.options = _Locator(options)
+
+    def locator(self, selector):
+        assert selector == ".el-select-dropdown__item:visible"
+        return self.options
+
+
+class _Mouse:
+    def __init__(self, error=False):
+        self.error = error
+        self.clicks = []
+
+    def click(self, x, y):
+        if self.error:
+            raise RuntimeError("click failure")
+        self.clicks.append((x, y))
+
+
+class LocatorPointerPage:
+    """Offline Playwright-shaped page; the helper drives every locator/mouse branch."""
+
+    def __init__(self, dropdowns, *, mouse_error=False):
+        self.dropdowns = _Locator(dropdowns)
+        self.mouse = _Mouse(mouse_error)
+
+    def locator(self, selector):
+        assert selector == ".el-select-dropdown:visible"
+        return self.dropdowns
+
+
+def test_real_pointer_option_helper_uses_locator_rechecks_then_one_mouse_click():
+    cap = _cap()
+    option = _Option(text="target")
+    dropdown = _Dropdown([option])
+    page = LocatorPointerPage([dropdown])
+
+    assert cap._click_unique_exact_visible_select_option(page, "target") is True
+    assert dropdown.options.filter_calls and "has_text" in dropdown.options.filter_calls[0]
+    assert page.mouse.clicks == [(25.0, 40.0)]
+
+
+@pytest.mark.parametrize(
+    ("dropdowns", "target", "mouse_error"),
+    [
+        ([], "target", False),
+        ([_Dropdown([]), _Dropdown([])], "target", False),
+        ([_Dropdown([], visible=False)], "target", False),
+        ([_Dropdown([], aria_disabled="true")], "target", False),
+        ([_Dropdown([])], "target", False),
+        ([_Dropdown([_Option(text="target"), _Option(text="target")])], "target", False),
+        ([_Dropdown([_Option(text="wrong")])], "target", False),
+        ([_Dropdown([_Option(text="target", visible=False)])], "target", False),
+        ([_Dropdown([_Option(text="target", classes="is-disabled")])], "target", False),
+        ([_Dropdown([_Option(text="target", aria_disabled="true")])], "target", False),
+        ([_Dropdown([_Option(text="target", box={})])], "target", False),
+        ([_Dropdown([_Option(text="target")])], "target", True),
+    ],
+)
+def test_real_pointer_option_helper_fails_closed_for_locator_and_click_guards(dropdowns, target, mouse_error):
+    cap = _cap()
+    page = LocatorPointerPage(dropdowns, mouse_error=mouse_error)
+
+    assert cap._click_unique_exact_visible_select_option(page, target) is False
+    assert page.mouse.clicks == []
+
+
 class ExactSelectPage:
-    """Offline evaluator that drives each real _prepare branch in order."""
+    """Offline evaluator that drives real _prepare gates after pointer clicks."""
 
     def __init__(self, results):
         self.results = list(results)
@@ -177,49 +287,44 @@ class ExactSelectPage:
         self.waits.append(milliseconds)
 
 
-def test_prepare_exact_filters_physically_selects_readonly_app_dropdown_before_search():
+def test_prepare_exact_filters_orders_channel_pointer_then_app_pointer_before_search(monkeypatch):
     cap = _cap()
-    page = ExactSelectPage([
-        {"opened": True}, True, True, True, True, True,
-    ])
+    page = ExactSelectPage([{"opened": True}, True, True, True])
+    pointer_targets = []
+    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target: pointer_targets.append(target) or True)
 
     assert cap._prepare_exact_terminal_filters(page, "channel", "application") is True
-    assert page.payloads == ["channel", "channel", "channel", None, "application", {
-        "channelName": "channel", "appName": "application",
-    }]
+    assert pointer_targets == ["channel", "application"]
+    assert page.payloads == [None, "channel", None, {"channelName": "channel", "appName": "application"}]
     assert page.waits == [300, 300, 300, 300]
-    assert "searches.length === 1" in page.scripts[0]
-    assert "dropdowns.length !== 1" in page.scripts[1]
-    assert "aria-disabled" in page.scripts[1]
-    assert "length !== 0" in page.scripts[2]
-    assert "!matches[0].readOnly" in page.scripts[3]
-    assert "selects.length === 1" in page.scripts[3]
-    assert "dropdowns.length !== 1" in page.scripts[4]
-    assert "aria-disabled" in page.scripts[4]
-    assert "length !== 0" in page.scripts[5]
-    app_select_source = "\n".join(page.scripts[3:])
-    assert "HTMLInputElement.prototype" not in app_select_source
-    assert "dispatchEvent" not in app_select_source
+    assert "length !== 0" in page.scripts[1]
+    assert "!matches[0].readOnly" in page.scripts[2]
+    assert "length !== 0" in page.scripts[3]
+    assert "HTMLInputElement.prototype" not in "\n".join(page.scripts)
+    assert "dispatchEvent" not in "\n".join(page.scripts)
 
 
 @pytest.mark.parametrize(
-    ("results", "expected_evaluations"),
+    ("results", "pointer_results", "expected_evaluations", "expected_pointers"),
     [
-        ([{"opened": False}], 1),  # zero/multiple form, control, or search button
-        ([{"opened": True}, False], 2),  # zero/multiple/disabled/wrong channel option
-        ([{"opened": True}, True, False], 3),  # channel did not close or recheck
-        ([{"opened": True}, True, True, False], 4),  # app select is absent/non-readonly/disabled
-        ([{"opened": True}, True, True, True, False], 5),  # zero/multiple/disabled/wrong app option
-        ([{"opened": True}, True, True, True, True, False], 6),  # app close/value recheck mismatch
+        ([{"opened": False}], [], 1, []),
+        ([{"opened": True}], [False], 1, ["channel"]),
+        ([{"opened": True}, False], [True], 2, ["channel"]),
+        ([{"opened": True}, True, False], [True], 3, ["channel"]),
+        ([{"opened": True}, True, True], [True, False], 3, ["channel", "application"]),
+        ([{"opened": True}, True, True, False], [True, True], 4, ["channel", "application"]),
     ],
 )
-def test_prepare_exact_filters_fails_closed_at_each_unique_control_gate(results, expected_evaluations):
+def test_prepare_exact_filters_fails_closed_without_lower_stage_or_search(monkeypatch, results, pointer_results, expected_evaluations, expected_pointers):
     cap = _cap()
     page = ExactSelectPage(results)
+    targets = []
+    pointer_results = iter(pointer_results)
+    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target: targets.append(target) or next(pointer_results))
 
     assert cap._prepare_exact_terminal_filters(page, "channel", "application") is False
+    assert targets == expected_pointers
     assert len(page.scripts) == expected_evaluations
-    assert len(page.scripts) < 6 or page.scripts[-1]
 
 
 def test_exact_terminal_search_rechecks_readonly_app_value_without_model_write():

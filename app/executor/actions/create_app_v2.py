@@ -4956,6 +4956,42 @@ def _enable_unknown_failure(message):
     }
 
 
+def _click_unique_exact_visible_select_option(page, target_text):
+    """Use one real pointer click after locator-level exact-option revalidation."""
+    if not isinstance(target_text, str) or not target_text:
+        return False
+    try:
+        dropdowns = page.locator(".el-select-dropdown:visible")
+        if dropdowns.count() != 1:
+            return False
+        dropdown = dropdowns.nth(0)
+        if not dropdown.is_visible() or dropdown.get_attribute("aria-hidden") == "true":
+            return False
+        exact_text = re.compile(r"^" + re.escape(target_text) + r"$")
+        options = dropdown.locator(".el-select-dropdown__item:visible").filter(has_text=exact_text)
+        if options.count() != 1:
+            return False
+        option = options.nth(0)
+        classes = option.get_attribute("class") or ""
+        if (
+            not option.is_visible()
+            or "is-disabled" in classes
+            or option.get_attribute("aria-disabled") == "true"
+            or (option.inner_text() or "").strip() != target_text
+        ):
+            return False
+        box = option.bounding_box()
+        if not isinstance(box, dict) or box.get("width", 0) <= 0 or box.get("height", 0) <= 0:
+            return False
+        page.mouse.click(
+            float(box.get("x", 0)) + float(box["width"]) / 2,
+            float(box.get("y", 0)) + float(box["height"]) / 2,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _prepare_exact_terminal_filters(page, channel_name, app_name):
     """Fill the sole visible list form without searching or retaining values."""
     opened = page.evaluate("""
@@ -4997,37 +5033,13 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
         matches[0].channel.querySelector('input.el-input__inner');
       if (!input || input.disabled) return {opened: false};
       input.click();
-      const searchInput = matches[0].channel.querySelector('input.el-select__input');
-      if (searchInput && !searchInput.readOnly) {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        setter.call(searchInput, channelName);
-        searchInput.dispatchEvent(new Event('input', {bubbles: true}));
-        searchInput.dispatchEvent(new Event('change', {bubbles: true}));
-      }
       return {opened: true};
     }
-    """, channel_name) or {}
+    """) or {}
     if not opened.get("opened"):
         return False
     page.wait_for_timeout(300)
-    selected = page.evaluate("""
-    (channelName) => {
-      const visible = node => {
-        const style = window.getComputedStyle(node); const rect = node.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
-          node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
-      };
-      const dropdowns = Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible);
-      if (dropdowns.length !== 1) return false;
-      const options = Array.from(dropdowns[0].querySelectorAll('.el-select-dropdown__item')).filter(option =>
-        visible(option) && !option.className.includes('is-disabled') && option.getAttribute('aria-disabled') !== 'true' &&
-        (option.innerText || '').trim() === channelName
-      );
-      if (options.length !== 1) return false;
-      options[0].click(); return true;
-    }
-    """, channel_name)
-    if selected is not True:
+    if not _click_unique_exact_visible_select_option(page, channel_name):
         return False
     page.wait_for_timeout(300)
     channel_verified = page.evaluate("""
@@ -5087,24 +5099,7 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
     if app_opened is not True:
         return False
     page.wait_for_timeout(300)
-    app_selected = page.evaluate("""
-    (appName) => {
-      const visible = node => {
-        const style = window.getComputedStyle(node); const rect = node.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
-          node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
-      };
-      const dropdowns = Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible);
-      if (dropdowns.length !== 1) return false;
-      const options = Array.from(dropdowns[0].querySelectorAll('.el-select-dropdown__item')).filter(option =>
-        visible(option) && !option.className.includes('is-disabled') && option.getAttribute('aria-disabled') !== 'true' &&
-        (option.innerText || '').trim() === appName
-      );
-      if (options.length !== 1) return false;
-      options[0].click(); return true;
-    }
-    """, app_name)
-    if app_selected is not True:
+    if not _click_unique_exact_visible_select_option(page, app_name):
         return False
     page.wait_for_timeout(300)
     configured = page.evaluate("""
