@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import sys
+from pathlib import Path
 import types
 
 import pytest
@@ -403,6 +404,45 @@ def test_post_click_diagnostics_are_fixed_and_value_free(capsys):
     assert "channel-name" not in output and "application-name" not in output
 
 
+class _CloseDropdownLocator:
+    def __init__(self, page):
+        self.page = page
+
+    def count(self):
+        value = self.page.counts.pop(0) if self.page.counts else self.page.last_count
+        if isinstance(value, BaseException):
+            raise value
+        self.page.last_count = value
+        return value
+
+
+class _CloseKeyboard:
+    def __init__(self, page):
+        self.page = page
+        self.presses = []
+
+    def press(self, key):
+        self.presses.append(key)
+        if self.page.escape_error:
+            raise RuntimeError("close unavailable")
+
+
+class CloseDropdownPage:
+    def __init__(self, counts, *, escape_error=False):
+        self.counts = list(counts)
+        self.last_count = 0
+        self.escape_error = escape_error
+        self.keyboard = _CloseKeyboard(self)
+        self.waits = []
+
+    def locator(self, selector):
+        assert selector == ".el-select-dropdown:visible"
+        return _CloseDropdownLocator(self)
+
+    def wait_for_timeout(self, milliseconds):
+        self.waits.append(milliseconds)
+
+
 class ExactSelectPage:
     """Offline evaluator that drives real _prepare gates after pointer clicks."""
 
@@ -422,19 +462,82 @@ class ExactSelectPage:
         self.waits.append(milliseconds)
 
 
-def test_prepare_exact_filters_orders_channel_pointer_then_app_pointer_before_search(monkeypatch):
+def test_close_helper_allows_passive_close_without_escape_and_projects_real_zero():
+    cap = _cap()
+    page = CloseDropdownPage([1, 1, 1, 0])
+
+    result = cap._close_and_wait_unique_select_dropdown(page, "channel")
+
+    assert result == {"ok": True, "reason": "success", "visible_dropdown_count": 0, "escape_attempted": False}
+    assert page.keyboard.presses == []
+    assert page.waits == [50, 50, 50]
+
+
+def test_close_helper_uses_escape_once_then_closes_or_fails_closed():
+    cap = _cap()
+    page = CloseDropdownPage([1, 1, 1, 1, 0])
+    assert cap._close_and_wait_unique_select_dropdown(page, "channel")["ok"] is True
+    assert page.keyboard.presses == ["Escape"]
+
+    stuck = CloseDropdownPage([1] * 20)
+    result = cap._close_and_wait_unique_select_dropdown(stuck, "application")
+    assert result["ok"] is False and result["reason"] == "dropdown_not_closed"
+    assert result["visible_dropdown_count"] == 1 and stuck.keyboard.presses == ["Escape"]
+
+    escape_error = CloseDropdownPage([1, 1, 1, 1], escape_error=True)
+    result = cap._close_and_wait_unique_select_dropdown(escape_error, "application")
+    assert result["ok"] is False and result["reason"] == "dropdown_not_closed"
+    assert escape_error.keyboard.presses == ["Escape"]
+
+
+def test_close_helper_rejects_multiple_or_unreadable_dropdowns_without_escape():
+    cap = _cap()
+    multiple = CloseDropdownPage([2])
+    assert cap._close_and_wait_unique_select_dropdown(multiple, "channel")["ok"] is False
+    assert multiple.keyboard.presses == [] and multiple.waits == []
+
+    unreadable = CloseDropdownPage([RuntimeError("unreadable")])
+    assert cap._close_and_wait_unique_select_dropdown(unreadable, "application")["ok"] is False
+    assert unreadable.keyboard.presses == [] and unreadable.waits == []
+
+
+@pytest.mark.parametrize("reason, count", [("dropdown_not_closed", 1), ("dropdown_count", 2)])
+def test_prepare_close_failure_logs_real_count_and_never_opens_application(monkeypatch, capsys, reason, count):
+    cap = _cap()
+    page = ExactSelectPage([{"opened": True}])
+    pointers = []
+    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target, stage: pointers.append((target, stage)) or True)
+    monkeypatch.setattr(cap, "_close_and_wait_unique_select_dropdown", lambda *_args: {
+        "ok": False, "reason": reason, "visible_dropdown_count": count,
+    })
+
+    assert cap._prepare_exact_terminal_filters(page, "channel-secret", "application-secret") is False
+    assert pointers == [("channel-secret", "channel")]
+    output = capsys.readouterr().out
+    assert f'"visible_dropdown_count":{count}' in output
+    assert "channel-secret" not in output and "application-secret" not in output
+
+
+def test_prepare_exact_filters_orders_close_and_exact_verification_before_app_pointer(monkeypatch):
     cap = _cap()
     page = ExactSelectPage([{"opened": True}, {"ok": True}, True, {"ok": True}])
     pointer_targets = []
+    close_stages = []
     monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target, stage: pointer_targets.append((target, stage)) or True)
+    monkeypatch.setattr(cap, "_close_and_wait_unique_select_dropdown", lambda _page, stage: close_stages.append(stage) or {
+        "ok": True, "visible_dropdown_count": 0,
+    })
 
     assert cap._prepare_exact_terminal_filters(page, "channel", "application") is True
     assert pointer_targets == [("channel", "channel"), ("application", "application")]
+    assert close_stages == ["channel", "application"]
     assert page.payloads == [None, "channel", None, {"channelName": "channel", "appName": "application"}]
-    assert page.waits == [300, 300, 300, 300]
-    assert "length !== 0" in page.scripts[1]
+    assert page.waits == [300, 300]
+    assert "length !== 0" not in page.scripts[1]
     assert "!matches[0].readOnly" in page.scripts[2]
-    assert "length !== 0" in page.scripts[3]
+    assert "length !== 0" not in page.scripts[3]
+    assert "tags.length === 1" in page.scripts[1]
+    assert "channelTags.length === 1" in page.scripts[3] and "appTags.length === 1" in page.scripts[3]
     assert "HTMLInputElement.prototype" not in "\n".join(page.scripts)
     assert "dispatchEvent" not in "\n".join(page.scripts)
 
@@ -456,10 +559,21 @@ def test_prepare_exact_filters_fails_closed_without_lower_stage_or_search(monkey
     targets = []
     pointer_results = iter(pointer_results)
     monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target, stage: targets.append((target, stage)) or next(pointer_results))
+    monkeypatch.setattr(cap, "_close_and_wait_unique_select_dropdown", lambda _page, _stage: {
+        "ok": True, "visible_dropdown_count": 0,
+    })
 
     assert cap._prepare_exact_terminal_filters(page, "channel", "application") is False
     assert targets == expected_pointers
     assert len(page.scripts) == expected_evaluations
+
+
+def test_contract_documents_exact_terminal_dropdown_close_and_no_extra_tag_guards():
+    contract = (Path(__file__).parents[1] / "contracts" / "hermes-http-v1.md").read_text(encoding="utf-8")
+    assert "每个唯一精确 option 至多物理点击一次" in contract
+    assert "至多一次 Escape 并在有界窗口内确认关闭" in contract
+    assert "tag/输入值必须恰好为目标且无额外值" in contract
+    assert "两个筛选均复核后才原子触发一次精确“搜索”" in contract
 
 
 def test_exact_terminal_search_rechecks_readonly_app_value_without_model_write():
@@ -477,6 +591,7 @@ def test_exact_terminal_search_rechecks_readonly_app_value_without_model_write()
     assert "input.readOnly" in page.script
     assert "selects.length === 1" in page.script
     assert "appTags" in page.script
+    assert "channelTags.length === 1" in page.script and "appTags.length === 1" in page.script
     assert "buttons.length !== 1" in page.script
     assert "HTMLInputElement.prototype" not in page.script
     assert "dispatchEvent" not in page.script

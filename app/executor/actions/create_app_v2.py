@@ -5013,6 +5013,9 @@ _EXACT_SELECT_DIAGNOSTIC_REASONS = {
     "option_text_mismatch", "option_box_invalid", "locator_click_failed",
     "dropdown_not_closed", "selected_value_mismatch",
 }
+_EXACT_SELECT_CLOSE_PASSIVE_MS = 150
+_EXACT_SELECT_CLOSE_TOTAL_MS = 600
+_EXACT_SELECT_CLOSE_POLL_MS = 50
 
 
 def _log_exact_select_diagnostic(stage, reason, dropdown_count=0, option_count=0, click_attempted=False, click_succeeded=False):
@@ -5028,13 +5031,47 @@ def _log_exact_select_diagnostic(stage, reason, dropdown_count=0, option_count=0
     }, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
 
 
-def _exact_select_post_click_ok(stage, result):
-    """Project a post-click DOM gate to fixed diagnostics without values."""
+def _exact_select_post_click_ok(stage, result, dropdown_count=0, option_count=0):
+    """Project the post-close DOM gate using its observed, value-free dropdown count."""
     if isinstance(result, dict) and result.get("ok") is True:
+        _log_exact_select_diagnostic(stage, "success", dropdown_count, option_count, True, True)
         return True
     reason = result.get("reason") if isinstance(result, dict) else "selected_value_mismatch"
-    _log_exact_select_diagnostic(stage, reason)
+    _log_exact_select_diagnostic(stage, reason, dropdown_count, option_count, True, True)
     return False
+
+
+def _close_and_wait_unique_select_dropdown(page, stage):
+    """Passively close, then Escape once at most; never select or mutate a value."""
+    elapsed_ms = 0
+    escape_attempted = False
+    last_count = 0
+    while True:
+        try:
+            count = page.locator(".el-select-dropdown:visible").count()
+            if not isinstance(count, int) or count < 0:
+                return {"ok": False, "reason": "dropdown_count", "visible_dropdown_count": last_count, "escape_attempted": escape_attempted}
+            last_count = count
+        except Exception:
+            return {"ok": False, "reason": "dropdown_count", "visible_dropdown_count": last_count, "escape_attempted": escape_attempted}
+        if count == 0:
+            return {"ok": True, "reason": "success", "visible_dropdown_count": 0, "escape_attempted": escape_attempted}
+        if count != 1:
+            return {"ok": False, "reason": "dropdown_count", "visible_dropdown_count": count, "escape_attempted": escape_attempted}
+        if elapsed_ms < _EXACT_SELECT_CLOSE_PASSIVE_MS:
+            page.wait_for_timeout(_EXACT_SELECT_CLOSE_POLL_MS)
+            elapsed_ms += _EXACT_SELECT_CLOSE_POLL_MS
+            continue
+        if not escape_attempted:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                return {"ok": False, "reason": "dropdown_not_closed", "visible_dropdown_count": last_count, "escape_attempted": True}
+            escape_attempted = True
+        if elapsed_ms >= _EXACT_SELECT_CLOSE_TOTAL_MS:
+            return {"ok": False, "reason": "dropdown_not_closed", "visible_dropdown_count": last_count, "escape_attempted": escape_attempted}
+        page.wait_for_timeout(_EXACT_SELECT_CLOSE_POLL_MS)
+        elapsed_ms += _EXACT_SELECT_CLOSE_POLL_MS
 
 
 _SECOND_VISIBLE_DROPDOWN_SELECTOR = ":nth-match(.el-select-dropdown:visible, 2)"
@@ -5140,7 +5177,10 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
     page.wait_for_timeout(300)
     if not _click_unique_exact_visible_select_option(page, channel_name, "channel"):
         return False
-    page.wait_for_timeout(300)
+    channel_closed = _close_and_wait_unique_select_dropdown(page, "channel")
+    if not channel_closed.get("ok"):
+        _log_exact_select_diagnostic("channel", channel_closed.get("reason"), channel_closed.get("visible_dropdown_count"), 1, True, True)
+        return False
     channel_verified = page.evaluate("""
     (channelName) => {
       const visible = node => {
@@ -5149,7 +5189,6 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
         return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
           node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
       };
-      if (Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible).length !== 0) return {ok: false, reason: 'dropdown_not_closed'};
       const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible);
       const matches = forms.map(form => {
         const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => {
@@ -5166,11 +5205,13 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
       if (matches.length !== 1) return {ok: false, reason: 'selected_value_mismatch'};
       const input = matches[0].channel.querySelector('input.el-input__inner');
       const tags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
-      const selected = Boolean((input && (input.value || '').trim() === channelName) || tags.includes(channelName));
+      const selected = tags.length
+        ? tags.length === 1 && tags[0] === channelName
+        : Boolean(input && (input.value || '').trim() === channelName);
       return {ok: selected, reason: selected ? 'success' : 'selected_value_mismatch'};
     }
     """, channel_name)
-    if not _exact_select_post_click_ok("channel", channel_verified):
+    if not _exact_select_post_click_ok("channel", channel_verified, channel_closed.get("visible_dropdown_count"), 1):
         return False
     app_opened = page.evaluate("""
     () => {
@@ -5201,7 +5242,10 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
     page.wait_for_timeout(300)
     if not _click_unique_exact_visible_select_option(page, app_name, "application"):
         return False
-    page.wait_for_timeout(300)
+    app_closed = _close_and_wait_unique_select_dropdown(page, "application")
+    if not app_closed.get("ok"):
+        _log_exact_select_diagnostic("application", app_closed.get("reason"), app_closed.get("visible_dropdown_count"), 1, True, True)
+        return False
     configured = page.evaluate("""
     ({channelName, appName}) => {
       const visible = node => {
@@ -5210,7 +5254,6 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
         return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
           node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
       };
-      if (Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible).length !== 0) return {ok: false, reason: 'dropdown_not_closed'};
       const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible);
       const matches = forms.map(form => {
         const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => {
@@ -5228,14 +5271,17 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
       const channelInput = matches[0].channel.querySelector('input.el-input__inner');
       const channelTags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
       const appTags = Array.from(matches[0].appSelect.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
-      const selected = Boolean(
-        ((channelInput && (channelInput.value || '').trim() === channelName) || channelTags.includes(channelName)) &&
-        ((matches[0].app.value || '').trim() === appName || appTags.includes(appName))
-      );
+      const channelSelected = channelTags.length
+        ? channelTags.length === 1 && channelTags[0] === channelName
+        : Boolean(channelInput && (channelInput.value || '').trim() === channelName);
+      const appSelected = appTags.length
+        ? appTags.length === 1 && appTags[0] === appName
+        : (matches[0].app.value || '').trim() === appName;
+      const selected = channelSelected && appSelected;
       return {ok: selected, reason: selected ? 'success' : 'selected_value_mismatch'};
     }
     """, {"channelName": channel_name, "appName": app_name})
-    return _exact_select_post_click_ok("application", configured)
+    return _exact_select_post_click_ok("application", configured, app_closed.get("visible_dropdown_count"), 1)
 
 
 def _click_exact_terminal_search_once(page, channel_name, app_name):
@@ -5265,8 +5311,13 @@ def _click_exact_terminal_search_once(page, channel_name, app_name):
       const channelInput = matches[0].channel.querySelector('input.el-input__inner');
       const channelTags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
       const appTags = Array.from(matches[0].appSelect.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
-      if (!((channelInput && (channelInput.value || '').trim() === channelName) || channelTags.includes(channelName)) ||
-          !matches[0].app || !((matches[0].app.value || '').trim() === appName || appTags.includes(appName))) return false;
+      const channelSelected = channelTags.length
+        ? channelTags.length === 1 && channelTags[0] === channelName
+        : Boolean(channelInput && (channelInput.value || '').trim() === channelName);
+      const appSelected = appTags.length
+        ? appTags.length === 1 && appTags[0] === appName
+        : Boolean(matches[0].app && (matches[0].app.value || '').trim() === appName);
+      if (!channelSelected || !appSelected) return false;
       const buttons = Array.from(matches[0].form.querySelectorAll('button')).filter(button =>
         visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
         (button.innerText || '').replace(/\\s/g, '').trim() === '搜索'
