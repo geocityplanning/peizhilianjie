@@ -217,6 +217,8 @@ _POST_SAVE_FALLBACK_POLL_ATTEMPTS = 6
 _POST_SAVE_FALLBACK_POLL_MS = 250
 _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS = 3
 _POST_SAVE_KNOWN_ID_POLL_MS = 500
+_POST_SAVE_KNOWN_ID_VISIBILITY_BUDGET_MS = 15_000
+_POST_SAVE_KNOWN_ID_VISIBILITY_RESCAN_MS = 7_500
 
 
 def _mark_unique_visible_copy_dialog_input(page, label):
@@ -3564,9 +3566,17 @@ def _locate_known_main_row_for_resource_fallback_impl(page, app_id, app_name, ch
     gate_counts = {"target_absent_requests": 0, "target_filtered_requests": 0, "unknown_requests": 0, "target_absent_2xx": 0}
     gate_diagnostics = {key: 0 for key in _LIST_DIAGNOSTIC_KEYS}
     gate_structure_diagnostics = {key: 0 for key in _LIST_STRUCTURE_BUCKETS}
+    visibility_deadline = time.monotonic() + (_POST_SAVE_KNOWN_ID_VISIBILITY_BUDGET_MS / 1000)
+    attempts_run = 0
     for attempt in range(_POST_SAVE_KNOWN_ID_POLL_ATTEMPTS):
         if attempt:
-            page.wait_for_timeout(_POST_SAVE_KNOWN_ID_POLL_MS)
+            remaining_ms = int((visibility_deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
+            page.wait_for_timeout(min(_POST_SAVE_KNOWN_ID_VISIBILITY_RESCAN_MS, remaining_ms))
+        if time.monotonic() >= visibility_deadline:
+            break
+        attempts_run += 1
         previous_state = _read_list_restore_state(page) or {}
         observations = (
             _attach_list_response_observer(page, private_outline_batch=private_outline_batch)
@@ -3643,7 +3653,7 @@ def _locate_known_main_row_for_resource_fallback_impl(page, app_id, app_name, ch
         }
     reason = _LIST_GATE_PASSED_ID_NOT_FOUND if gate_passed else _deepest_list_gate_reason(gate_reasons)
     _log_unfiltered_list_gate(
-        reason, _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS, gate_passed, gate_counts, refresh_attempted, refresh_clicked,
+        reason, attempts_run, gate_passed, gate_counts, refresh_attempted, refresh_clicked,
         gate_diagnostics, gate_structure_diagnostics,
     )
     return _known_main_failure("zero_candidates_after_poll", scanned.get("snapshot"))

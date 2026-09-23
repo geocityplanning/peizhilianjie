@@ -80,7 +80,30 @@ def test_known_locator_zero_candidate_is_bounded_read_only_polling(monkeypatch):
     assert result["candidate_category"] == "0"
     assert result["id_field_source"] == "main"
     assert len(resets) == cap._POST_SAVE_KNOWN_ID_POLL_ATTEMPTS
-    assert page.waits == [cap._POST_SAVE_KNOWN_ID_POLL_MS] * (cap._POST_SAVE_KNOWN_ID_POLL_ATTEMPTS - 1)
+    assert page.waits == [cap._POST_SAVE_KNOWN_ID_VISIBILITY_RESCAN_MS] * (cap._POST_SAVE_KNOWN_ID_POLL_ATTEMPTS - 1)
+
+
+def test_known_locator_visibility_budget_stops_before_extra_rescan(monkeypatch):
+    cap = _cap()
+    clock = [0.0]
+    scans = []
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            clock[0] += milliseconds / 1000
+
+    _install_navigation(monkeypatch, cap)
+    monkeypatch.setattr(cap.time, "monotonic", lambda: clock[0])
+
+    def scan(*args):
+        scans.append(True)
+        clock[0] += cap._POST_SAVE_KNOWN_ID_VISIBILITY_BUDGET_MS / 1000
+        return {"status": "zero", "snapshot": {}}
+
+    monkeypatch.setattr(cap, "_scan_known_main_id_pages", scan)
+    result = cap._locate_known_main_row_for_resource_fallback(Page(), "id", "name", "channel")
+    assert result["reason"] == "zero_candidates_after_poll"
+    assert len(scans) == 1
 
 
 def test_known_locator_logs_gate_passed_id_not_found(monkeypatch, capsys):
