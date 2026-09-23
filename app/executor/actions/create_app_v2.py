@@ -3411,6 +3411,78 @@ def _read_current_page_app_rows(page):
     return rows
 
 
+_NARROW_ROW_SWITCH_STATE_JS = """
+(expected) => {
+  const visible = (el) => Boolean(el) && el.offsetParent !== null;
+  const inDialog = (el) => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
+  const utility = (classes) => /el-table__expand-column|el-table-column--selection|el-table-column--index|\\bgutter\\b/.test(String(classes || ''));
+  const tables = Array.from(document.querySelectorAll('.el-table')).filter((table) => visible(table) && !inDialog(table));
+  if (tables.length !== 1) return null;
+  const table = tables[0];
+  const rawHeaders = Array.from(table.querySelectorAll('.el-table__header-wrapper th').length
+    ? table.querySelectorAll('.el-table__header-wrapper th') : table.querySelectorAll('th'));
+  const headers = rawHeaders.filter((header) => !utility(header.className)).map((header) => (header.innerText || header.textContent || '').trim());
+  const rawRows = Array.from(table.querySelectorAll('.el-table__body-wrapper tbody tr').length
+    ? table.querySelectorAll('.el-table__body-wrapper tbody tr') : table.querySelectorAll('tbody tr'));
+  const rows = rawRows.filter((row) => visible(row) && !row.classList.contains('el-table__expanded-row'));
+  const idHeaders = headers.map((header, index) => ({header, index})).filter(({header}) => header === 'ID' || header.includes('应用ID'));
+  const nameHeaders = headers.map((header, index) => ({header, index})).filter(({header}) => /应用名称|应用名/.test(header));
+  const channelHeaders = headers.map((header, index) => ({header, index})).filter(({header}) => {
+    const normalized = header.replace(/[ *:：\\s]/g, '');
+    return normalized && !/ID|编码|code/i.test(normalized) && header.includes('渠道');
+  });
+  if (idHeaders.length !== 1 || nameHeaders.length !== 1 || channelHeaders.length !== 1) return null;
+  const matches = [];
+  for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+    const cells = Array.from(rows[rowIdx].querySelectorAll('td')).filter((cell) => !utility(cell.className));
+    if (cells.length !== headers.length) continue;
+    const valueAt = (index) => (cells[index].innerText || cells[index].textContent || '').trim();
+    if (valueAt(idHeaders[0].index) === expected.appId
+      && valueAt(nameHeaders[0].index) === expected.appName
+      && valueAt(channelHeaders[0].index) === expected.channelName) {
+      matches.push({row: rows[rowIdx], rowIdx});
+    }
+  }
+  if (matches.length !== 1) return null;
+  const switches = Array.from(matches[0].row.querySelectorAll('.el-switch')).filter(visible);
+  if (switches.length !== 1) return null;
+  const checked = switches[0].classList.contains('is-checked');
+  return {state: checked ? 'switch_checked' : 'switch_unchecked', row_idx: matches[0].rowIdx};
+}
+"""
+_NARROW_ROW_SWITCH_STATES = {"switch_checked", "switch_unchecked", "unreadable"}
+
+
+def _post_save_narrow_row_switch_state(page, app_id, app_name, channel_name):
+    """Read a uniquely anchored filtered-row switch twice without interacting."""
+    expected = {
+        "appId": str(app_id or "").strip(),
+        "appName": str(app_name or "").strip(),
+        "channelName": str(channel_name or "").strip(),
+    }
+    if not all(expected.values()):
+        return "unreadable"
+    snapshots = []
+    for _ in range(2):
+        try:
+            snapshot = page.evaluate(_NARROW_ROW_SWITCH_STATE_JS, expected)
+        except Exception:
+            return "unreadable"
+        if not isinstance(snapshot, dict):
+            return "unreadable"
+        state = snapshot.get("state")
+        row_idx = snapshot.get("row_idx")
+        if state not in _NARROW_ROW_SWITCH_STATES - {"unreadable"} or isinstance(row_idx, bool) or not isinstance(row_idx, int) or row_idx < 0:
+            return "unreadable"
+        snapshots.append((state, row_idx))
+    return snapshots[0][0] if snapshots[0] == snapshots[1] else "unreadable"
+
+
+def _log_post_save_narrow_row_switch_state(state):
+    fixed_state = state if state in _NARROW_ROW_SWITCH_STATES else "unreadable"
+    print(f"[create_app] post_save_narrow_row_switch_state={fixed_state}")
+
+
 def _collect_all_app_rows(page, reset_filters=False):
     """Collect app rows across pagination, keyed by the exact application ID."""
     if reset_filters:
@@ -3793,7 +3865,13 @@ def _identify_new_app(page, before_ids, actual_channel_name, app_name, context_s
             and row.get("channel_name") == actual_channel_name
         ]
         if len(fast_candidates) == 1:
-            return {"success": True, "app_id": fast_candidates[0]["app_id"]}
+            candidate = fast_candidates[0]
+            _log_post_save_narrow_row_switch_state(
+                _post_save_narrow_row_switch_state(
+                    page, candidate.get("app_id"), candidate.get("app_name"), candidate.get("channel_name")
+                )
+            )
+            return {"success": True, "app_id": candidate["app_id"]}
         if len(fast_candidates) > 1:
             return {
                 "success": False,

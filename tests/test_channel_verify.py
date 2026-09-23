@@ -284,6 +284,105 @@ def test_identify_zero_new_ids_stop(monkeypatch):
     assert result["error"]["code"] == "NEW_APP_ID_NOT_FOUND"
 
 
+def test_post_save_narrow_row_switch_state_reads_two_stable_snapshots_only():
+    cap = _stub_login_and_import()
+
+    class Page:
+        def __init__(self, snapshots):
+            self.snapshots = list(snapshots)
+            self.calls = []
+        def evaluate(self, script, expected):
+            self.calls.append((script, expected))
+            return self.snapshots.pop(0)
+
+    for expected_state in ("switch_checked", "switch_unchecked"):
+        page = Page([
+            {"state": expected_state, "row_idx": 4},
+            {"state": expected_state, "row_idx": 4},
+        ])
+        assert cap._post_save_narrow_row_switch_state(page, "secret-id", "secret-name", "secret-channel") == expected_state
+        assert len(page.calls) == 2
+        assert all(call[0] == cap._NARROW_ROW_SWITCH_STATE_JS for call in page.calls)
+
+
+def test_post_save_narrow_row_switch_state_fails_closed_for_unreadable_rows():
+    cap = _stub_login_and_import()
+
+    class Page:
+        def __init__(self, snapshots=None, raises=False):
+            self.snapshots = list(snapshots or [])
+            self.raises = raises
+        def evaluate(self, script, expected):
+            if self.raises:
+                raise RuntimeError("unreadable")
+            return self.snapshots.pop(0)
+
+    # None represents each JS-side rejected shape: non-unique row, missing/multiple
+    # switch, missing/multiple anchor column, or unaligned cells.
+    for page in (
+        Page([None]),
+        Page([{"state": "switch_checked", "row_idx": 1}, {"state": "switch_unchecked", "row_idx": 1}]),
+        Page([{"state": "switch_checked", "row_idx": 1}, {"state": "switch_checked", "row_idx": 2}]),
+        Page([{"state": "switch_checked", "row_idx": "1"}]),
+        Page([{"state": "switch_checked", "row_idx": True}]),
+        Page(raises=True),
+    ):
+        assert cap._post_save_narrow_row_switch_state(page, "secret-id", "secret-name", "secret-channel") == "unreadable"
+    assert cap._post_save_narrow_row_switch_state(Page(), "", "secret-name", "secret-channel") == "unreadable"
+
+
+def test_narrow_row_switch_diagnostic_is_value_free_and_does_not_change_candidate(monkeypatch, capsys):
+    cap = _stub_login_and_import()
+    calls = {"diagnostic": 0, "search": 0, "collect": 0}
+
+    def search(*args, **kwargs):
+        calls["search"] += 1
+        return {"filter_stable": True}
+
+    def collect(*args, **kwargs):
+        calls["collect"] += 1
+        return {"secret-id": {"app_id": "secret-id", "app_name": "secret-name", "channel_name": "secret-channel"}}
+
+    def diagnostic(*args):
+        calls["diagnostic"] += 1
+        return "switch_checked"
+
+    monkeypatch.setattr(cap, "_search_list_by_channel", search)
+    monkeypatch.setattr(cap, "_collect_all_app_rows", collect)
+    monkeypatch.setattr(cap, "_post_save_narrow_row_switch_state", diagnostic)
+    result = cap._identify_new_app(object(), {"old-id"}, "secret-channel", "secret-name")
+
+    assert result == {"success": True, "app_id": "secret-id"}
+    assert calls == {"diagnostic": 1, "search": 1, "collect": 1}
+    output = capsys.readouterr().out
+    assert output.strip() == "[create_app] post_save_narrow_row_switch_state=switch_checked"
+    for forbidden in ("secret-id", "secret-name", "secret-channel", "is-checked", "class"):
+        assert forbidden not in output
+
+
+def test_contract_documents_narrow_row_switch_state_as_non_business_enum():
+    contract = (Path(__file__).parents[1] / "contracts" / "hermes-http-v1.md").read_text(encoding="utf-8")
+    assert "post_save_narrow_row_switch_state`（switch_checked/switch_unchecked/unreadable" in contract
+    assert "不推导业务已/未启用" in contract
+
+
+def test_narrow_row_switch_diagnostic_has_no_interaction_or_control_flow_effect():
+    cap = _stub_login_and_import()
+    source = Path(cap.__file__).read_text(encoding="utf-8")
+    start = source.index("def _post_save_narrow_row_switch_state")
+    end = source.index("def _collect_all_app_rows", start)
+    helper_source = source[start:end]
+    assert ".click(" not in helper_source
+    assert "_reset_list_filters" not in helper_source
+    assert "wait_for_timeout" not in helper_source
+    assert "_NARROW_ROW_SWITCH_STATE_JS" in helper_source
+    assert "matches.length !== 1" in cap._NARROW_ROW_SWITCH_STATE_JS
+    assert "switches.length !== 1" in cap._NARROW_ROW_SWITCH_STATE_JS
+    assert "idHeaders.length !== 1" in cap._NARROW_ROW_SWITCH_STATE_JS
+    assert ".click(" not in cap._NARROW_ROW_SWITCH_STATE_JS
+    assert "dispatchEvent" not in cap._NARROW_ROW_SWITCH_STATE_JS
+
+
 def test_identify_function_never_creates_or_saves():
     cap = _stub_login_and_import()
     import ast
