@@ -2694,14 +2694,14 @@ def _unique_save_page_response(observer, candidate):
     return matches[0] if len(matches) == 1 and matches[0].get("response") is not None else None
 
 
-def _apply_save_page_response_fallback(match, candidate):
+def _apply_save_page_response_fallback(match, candidate, deadline):
     """Read one exact page response after its shared evidence attempt is consumed."""
     response = match.get("response") if isinstance(match, dict) else None
     try:
         if response is None or not hasattr(response, "finished") or not hasattr(response, "text"):
             return False
         finished = response.finished()
-        if finished is not None:
+        if finished is not None or time.monotonic() >= deadline:
             return False
         text = response.text()
     except Exception:
@@ -2726,7 +2726,7 @@ def _drain_save_response_evidence(observer, candidate):
         return
     now = time.monotonic()
     deadline = candidate.get("evidence_deadline")
-    if isinstance(deadline, (int, float)) and now > deadline:
+    if isinstance(deadline, (int, float)) and now >= deadline:
         candidate["evidence_terminal"] = True
         return
     if now < float(candidate.get("evidence_next_at") or now):
@@ -2749,7 +2749,7 @@ def _drain_save_response_evidence(observer, candidate):
     candidate["evidence_attempts"] = attempts + 1
     candidate["evidence_next_at"] = now + (_SAVE_EVIDENCE_RETRY_MS / 1000)
     if source == "page":
-        if _apply_save_page_response_fallback(page_match, candidate):
+        if _apply_save_page_response_fallback(page_match, candidate, deadline):
             candidate["evidence_terminal"] = True
             return
     else:

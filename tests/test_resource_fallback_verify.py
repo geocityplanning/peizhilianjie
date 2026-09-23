@@ -482,6 +482,7 @@ def test_contract_documents_wrapper_safe_bounded_page_response_fallback():
     assert "首次实际正文读取即将发生时起" in contract
     assert "合计最多三次、共享 450ms**尝试启动时限**" in contract
     assert "其返回后若时限已过必须立即终态，不得再启动后续证据读取" in contract
+    assert "page `finished()` 返回时已到期不得启动 `text()`" in contract
     assert "不得触发第二次保存、启用、搜索、重建、换幂等键或任何业务重试" in contract
     assert "耗尽仍保持 `SAVE_FAILED` / `UNKNOWN` / `QUERY`" in contract
 

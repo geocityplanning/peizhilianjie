@@ -226,6 +226,39 @@ def test_slow_started_cdp_read_ends_evidence_without_a_followup_read(monkeypatch
     assert session.body_calls == 1 and _evidence_reads(session) == 1
 
 
+def test_slow_page_finished_does_not_start_text_or_any_followup_read(monkeypatch):
+    cap, clock, session, _page, observer, request = _setup(monkeypatch, [{}])
+    response = Response(request, text_results=['{"header":{"status":"200"}}'])
+    observer.page_responses.append({
+        "method": "POST", "path_hash": observer.candidates["r1"]["path_hash"], "http_status": 200, "response": response,
+    })
+    original_finished = response.finished
+
+    def delayed_finished():
+        result = original_finished()
+        clock[0] += 0.451
+        return result
+
+    response.finished = delayed_finished
+    decision = cap._save_click_observation(observer)
+    candidate = observer.candidates["r1"]
+    assert decision["outcome"] == "business_unreadable"
+    assert decision["business"]["outcome"] == "unreadable"
+    assert candidate["evidence_terminal"] is True
+    assert response.finished_calls == 1 and response.text_calls == 0 and session.body_calls == 0
+    assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
+    assert response.finished_calls == 1 and response.text_calls == 0 and session.body_calls == 0
+
+
+def test_exact_deadline_does_not_start_a_followup_evidence_read(monkeypatch):
+    cap, clock, session, _page, observer, _request = _setup(monkeypatch, [{}, {}])
+    assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
+    clock[0] = observer.candidates["r1"]["evidence_deadline"]
+    assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
+    assert observer.candidates["r1"]["evidence_terminal"] is True
+    assert session.body_calls == 1 and _evidence_reads(session) == 1
+
+
 def test_shared_budget_exhaustion_stays_unreadable_unknown_query_and_detaches(monkeypatch):
     cap, _clock, session, page, observer, _request = _setup(monkeypatch, [{}, {}, {}])
     for _ in range(3):
