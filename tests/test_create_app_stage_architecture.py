@@ -77,8 +77,11 @@ def test_application_name_and_target_identity_are_separate():
 def test_later_stages_relocate_by_exact_app_id():
     source = SOURCE_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    for name in ("_stage_enable", "_stage_set_group", "_stage_collect_result"):
-        function = _function(tree, name)
-        function_source = ast.get_source_segment(source, function) or ""
+    enable = ast.get_source_segment(source, _function(tree, "_stage_enable")) or ""
+    assert "target_app_id" in enable
+    assert "_locate_known_main_row_for_resource_fallback" in enable
+    assert "_click_unchecked_switch_by_known_main_row" in enable
+    for name in ("_stage_set_group", "_stage_collect_result"):
+        function_source = ast.get_source_segment(source, _function(tree, name)) or ""
         assert "target_app_id" in function_source
         assert "_find_target_row_by_id" in function_source

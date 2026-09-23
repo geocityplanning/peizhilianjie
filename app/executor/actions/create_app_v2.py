@@ -566,6 +566,101 @@ def _open_copy_dialog_by_known_main_row(
         return False
 
 
+def _click_unchecked_switch_by_known_main_row(
+    page, app_id, page_number, row_idx, logical_key, key_kind, app_name, channel_name
+):
+    """Atomically re-resolve one stable main row and click its unchecked switch once."""
+    try:
+        return bool(page.evaluate(
+            """
+            ({appId, pageNumber, rowIdx, logicalKey, keyKind, appName, channelName}) => {
+              const visible = el => Boolean(el) && el.offsetParent !== null;
+              const inDialog = el => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
+              const utility = el => /el-table__expand-column|el-table-column--selection|\\bgutter\\b/.test(String(el.className || ''));
+              const messageBoxes = Array.from(document.querySelectorAll('.el-message-box__wrapper')).filter(visible);
+              if (messageBoxes.length !== 0) return false;
+              const tables = Array.from(document.querySelectorAll('.el-table')).filter(table => visible(table) && !inDialog(table));
+              if (tables.length !== 1 || !Number.isInteger(rowIdx) || !logicalKey) return false;
+              const pagers = Array.from(document.querySelectorAll('.el-pagination')).filter(pager => !inDialog(pager));
+              const active = pagers[0]?.querySelector('.el-pager li.active');
+              const currentPage = /^\\d+$/.test((active?.innerText || '').trim()) ? Number(active.innerText.trim()) : 1;
+              if (currentPage !== pageNumber) return false;
+              const table = tables[0];
+              const headers = Array.from((table.querySelectorAll('.el-table__header-wrapper th').length ? table.querySelectorAll('.el-table__header-wrapper th') : table.querySelectorAll('th'))).filter(header => !utility(header));
+              const textOf = header => (header.innerText || header.textContent || '').replace(/[ *:：\\s]/g, '').trim();
+              const indexesFor = predicate => headers.map(textOf).map((text, index) => predicate(text) ? index : -1).filter(index => index >= 0);
+              const idIndexes = indexesFor(text => text === 'ID' || text.includes('应用ID'));
+              const nameIndexes = indexesFor(text => text.includes('应用名称') || text.includes('应用名'));
+              const channelIndexes = indexesFor(text => text.includes('渠道') && !/ID|编码|code/i.test(text));
+              if (idIndexes.length !== 1 || nameIndexes.length !== 1 || channelIndexes.length !== 1) return false;
+              const bodyRows = table.querySelectorAll('.el-table__body-wrapper tbody tr');
+              const logicalRows = Array.from(bodyRows.length ? bodyRows : table.querySelectorAll('tbody tr')).filter(row => !row.classList.contains('el-table__expanded-row'));
+              const valuesOf = row => {
+                const cells = Array.from(row.querySelectorAll('td')).filter(cell => !utility(cell));
+                if (cells.length !== headers.length) return null;
+                const text = index => (cells[index].innerText || cells[index].textContent || '').trim();
+                return {id: text(idIndexes[0]), name: text(nameIndexes[0]), channel: text(channelIndexes[0])};
+              };
+              const nativeKeyOf = row => row.getAttribute('data-row-key') || row.getAttribute('row-key') || '';
+              const keyOf = (row, index, values) => nativeKeyOf(row) || [`synthetic:${currentPage}`, index, values.id, values.name, values.channel].join(String.fromCharCode(31));
+              const matches = logicalRows.map((row, index) => ({row, index, values: valuesOf(row)})).filter(item => visible(item.row) && item.values && item.values.id === String(appId || '').trim());
+              if (!matches.length || (keyKind === 'synthetic' && matches.length !== 1)) return false;
+              for (const matched of matches) {
+                if (matched.values.id !== String(appId || '').trim() || matched.values.name !== String(appName || '').trim() || matched.values.channel !== String(channelName || '').trim()) return false;
+                if (keyKind === 'native' && (!nativeKeyOf(matched.row) || nativeKeyOf(matched.row) !== logicalKey)) return false;
+                if (keyKind === 'synthetic' && keyOf(matched.row, matched.index, matched.values) !== logicalKey) return false;
+              }
+              const target = logicalRows[rowIdx];
+              const targetValues = target ? valuesOf(target) : null;
+              if (!target || !visible(target) || !targetValues || keyOf(target, rowIdx, targetValues) !== logicalKey) return false;
+              const switches = Array.from(target.querySelectorAll('.el-switch')).filter(visible);
+              if (switches.length !== 1) return false;
+              const switchControl = switches[0];
+              const input = switchControl.querySelector('input');
+              if (switchControl.classList.contains('is-disabled') || switchControl.getAttribute('aria-disabled') === 'true' || (input && input.disabled) || switchControl.classList.contains('is-checked')) return false;
+              switchControl.click();
+              return true;
+            }
+            """,
+            {"appId": app_id, "pageNumber": page_number, "rowIdx": row_idx,
+             "logicalKey": logical_key, "keyKind": key_kind, "appName": app_name,
+             "channelName": channel_name},
+        ))
+    except Exception:
+        return False
+
+
+def _visible_message_box_count(page):
+    """Read visible confirmation boxes before an irreversible switch click."""
+    try:
+        result = page.evaluate("""() => Array.from(document.querySelectorAll('.el-message-box__wrapper')).filter(
+          item => Boolean(item) && item.offsetParent !== null
+        ).length""")
+        return result if isinstance(result, int) and not isinstance(result, bool) else None
+    except Exception:
+        return None
+
+
+def _click_unique_new_message_box_confirm(page):
+    """Click exactly one enabled, exact-text confirmation button; never use Enter."""
+    try:
+        return bool(page.evaluate("""() => {
+          const visible = el => Boolean(el) && el.offsetParent !== null;
+          const boxes = Array.from(document.querySelectorAll('.el-message-box__wrapper')).filter(visible);
+          if (boxes.length !== 1) return false;
+          const buttons = Array.from(boxes[0].querySelectorAll('button')).filter(button => {
+            const text = (button.innerText || button.textContent || '').replace(/\\s+/g, '').trim();
+            return visible(button) && text === '确定' && !button.disabled
+              && button.getAttribute('aria-disabled') !== 'true' && !button.classList.contains('is-disabled');
+          });
+          if (buttons.length !== 1) return false;
+          buttons[0].click();
+          return true;
+        }"""))
+    except Exception:
+        return False
+
+
 def _copy_dialog_visible(page):
     """Strict visible-copy-dialog check used only for bounded verification cleanup."""
     return bool(page.evaluate("""() => {
@@ -619,27 +714,10 @@ def _close_copy_dialog_after_verify(page):
     return False
 
 
-def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_name, expected_channel_name, narrow_context_profiles=None):
-    """Read the exact new app, its identity, and its fallback value with bounded stability."""
-    main_identity = _locate_known_main_row_for_resource_fallback(
-        page, app_id, expected_app_name, expected_channel_name, narrow_context_profiles=narrow_context_profiles
-    )
-    if not main_identity["success"]:
-        diagnostics = _known_main_redacted_facts(
-            main_identity,
-            main_identity.get("stable_row_key", False),
-        )
-        return {
-            "success": False,
-            "error": _resource_fallback_readback_error(
-                "VERIFY",
-                "保存后已知应用ID主行身份未能稳定核验，已停止 "
-                f"candidate_category={diagnostics['candidate_category']} "
-                f"page={diagnostics['page']} "
-                f"stable_row_key={diagnostics['stable_row_key']} "
-                f"id_field_source={diagnostics['id_field_source']}",
-            ),
-        }
+def _verify_resource_fallback_by_known_main_row(
+    page, app_id, expected, expected_app_name, expected_channel_name, main_identity
+):
+    """Double-read fallback through one already-stable current-view row handle."""
     if not _open_copy_dialog_by_known_main_row(
         page,
         app_id,
@@ -687,6 +765,27 @@ def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_nam
     if not closed:
         return {"success": False, "error": _resource_fallback_readback_error("VERIFY", "保存后资源不足中间页链接核验对话框未能确认关闭，已停止")}
     return verified
+
+
+def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_name, expected_channel_name, narrow_context_profiles=None):
+    """Compatibility wrapper: locate through the fresh unfiltered gate, then read."""
+    main_identity = _locate_known_main_row_for_resource_fallback(
+        page, app_id, expected_app_name, expected_channel_name, narrow_context_profiles=narrow_context_profiles
+    )
+    if not main_identity["success"]:
+        diagnostics = _known_main_redacted_facts(main_identity, main_identity.get("stable_row_key", False))
+        return {
+            "success": False,
+            "error": _resource_fallback_readback_error(
+                "VERIFY",
+                "保存后已知应用ID主行身份未能稳定核验，已停止 "
+                f"candidate_category={diagnostics['candidate_category']} page={diagnostics['page']} "
+                f"stable_row_key={diagnostics['stable_row_key']} id_field_source={diagnostics['id_field_source']}",
+            ),
+        }
+    return _verify_resource_fallback_by_known_main_row(
+        page, app_id, expected, expected_app_name, expected_channel_name, main_identity
+    )
 
 
 def _js_select(page, label, value):
@@ -2491,6 +2590,51 @@ def _wait_for_save_click_observation(page, observer, timeout_ms=6000, poll_inter
     return _save_click_observation(observer)
 
 
+def _wait_for_switch_action_observation(page, observer, timeout_ms=6000, poll_interval_ms=150):
+    """Keep one bounded action window; accept one new confirm box or direct dispatch.
+
+    A response is intentionally not accepted early: the direct path must prove no
+    confirmation box appeared anywhere in the bounded window.  A box after a
+    request, multiple boxes, an invalid confirm button, or a second box is an
+    attribution ambiguity and therefore fail-closed.
+    """
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    saw_box = False
+    confirm_clicked = False
+    confirm_closed = False
+    while time.monotonic() < deadline:
+        box_count = _visible_message_box_count(page)
+        if box_count is None:
+            return {"outcome": "message_box_unreadable"}
+        candidate_count = len(getattr(observer, "candidates", {}) or {})
+        if candidate_count > 1:
+            return {"outcome": "ambiguous_candidate", "candidate_count": candidate_count}
+        if box_count:
+            # The original box may remain visible through its close animation;
+            # only a box before it or after it closed is ambiguous.
+            if box_count != 1 or confirm_closed:
+                return {"outcome": "message_box_ambiguous"}
+            if not saw_box:
+                if candidate_count:
+                    return {"outcome": "message_box_ambiguous"}
+                saw_box = True
+                if not _click_unique_new_message_box_confirm(page):
+                    return {"outcome": "message_box_confirm_rejected"}
+                confirm_clicked = True
+        elif confirm_clicked:
+            confirm_closed = True
+        page.wait_for_timeout(poll_interval_ms)
+    if saw_box and (not confirm_clicked or not confirm_closed):
+        return {"outcome": "message_box_ambiguous"}
+    return _save_click_observation(observer)
+
+
+def _log_enable_click_observation(decision):
+    print("[create_app] enable_observation=" + json.dumps(
+        _save_click_diagnostic(decision), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ))
+
+
 def _attach_save_click_observer(page):
     """Observe one post-click same-origin non-list write request by request ID only."""
     observer = _SaveClickObserver()
@@ -3675,6 +3819,49 @@ def _scan_known_main_id_pages(page, app_id, app_name, channel_name):
     return {"status": "failure", "snapshot": {}, "reason": "page_scan_limit_reached"}
 
 
+def _locate_known_main_row_in_current_view(page, app_id, app_name, channel_name):
+    """Return a stable known-main handle without resetting the narrow view or clicking.
+
+    This is deliberately separate from the fresh-unfiltered restore gate: the
+    post-save fallback proof must use the filtered view which identified the new
+    row, while enable's terminal proof installs its own unfiltered gate later.
+    """
+    if not _go_to_first_page(page):
+        return _known_main_failure("pagination_unstable")
+    scanned = _scan_known_main_id_pages(page, app_id, app_name, channel_name)
+    if scanned.get("status") != "candidate":
+        return _known_main_failure(scanned.get("reason") or "zero_candidates", scanned.get("snapshot"))
+    first_snapshot = scanned["snapshot"]
+    first_row = scanned["decision"]["row"]
+    page.wait_for_timeout(_POST_SAVE_KNOWN_ID_POLL_MS)
+    second_snapshot = _snapshot_known_main_id_rows(page, app_id)
+    if not second_snapshot.get("success") or second_snapshot.get("page") != first_snapshot.get("page"):
+        _log_known_main_snapshot(second_snapshot, {}, False)
+        return _known_main_failure("main_identity_unstable", second_snapshot)
+    second_decision = _known_main_identity_from_snapshot(second_snapshot, app_id, app_name, channel_name)
+    stable_key = bool(
+        second_decision.get("success")
+        and second_decision["row"].get("logical_key") == first_row.get("logical_key")
+        and second_decision["row"].get("row_idx") == first_row.get("row_idx")
+    )
+    _log_known_main_snapshot(second_snapshot, second_decision, stable_key)
+    if not stable_key:
+        return _known_main_failure("main_identity_unstable", second_snapshot)
+    return {
+        "success": True,
+        "page": second_snapshot.get("page"),
+        "row_idx": second_decision["row"].get("row_idx"),
+        "row_key": second_decision["row"].get("logical_key"),
+        "key_kind": second_decision["row"].get("key_kind"),
+    }
+
+
+def _same_known_main_handle(left, right):
+    """Compare only the in-memory stable handle fields; never log their values."""
+    fields = ("page", "row_idx", "row_key", "key_kind")
+    return all(left.get(field) == right.get(field) for field in fields)
+
+
 def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_attempted, refresh_clicked, diagnostics, structure_diagnostics, context_relation="unreadable"):
     bounded = lambda value: min(max(int(value or 0), 0), _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS * 2)
     print("[create_app] unfiltered_list_gate=" + json.dumps({
@@ -4444,109 +4631,105 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
     if not identified["success"]:
         return _post_save_unconfirmed_failure(identified["error"])
     target_app_id = identified["app_id"]
-    # Only this post-save resource-fallback proof uses the strict main-row locator.
-    # Later enable/group/result stages intentionally retain _find_target_row_by_id.
-    fallback_persisted = _verify_persisted_resource_fallback(
-        page,
-        target_app_id,
-        resource_fallback_page,
-        app_name,
-        data["actual_channel_name"],
-        narrow_context_profiles=narrow_context_profiles,
+    # Keep this filtered/narrow view intact: fallback double-read, close, then
+    # re-resolve the exact same row before any switch action is even considered.
+    try:
+        narrow_handle = _locate_known_main_row_in_current_view(
+            page, target_app_id, app_name, data["actual_channel_name"]
+        )
+    except Exception:
+        narrow_handle = {"success": False}
+    if not narrow_handle["success"]:
+        return _post_save_unconfirmed_failure(_resource_fallback_readback_error(
+            "VERIFY", "保存后窄路径主行身份未能稳定核验，已停止"
+        ))
+    fallback_persisted = _verify_resource_fallback_by_known_main_row(
+        page, target_app_id, resource_fallback_page, app_name,
+        data["actual_channel_name"], narrow_handle,
     )
     if not fallback_persisted["success"]:
         return _post_save_unconfirmed_failure(fallback_persisted["error"])
+    try:
+        rechecked_handle = _locate_known_main_row_in_current_view(
+            page, target_app_id, app_name, data["actual_channel_name"]
+        )
+    except Exception:
+        rechecked_handle = {"success": False}
+    if not rechecked_handle.get("success") or not _same_known_main_handle(narrow_handle, rechecked_handle):
+        return _post_save_unconfirmed_failure(_resource_fallback_readback_error(
+            "VERIFY", "保存后资源兜底核验关窗后主行身份发生变化，已停止"
+        ))
     _shot(page, "07_created")
-    return {"success": True, "target_app_id": target_app_id}
+    # This handle is internal-only and exists only until _stage_enable completes.
+    return {"success": True, "target_app_id": target_app_id, "known_main_handle": rechecked_handle}
 
 
-def _stage_enable(page, execution_id, target_app_id, app_name, actual_channel_name):
-    """Stage 2: 检查状态 → 如果已上线则跳过 → 如果没上线则点击开关 → 确认 → 验证。
-    Returns: {success: bool, error: err_or_None}
-    """
+def _enable_unknown_failure(message):
+    """A saved object may exist (and may now be enabled); freeze its original order."""
+    return {
+        "success": False,
+        "error": err("PUBLISH_FAILED", "PUBLISH", message, NEXT_QUERY),
+        "enable_may_have_occurred": True,
+    }
+
+
+def _stage_enable(page, execution_id, target_app_id, app_name, actual_channel_name, known_main_handle):
+    """Stage 2: one anchored enable click plus new unfiltered terminal proof."""
     _set_stage(execution_id, "正在检查应用状态")
-    located = _find_target_row_by_id(page, target_app_id, actual_channel_name)
-    if not located.get("found"):
-        return {
-            "success": False,
-            "error": err("TARGET_APP_NOT_FOUND", "PUBLISH", f"上线前未找到应用ID={target_app_id}", NEXT_MANUAL),
-        }
-    target_idx = located["row_idx"]
+    if not isinstance(known_main_handle, dict) or not known_main_handle.get("success"):
+        return _enable_unknown_failure("缺少保存后已核验主行身份，已停止")
+    try:
+        pre_click_handle = _locate_known_main_row_in_current_view(
+            page, target_app_id, app_name, actual_channel_name
+        )
+    except Exception:
+        pre_click_handle = {"success": False}
+    if not pre_click_handle.get("success") or not _same_known_main_handle(known_main_handle, pre_click_handle):
+        return _enable_unknown_failure("上线前同行身份未能连续稳定复核，已停止")
+    if _post_save_narrow_row_switch_state(page, target_app_id, app_name, actual_channel_name) != "switch_unchecked":
+        return _enable_unknown_failure("上线前开关不是唯一可读未启用状态，已停止")
+    if _visible_message_box_count(page) != 0:
+        return _enable_unknown_failure("上线前存在未归属确认框，已停止")
 
-    # 先检查当前是否已上线
-    status_check = page.evaluate("""
-    (rowIdx) => {
-      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-      const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
-      const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
-      if (rowIdx < 0 || rowIdx >= rows.length) return {error: 'row not found'};
-      const sw = rows[rowIdx].querySelector('.el-switch');
-      if (!sw) return {error: 'no switch'};
-      const isOn = sw.className.includes('is-checked');
-      return {isOn: isOn};
-    }
-    """, target_idx)
-    print(f"[create_app] 状态检查: {status_check}")
-
-    if status_check.get("isOn"):
-        print("[create_app] 应用已上线，跳过上线步骤")
-        _shot(page, "08_already_published")
-        return {"success": True, "error": None}
-
-    # 没上线，点击开关
     _set_stage(execution_id, "正在发布上线")
-    publish_result = page.evaluate("""
-    (rowIdx) => {
-      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-      const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
-      const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
-      if (rowIdx < 0 || rowIdx >= rows.length) return {error: 'row not found'};
-      const sw = rows[rowIdx].querySelector('.el-switch');
-      if (!sw) return {error: 'no switch'};
-      if (sw.className.includes('is-checked')) return {clicked: false, wasOn: true};
-      sw.click();
-      return {clicked: true, wasOn: false};
-    }
-    """, target_idx)
-    print(f"[create_app] publish: {publish_result}")
-
-    if publish_result.get("clicked"):
-        page.wait_for_timeout(1500)
-        # 用 JS 精确点击"确定"按钮
-        confirmed = page.evaluate("""() => {
-          const mbs = document.querySelectorAll('.el-message-box__wrapper');
-          for (const mb of mbs) {
-            if (mb.style.display === 'none') continue;
-            const btns = mb.querySelectorAll('button');
-            for (const b of btns) {
-              if (b.offsetParent !== null && b.innerText.trim() === '确定') { b.click(); return true; }
-            }
-          }
-          return false;
-        }""")
-        print(f"[create_app] 确认上线: {confirmed}")
-        if not confirmed:
+    observer = _attach_save_click_observer(page)
+    if observer is None:
+        return _enable_unknown_failure("上线写请求观察器不可用，已停止")
+    clicked = False
+    observation = {"outcome": "observer_unavailable"}
+    try:
+        clicked = _click_unchecked_switch_by_known_main_row(
+            page, target_app_id, pre_click_handle.get("page"), pre_click_handle.get("row_idx"),
+            pre_click_handle.get("row_key"), pre_click_handle.get("key_kind"), app_name,
+            actual_channel_name,
+        )
+        if clicked:
             try:
-                page.keyboard.press("Enter")
+                observation = _wait_for_switch_action_observation(page, observer)
             except Exception:
-                pass
-        page.wait_for_timeout(2000)
+                observation = {"outcome": "observer_unavailable"}
+    finally:
+        _detach_save_click_observer(observer)
+    if not clicked:
+        return _enable_unknown_failure("上线同行开关未通过原子复核或不可点击，已停止")
+    _log_enable_click_observation(observation)
+    if observation.get("outcome") != "success":
+        return _enable_unknown_failure("上线响应未能唯一确认业务成功，已停止")
 
-    # 验证开关是否变 ON
-    is_on = page.evaluate("""
-    (rowIdx) => {
-      const primaryRows = document.querySelectorAll('.el-table__body-wrapper tbody tr');
-      const sourceRows = primaryRows.length ? primaryRows : document.querySelectorAll('table tbody tr');
-      const rows = Array.from(sourceRows).filter(row => !row.classList.contains('el-table__expanded-row'));
-      if (rowIdx < 0 || rowIdx >= rows.length) return false;
-      const sw = rows[rowIdx].querySelector('.el-switch');
-      return sw ? sw.className.includes('is-checked') : false;
-    }
-    """, target_idx)
-    print(f"[create_app] 上线验证: is_on={is_on}")
-    if not is_on:
-        pub_err = capture_page_errors(page, screenshot_name=f"app_publish_fail_{app_name}")
-        return {"success": False, "error": err("PUBLISH_FAILED", "PUBLISH", build_error_message(pub_err, "发布失败(状态未开启)"), NEXT_MANUAL)}
+    # Checked state is diagnostic only and never substitutes for the write proof.
+    if _post_save_narrow_row_switch_state(page, target_app_id, app_name, actual_channel_name) != "switch_checked":
+        return _enable_unknown_failure("上线后开关状态未能连续稳定回读，已停止")
+
+    # Throw away every narrow locator, response and DOM observation.  The final
+    # proof starts a fresh unfiltered observer/gate and finds the same three anchors.
+    try:
+        final_handle = _locate_known_main_row_for_resource_fallback(
+            page, target_app_id, app_name, actual_channel_name
+        )
+    except Exception:
+        final_handle = {"success": False}
+    if not final_handle.get("success"):
+        return _enable_unknown_failure("上线后未筛选终验未能唯一定位目标主行，已停止")
     _shot(page, "08_published")
     return {"success": True, "error": None}
 
@@ -4951,9 +5134,10 @@ def execute_create_app(request: dict) -> dict:
             target_app_id,
             app_name,
             data["actual_channel_name"],
+            create_result.get("known_main_handle"),
         )
         if not enable_result["success"]:
-            return finish_failure(enable_result["error"], current_stage)
+            return finish_failure(enable_result["error"], current_stage, ex.BIZ_UNKNOWN)
         completed_stages.append(current_stage)
 
         if group_name:

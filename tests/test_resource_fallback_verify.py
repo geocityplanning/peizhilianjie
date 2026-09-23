@@ -926,7 +926,7 @@ def test_post_save_known_main_identity_failure_is_unknown(monkeypatch):
     monkeypatch.setattr(cap, "_fill_and_verify_resource_fallback", lambda *args, **kwargs: {"success": True})
     monkeypatch.setattr(cap, "capture_page_errors", lambda *args, **kwargs: {"dialog_open": False})
     monkeypatch.setattr(cap, "_identify_new_app", lambda *args, **kwargs: {"success": True, "app_id": "new-id"})
-    monkeypatch.setattr(cap, "_verify_persisted_resource_fallback", lambda *args, **kwargs: {"success": False, "error": cap.err("RESOURCE_FALLBACK_VERIFY_FAILED", "VERIFY", "identity", cap.NEXT_MANUAL)})
+    monkeypatch.setattr(cap, "_locate_known_main_row_in_current_view", lambda *args, **kwargs: {"success": False})
 
     result = cap._stage_create_save(page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type")
 
@@ -944,8 +944,7 @@ def test_post_save_failure_marks_stage_as_may_have_saved(monkeypatch):
     monkeypatch.setattr(cap, "_fill_and_verify_resource_fallback", lambda *args, **kwargs: {"success": True})
     monkeypatch.setattr(cap, "capture_page_errors", lambda *args, **kwargs: {"dialog_open": False})
     monkeypatch.setattr(cap, "_identify_new_app", lambda *args, **kwargs: {"success": True, "app_id": "new-id"})
-    monkeypatch.setattr(cap, "_find_target_row_by_id", lambda *args, **kwargs: {"found": True, "row_idx": 0})
-    monkeypatch.setattr(cap, "_verify_persisted_resource_fallback", lambda *args, **kwargs: {"success": False, "error": cap.err("RESOURCE_FALLBACK_VERIFY_FAILED", "VERIFY", "empty", cap.NEXT_MANUAL)})
+    monkeypatch.setattr(cap, "_locate_known_main_row_in_current_view", lambda *args, **kwargs: {"success": False})
 
     result = cap._stage_create_save(page, "exec-1", _stage_data(), "https://example.invalid/ref", "1", "demo", "", EXPECTED, "type")
 

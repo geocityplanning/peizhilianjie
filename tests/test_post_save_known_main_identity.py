@@ -631,6 +631,8 @@ def test_only_post_save_path_uses_special_locator_and_downstream_find_is_unchang
     enable = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_stage_enable")
     stage_source = ast.get_source_segment(source, stage) or ""
     enable_source = ast.get_source_segment(source, enable) or ""
-    assert "_verify_persisted_resource_fallback" in stage_source
+    assert "_locate_known_main_row_in_current_view" in stage_source
+    assert "_verify_resource_fallback_by_known_main_row" in stage_source
     assert "_find_target_row_by_id(page, target_app_id" not in stage_source
-    assert "_find_target_row_by_id(page, target_app_id" in enable_source
+    assert "_click_unchecked_switch_by_known_main_row" in enable_source
+    assert "_locate_known_main_row_for_resource_fallback" in enable_source
