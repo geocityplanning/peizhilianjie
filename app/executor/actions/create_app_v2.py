@@ -5007,23 +5007,22 @@ def _click_unique_exact_visible_select_option(page, target_text, stage):
         if option_count != 1:
             _log_exact_select_diagnostic(stage, "option_count", dropdown_count, option_count)
             return False
-        option = options.nth(0)
-        classes = option.get_attribute("class") or ""
-        if not option.is_visible():
+        classes = options.get_attribute("class") or ""
+        if not options.is_visible():
             _log_exact_select_diagnostic(stage, "option_not_visible", dropdown_count, option_count)
             return False
-        if "is-disabled" in classes or option.get_attribute("aria-disabled") == "true":
+        if "is-disabled" in classes or options.get_attribute("aria-disabled") == "true":
             _log_exact_select_diagnostic(stage, "option_disabled", dropdown_count, option_count)
             return False
-        if (option.inner_text() or "").strip() != target_text:
+        if (options.inner_text() or "").strip() != target_text:
             _log_exact_select_diagnostic(stage, "option_text_mismatch", dropdown_count, option_count)
             return False
-        box = option.bounding_box()
+        box = options.bounding_box()
         if not isinstance(box, dict) or box.get("width", 0) <= 0 or box.get("height", 0) <= 0:
             _log_exact_select_diagnostic(stage, "option_box_invalid", dropdown_count, option_count)
             return False
         try:
-            option.click()
+            options.click()
         except Exception:
             _log_exact_select_diagnostic(stage, "locator_click_failed", dropdown_count, option_count, True)
             return False

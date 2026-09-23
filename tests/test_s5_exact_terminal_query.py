@@ -191,8 +191,9 @@ class _Option:
 
 
 class _Locator:
-    def __init__(self, items):
+    def __init__(self, items, *, click_items=None):
         self.items = list(items)
+        self.click_items = self.items if click_items is None else list(click_items)
         self.filter_calls = []
 
     def count(self):
@@ -205,11 +206,32 @@ class _Locator:
         self.filter_calls.append(kwargs)
         return self
 
+    def _strict_item(self, items=None):
+        candidates = self.items if items is None else items
+        if len(candidates) != 1:
+            raise RuntimeError("strict locator violation")
+        return candidates[0]
+
+    def is_visible(self):
+        return self._strict_item().is_visible()
+
+    def get_attribute(self, name):
+        return self._strict_item().get_attribute(name)
+
+    def inner_text(self):
+        return self._strict_item().inner_text()
+
+    def bounding_box(self):
+        return self._strict_item().bounding_box()
+
+    def click(self):
+        self._strict_item(self.click_items).click()
+
 
 class _Dropdown(_Option):
-    def __init__(self, options, **kwargs):
+    def __init__(self, options, *, click_options=None, **kwargs):
         super().__init__(**kwargs)
-        self.options = _Locator(options)
+        self.options = _Locator(options, click_items=click_options)
 
     def locator(self, selector):
         assert selector == ".el-select-dropdown__item:visible"
@@ -239,6 +261,21 @@ def test_locator_option_helper_rechecks_then_clicks_exact_option_once_without_mo
     assert not hasattr(page, "mouse")
     output = capsys.readouterr().out
     assert '"reason":"success"' in output and '"stage":"channel"' in output
+    assert "target" not in output
+
+
+def test_locator_option_helper_fails_closed_when_strict_click_sees_new_duplicate(capsys):
+    cap = _cap()
+    first = _Option(text="target")
+    second = _Option(text="target")
+    dropdown = _Dropdown([first], click_options=[first, second])
+    page = LocatorClickPage([dropdown])
+
+    assert cap._click_unique_exact_visible_select_option(page, "target", "channel") is False
+    assert first.clicks == 0 and second.clicks == 0
+    assert not hasattr(page, "mouse")
+    output = capsys.readouterr().out
+    assert '"reason":"locator_click_failed"' in output
     assert "target" not in output
 
 
