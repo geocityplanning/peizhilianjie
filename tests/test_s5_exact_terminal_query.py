@@ -241,12 +241,15 @@ class _Dropdown(_Option):
 class LocatorClickPage:
     """Offline Playwright-shaped page; the helper drives locator.click directly."""
 
-    def __init__(self, dropdowns):
+    def __init__(self, dropdowns, *, exact_options=None):
         self.dropdowns = _Locator(dropdowns)
+        self.exact_options = exact_options or (dropdowns[0].options if len(dropdowns) == 1 else _Locator([]))
 
     def locator(self, selector):
-        assert selector == ".el-select-dropdown:visible"
-        return self.dropdowns
+        if selector == ".el-select-dropdown:visible":
+            return self.dropdowns
+        assert ".el-select-dropdown__item:visible" in selector
+        return self.exact_options
 
 
 def test_locator_option_helper_rechecks_then_clicks_exact_option_once_without_mouse(capsys):
@@ -256,7 +259,7 @@ def test_locator_option_helper_rechecks_then_clicks_exact_option_once_without_mo
     page = LocatorClickPage([dropdown])
 
     assert cap._click_unique_exact_visible_select_option(page, "target", "channel") is True
-    assert dropdown.options.filter_calls and "has_text" in dropdown.options.filter_calls[0]
+    assert page.exact_options.filter_calls and "has_text" in page.exact_options.filter_calls[0]
     assert option.clicks == 1
     assert not hasattr(page, "mouse")
     output = capsys.readouterr().out
@@ -277,6 +280,34 @@ def test_locator_option_helper_fails_closed_when_strict_click_sees_new_duplicate
     output = capsys.readouterr().out
     assert '"reason":"locator_click_failed"' in output
     assert "target" not in output
+
+
+def test_locator_option_helper_fails_closed_when_new_dropdown_invalidates_global_guard(capsys):
+    cap = _cap()
+    first = _Option(text="target")
+    second_dropdown = _Dropdown([])
+    dropdown = _Dropdown([first])
+    page = LocatorClickPage([dropdown])
+    guarded_options = _Locator([first])
+
+    def strict_global_click():
+        # A second visible dropdown appears after initial count/attribute checks.
+        page.dropdowns.items.append(second_dropdown)
+        if page.dropdowns.count() != 1:
+            raise RuntimeError("strict global dropdown guard")
+        guarded_options._strict_item().click()
+
+    guarded_options.click = strict_global_click
+    page.exact_options = guarded_options
+
+    assert cap._click_unique_exact_visible_select_option(page, "target", "channel") is False
+    assert page.dropdowns.count() == 2
+    assert first.clicks == 0
+    assert not hasattr(page, "mouse")
+    output = capsys.readouterr().out
+    assert '"reason":"locator_click_failed"' in output
+    assert "target" not in output
+    assert second_dropdown.options.count() == 0  # The new menu need not contain the target.
 
 
 @pytest.mark.parametrize(

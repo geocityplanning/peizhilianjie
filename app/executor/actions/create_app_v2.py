@@ -4985,6 +4985,13 @@ def _exact_select_post_click_ok(stage, result):
     return False
 
 
+_UNIQUE_VISIBLE_DROPDOWN_SELECTOR = (
+    ".el-select-dropdown:visible"
+    ":not(:has(~ .el-select-dropdown:visible))"
+    ":not(.el-select-dropdown:visible ~ .el-select-dropdown:visible)"
+)
+
+
 def _click_unique_exact_visible_select_option(page, target_text, stage):
     """Use one Playwright locator click after exact, value-free revalidation."""
     if not isinstance(target_text, str) or not target_text:
@@ -4997,12 +5004,13 @@ def _click_unique_exact_visible_select_option(page, target_text, stage):
         if dropdown_count != 1:
             _log_exact_select_diagnostic(stage, "dropdown_count", dropdown_count)
             return False
-        dropdown = dropdowns.nth(0)
-        if not dropdown.is_visible() or dropdown.get_attribute("aria-hidden") == "true":
+        if not dropdowns.is_visible() or dropdowns.get_attribute("aria-hidden") == "true":
             _log_exact_select_diagnostic(stage, "option_not_visible", dropdown_count)
             return False
         exact_text = re.compile(r"^" + re.escape(target_text) + r"$")
-        options = dropdown.locator(".el-select-dropdown__item:visible").filter(has_text=exact_text)
+        options = page.locator(
+            _UNIQUE_VISIBLE_DROPDOWN_SELECTOR + " .el-select-dropdown__item:visible"
+        ).filter(has_text=exact_text)
         option_count = options.count()
         if option_count != 1:
             _log_exact_select_diagnostic(stage, "option_count", dropdown_count, option_count)
