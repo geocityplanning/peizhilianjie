@@ -5009,7 +5009,7 @@ def _enable_unknown_failure(message):
 
 
 _EXACT_SELECT_DIAGNOSTIC_REASONS = {
-    "success", "dropdown_count", "option_count", "option_not_visible", "option_disabled",
+    "success", "dropdown_count", "dropdown_count_unreadable", "option_count", "option_not_visible", "option_disabled",
     "option_text_mismatch", "option_box_invalid", "locator_click_failed",
     "dropdown_not_closed", "selected_value_mismatch",
 }
@@ -5021,10 +5021,12 @@ _EXACT_SELECT_CLOSE_POLL_MS = 50
 def _log_exact_select_diagnostic(stage, reason, dropdown_count=0, option_count=0, click_attempted=False, click_succeeded=False):
     """Emit fixed, value-free exact-select facts only; never expose filter values."""
     bounded = lambda value: min(max(int(value or 0), 0), 2)
+    count_readable = isinstance(dropdown_count, int) and dropdown_count >= 0
     print("[create_app] exact_select=" + json.dumps({
         "stage": stage if stage in {"channel", "application"} else "unknown",
         "reason": reason if reason in _EXACT_SELECT_DIAGNOSTIC_REASONS else "locator_click_failed",
-        "visible_dropdown_count": bounded(dropdown_count),
+        "visible_dropdown_count": bounded(dropdown_count) if count_readable else None,
+        "visible_dropdown_count_readable": count_readable,
         "exact_option_count": bounded(option_count),
         "click_attempted": bool(click_attempted),
         "click_succeeded": bool(click_succeeded),
@@ -5045,15 +5047,15 @@ def _close_and_wait_unique_select_dropdown(page, stage):
     """Passively close, then Escape once at most; never select or mutate a value."""
     elapsed_ms = 0
     escape_attempted = False
-    last_count = 0
+    last_count = None
     while True:
         try:
             count = page.locator(".el-select-dropdown:visible").count()
             if not isinstance(count, int) or count < 0:
-                return {"ok": False, "reason": "dropdown_count", "visible_dropdown_count": last_count, "escape_attempted": escape_attempted}
+                return {"ok": False, "reason": "dropdown_count_unreadable", "visible_dropdown_count": None, "escape_attempted": escape_attempted}
             last_count = count
         except Exception:
-            return {"ok": False, "reason": "dropdown_count", "visible_dropdown_count": last_count, "escape_attempted": escape_attempted}
+            return {"ok": False, "reason": "dropdown_count_unreadable", "visible_dropdown_count": None, "escape_attempted": escape_attempted}
         if count == 0:
             return {"ok": True, "reason": "success", "visible_dropdown_count": 0, "escape_attempted": escape_attempted}
         if count != 1:
@@ -5082,10 +5084,14 @@ def _click_unique_exact_visible_select_option(page, target_text, stage):
     if not isinstance(target_text, str) or not target_text:
         _log_exact_select_diagnostic(stage, "option_text_mismatch")
         return False
-    dropdown_count = option_count = 0
+    dropdown_count = None
+    option_count = 0
     try:
         dropdowns = page.locator(".el-select-dropdown:visible")
         dropdown_count = dropdowns.count()
+        if not isinstance(dropdown_count, int) or dropdown_count < 0:
+            _log_exact_select_diagnostic(stage, "dropdown_count_unreadable", dropdown_count)
+            return False
         if dropdown_count != 1:
             _log_exact_select_diagnostic(stage, "dropdown_count", dropdown_count)
             return False
@@ -5124,7 +5130,12 @@ def _click_unique_exact_visible_select_option(page, target_text, stage):
         _log_exact_select_diagnostic(stage, "success", dropdown_count, option_count, True, True)
         return True
     except Exception:
-        _log_exact_select_diagnostic(stage, "locator_click_failed", dropdown_count, option_count)
+        _log_exact_select_diagnostic(
+            stage,
+            "dropdown_count_unreadable" if dropdown_count is None else "locator_click_failed",
+            dropdown_count,
+            option_count,
+        )
         return False
 
 
@@ -5204,7 +5215,17 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
       }).filter(Boolean);
       if (matches.length !== 1) return {ok: false, reason: 'selected_value_mismatch'};
       const input = matches[0].channel.querySelector('input.el-input__inner');
-      const tags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
+      const tagValues = select => {
+        const tagContainers = Array.from(select.querySelectorAll('.el-tag'));
+        if (tagContainers.length) return tagContainers.map(tag => {
+          const leaf = tag.querySelector('.el-tag__content') || tag.querySelector('.el-select__tags-text');
+          return leaf ? (leaf.innerText || '').trim() : null;
+        });
+        const fallbackText = Array.from(select.querySelectorAll('.el-select__tags-text'));
+        return (fallbackText.length ? fallbackText : Array.from(select.querySelectorAll('.el-tag__content')))
+          .map(tag => (tag.innerText || '').trim());
+      };
+      const tags = tagValues(matches[0].channel);
       const selected = tags.length
         ? tags.length === 1 && tags[0] === channelName
         : Boolean(input && (input.value || '').trim() === channelName);
@@ -5269,8 +5290,18 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
       }).filter(Boolean);
       if (matches.length !== 1) return {ok: false, reason: 'selected_value_mismatch'};
       const channelInput = matches[0].channel.querySelector('input.el-input__inner');
-      const channelTags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
-      const appTags = Array.from(matches[0].appSelect.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
+      const tagValues = select => {
+        const tagContainers = Array.from(select.querySelectorAll('.el-tag'));
+        if (tagContainers.length) return tagContainers.map(tag => {
+          const leaf = tag.querySelector('.el-tag__content') || tag.querySelector('.el-select__tags-text');
+          return leaf ? (leaf.innerText || '').trim() : null;
+        });
+        const fallbackText = Array.from(select.querySelectorAll('.el-select__tags-text'));
+        return (fallbackText.length ? fallbackText : Array.from(select.querySelectorAll('.el-tag__content')))
+          .map(tag => (tag.innerText || '').trim());
+      };
+      const channelTags = tagValues(matches[0].channel);
+      const appTags = tagValues(matches[0].appSelect);
       const channelSelected = channelTags.length
         ? channelTags.length === 1 && channelTags[0] === channelName
         : Boolean(channelInput && (channelInput.value || '').trim() === channelName);
@@ -5309,8 +5340,18 @@ def _click_exact_terminal_search_once(page, channel_name, app_name):
       }).filter(Boolean);
       if (matches.length !== 1) return false;
       const channelInput = matches[0].channel.querySelector('input.el-input__inner');
-      const channelTags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
-      const appTags = Array.from(matches[0].appSelect.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
+      const tagValues = select => {
+        const tagContainers = Array.from(select.querySelectorAll('.el-tag'));
+        if (tagContainers.length) return tagContainers.map(tag => {
+          const leaf = tag.querySelector('.el-tag__content') || tag.querySelector('.el-select__tags-text');
+          return leaf ? (leaf.innerText || '').trim() : null;
+        });
+        const fallbackText = Array.from(select.querySelectorAll('.el-select__tags-text'));
+        return (fallbackText.length ? fallbackText : Array.from(select.querySelectorAll('.el-tag__content')))
+          .map(tag => (tag.innerText || '').trim());
+      };
+      const channelTags = tagValues(matches[0].channel);
+      const appTags = tagValues(matches[0].appSelect);
       const channelSelected = channelTags.length
         ? channelTags.length === 1 && channelTags[0] === channelName
         : Boolean(channelInput && (channelInput.value || '').trim() === channelName);

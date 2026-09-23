@@ -331,6 +331,25 @@ def test_locator_option_helper_rechecks_then_clicks_exact_option_once_without_mo
     assert "target" not in output
 
 
+def test_initial_visible_dropdown_count_error_is_not_projected_as_zero(capsys):
+    cap = _cap()
+
+    class CountErrorPage:
+        def locator(self, selector):
+            assert selector == ".el-select-dropdown:visible"
+            class BrokenLocator:
+                def count(self):
+                    raise RuntimeError("unreadable")
+            return BrokenLocator()
+
+    assert cap._click_unique_exact_visible_select_option(CountErrorPage(), "target", "channel") is False
+    output = capsys.readouterr().out
+    assert '"reason":"dropdown_count_unreadable"' in output
+    assert '"visible_dropdown_count":null' in output
+    assert '"visible_dropdown_count_readable":false' in output
+    assert "target" not in output
+
+
 def test_locator_option_helper_fails_closed_when_strict_click_sees_new_duplicate(capsys):
     cap = _cap()
     first = _Option(text="target")
@@ -497,11 +516,17 @@ def test_close_helper_rejects_multiple_or_unreadable_dropdowns_without_escape():
     assert multiple.keyboard.presses == [] and multiple.waits == []
 
     unreadable = CloseDropdownPage([RuntimeError("unreadable")])
-    assert cap._close_and_wait_unique_select_dropdown(unreadable, "application")["ok"] is False
+    result = cap._close_and_wait_unique_select_dropdown(unreadable, "application")
+    assert result == {
+        "ok": False, "reason": "dropdown_count_unreadable", "visible_dropdown_count": None,
+        "escape_attempted": False,
+    }
     assert unreadable.keyboard.presses == [] and unreadable.waits == []
 
 
-@pytest.mark.parametrize("reason, count", [("dropdown_not_closed", 1), ("dropdown_count", 2)])
+@pytest.mark.parametrize("reason, count", [
+    ("dropdown_not_closed", 1), ("dropdown_count", 2), ("dropdown_count_unreadable", None),
+])
 def test_prepare_close_failure_logs_real_count_and_never_opens_application(monkeypatch, capsys, reason, count):
     cap = _cap()
     page = ExactSelectPage([{"opened": True}])
@@ -514,7 +539,9 @@ def test_prepare_close_failure_logs_real_count_and_never_opens_application(monke
     assert cap._prepare_exact_terminal_filters(page, "channel-secret", "application-secret") is False
     assert pointers == [("channel-secret", "channel")]
     output = capsys.readouterr().out
-    assert f'"visible_dropdown_count":{count}' in output
+    expected_count = "null" if count is None else str(count)
+    assert f'"visible_dropdown_count":{expected_count}' in output
+    assert ('"visible_dropdown_count_readable":false' in output) is (count is None)
     assert "channel-secret" not in output and "application-secret" not in output
 
 
@@ -538,6 +565,10 @@ def test_prepare_exact_filters_orders_close_and_exact_verification_before_app_po
     assert "length !== 0" not in page.scripts[3]
     assert "tags.length === 1" in page.scripts[1]
     assert "channelTags.length === 1" in page.scripts[3] and "appTags.length === 1" in page.scripts[3]
+    assert page.scripts[1].count("tagContainers") >= 2
+    assert page.scripts[3].count("tagContainers") >= 2
+    assert ".el-tag__content, .el-select__tags-text" not in page.scripts[1]
+    assert ".el-tag__content, .el-select__tags-text" not in page.scripts[3]
     assert "HTMLInputElement.prototype" not in "\n".join(page.scripts)
     assert "dispatchEvent" not in "\n".join(page.scripts)
 
@@ -568,11 +599,24 @@ def test_prepare_exact_filters_fails_closed_without_lower_stage_or_search(monkey
     assert len(page.scripts) == expected_evaluations
 
 
+def test_terminal_tag_guards_count_physical_containers_in_all_three_gates():
+    cap = _cap()
+    source = inspect.getsource(cap._prepare_exact_terminal_filters) + inspect.getsource(cap._click_exact_terminal_search_once)
+    # One physical .el-tag may contain both leaf classes; it is mapped once. Two
+    # physical containers yield two values and fail each length===1 exact guard.
+    assert source.count("const tagContainers = Array.from(select.querySelectorAll('.el-tag'))") == 3
+    assert source.count("tagContainers.map(tag =>") == 3
+    assert source.count("const fallbackText = Array.from(select.querySelectorAll('.el-select__tags-text'))") == 3
+    assert ".el-tag__content, .el-select__tags-text" not in source
+    assert source.count("length === 1") >= 5
+
+
 def test_contract_documents_exact_terminal_dropdown_close_and_no_extra_tag_guards():
     contract = (Path(__file__).parents[1] / "contracts" / "hermes-http-v1.md").read_text(encoding="utf-8")
     assert "每个唯一精确 option 至多物理点击一次" in contract
     assert "至多一次 Escape 并在有界窗口内确认关闭" in contract
     assert "tag/输入值必须恰好为目标且无额外值" in contract
+    assert "tag 按物理 `.el-tag` 容器计数，每个容器只取一个叶子文本" in contract
     assert "两个筛选均复核后才原子触发一次精确“搜索”" in contract
 
 
