@@ -4956,39 +4956,81 @@ def _enable_unknown_failure(message):
     }
 
 
-def _click_unique_exact_visible_select_option(page, target_text):
-    """Use one real pointer click after locator-level exact-option revalidation."""
+_EXACT_SELECT_DIAGNOSTIC_REASONS = {
+    "success", "dropdown_count", "option_count", "option_not_visible", "option_disabled",
+    "option_text_mismatch", "option_box_invalid", "locator_click_failed",
+    "dropdown_not_closed", "selected_value_mismatch",
+}
+
+
+def _log_exact_select_diagnostic(stage, reason, dropdown_count=0, option_count=0, click_attempted=False, click_succeeded=False):
+    """Emit fixed, value-free exact-select facts only; never expose filter values."""
+    bounded = lambda value: min(max(int(value or 0), 0), 2)
+    print("[create_app] exact_select=" + json.dumps({
+        "stage": stage if stage in {"channel", "application"} else "unknown",
+        "reason": reason if reason in _EXACT_SELECT_DIAGNOSTIC_REASONS else "locator_click_failed",
+        "visible_dropdown_count": bounded(dropdown_count),
+        "exact_option_count": bounded(option_count),
+        "click_attempted": bool(click_attempted),
+        "click_succeeded": bool(click_succeeded),
+    }, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+
+
+def _exact_select_post_click_ok(stage, result):
+    """Project a post-click DOM gate to fixed diagnostics without values."""
+    if isinstance(result, dict) and result.get("ok") is True:
+        return True
+    reason = result.get("reason") if isinstance(result, dict) else "selected_value_mismatch"
+    _log_exact_select_diagnostic(stage, reason)
+    return False
+
+
+def _click_unique_exact_visible_select_option(page, target_text, stage):
+    """Use one Playwright locator click after exact, value-free revalidation."""
     if not isinstance(target_text, str) or not target_text:
+        _log_exact_select_diagnostic(stage, "option_text_mismatch")
         return False
+    dropdown_count = option_count = 0
     try:
         dropdowns = page.locator(".el-select-dropdown:visible")
-        if dropdowns.count() != 1:
+        dropdown_count = dropdowns.count()
+        if dropdown_count != 1:
+            _log_exact_select_diagnostic(stage, "dropdown_count", dropdown_count)
             return False
         dropdown = dropdowns.nth(0)
         if not dropdown.is_visible() or dropdown.get_attribute("aria-hidden") == "true":
+            _log_exact_select_diagnostic(stage, "option_not_visible", dropdown_count)
             return False
         exact_text = re.compile(r"^" + re.escape(target_text) + r"$")
         options = dropdown.locator(".el-select-dropdown__item:visible").filter(has_text=exact_text)
-        if options.count() != 1:
+        option_count = options.count()
+        if option_count != 1:
+            _log_exact_select_diagnostic(stage, "option_count", dropdown_count, option_count)
             return False
         option = options.nth(0)
         classes = option.get_attribute("class") or ""
-        if (
-            not option.is_visible()
-            or "is-disabled" in classes
-            or option.get_attribute("aria-disabled") == "true"
-            or (option.inner_text() or "").strip() != target_text
-        ):
+        if not option.is_visible():
+            _log_exact_select_diagnostic(stage, "option_not_visible", dropdown_count, option_count)
+            return False
+        if "is-disabled" in classes or option.get_attribute("aria-disabled") == "true":
+            _log_exact_select_diagnostic(stage, "option_disabled", dropdown_count, option_count)
+            return False
+        if (option.inner_text() or "").strip() != target_text:
+            _log_exact_select_diagnostic(stage, "option_text_mismatch", dropdown_count, option_count)
             return False
         box = option.bounding_box()
         if not isinstance(box, dict) or box.get("width", 0) <= 0 or box.get("height", 0) <= 0:
+            _log_exact_select_diagnostic(stage, "option_box_invalid", dropdown_count, option_count)
             return False
-        page.mouse.click(
-            float(box.get("x", 0)) + float(box["width"]) / 2,
-            float(box.get("y", 0)) + float(box["height"]) / 2,
-        )
+        try:
+            option.click()
+        except Exception:
+            _log_exact_select_diagnostic(stage, "locator_click_failed", dropdown_count, option_count, True)
+            return False
+        _log_exact_select_diagnostic(stage, "success", dropdown_count, option_count, True, True)
         return True
     except Exception:
+        _log_exact_select_diagnostic(stage, "locator_click_failed", dropdown_count, option_count)
         return False
 
 
@@ -5039,7 +5081,7 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
     if not opened.get("opened"):
         return False
     page.wait_for_timeout(300)
-    if not _click_unique_exact_visible_select_option(page, channel_name):
+    if not _click_unique_exact_visible_select_option(page, channel_name, "channel"):
         return False
     page.wait_for_timeout(300)
     channel_verified = page.evaluate("""
@@ -5050,7 +5092,7 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
         return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
           node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
       };
-      if (Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible).length !== 0) return false;
+      if (Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible).length !== 0) return {ok: false, reason: 'dropdown_not_closed'};
       const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible);
       const matches = forms.map(form => {
         const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => {
@@ -5064,13 +5106,14 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
         });
         return channels.length === 1 && apps.length === 1 ? {channel: channels[0]} : null;
       }).filter(Boolean);
-      if (matches.length !== 1) return false;
+      if (matches.length !== 1) return {ok: false, reason: 'selected_value_mismatch'};
       const input = matches[0].channel.querySelector('input.el-input__inner');
       const tags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
-      return Boolean((input && (input.value || '').trim() === channelName) || tags.includes(channelName));
+      const selected = Boolean((input && (input.value || '').trim() === channelName) || tags.includes(channelName));
+      return {ok: selected, reason: selected ? 'success' : 'selected_value_mismatch'};
     }
     """, channel_name)
-    if channel_verified is not True:
+    if not _exact_select_post_click_ok("channel", channel_verified):
         return False
     app_opened = page.evaluate("""
     () => {
@@ -5099,7 +5142,7 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
     if app_opened is not True:
         return False
     page.wait_for_timeout(300)
-    if not _click_unique_exact_visible_select_option(page, app_name):
+    if not _click_unique_exact_visible_select_option(page, app_name, "application"):
         return False
     page.wait_for_timeout(300)
     configured = page.evaluate("""
@@ -5110,7 +5153,7 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
         return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
           node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
       };
-      if (Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible).length !== 0) return false;
+      if (Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible).length !== 0) return {ok: false, reason: 'dropdown_not_closed'};
       const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible);
       const matches = forms.map(form => {
         const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => {
@@ -5124,17 +5167,18 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
         });
         return channels.length === 1 && apps.length === 1 ? {channel: channels[0], app: apps[0].querySelector('input.el-input__inner'), appSelect: apps[0].querySelector('.el-select')} : null;
       }).filter(Boolean);
-      if (matches.length !== 1) return false;
+      if (matches.length !== 1) return {ok: false, reason: 'selected_value_mismatch'};
       const channelInput = matches[0].channel.querySelector('input.el-input__inner');
       const channelTags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
       const appTags = Array.from(matches[0].appSelect.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
-      return Boolean(
+      const selected = Boolean(
         ((channelInput && (channelInput.value || '').trim() === channelName) || channelTags.includes(channelName)) &&
         ((matches[0].app.value || '').trim() === appName || appTags.includes(appName))
       );
+      return {ok: selected, reason: selected ? 'success' : 'selected_value_mismatch'};
     }
     """, {"channelName": channel_name, "appName": app_name})
-    return configured is True
+    return _exact_select_post_click_ok("application", configured)
 
 
 def _click_exact_terminal_search_once(page, channel_name, app_name):

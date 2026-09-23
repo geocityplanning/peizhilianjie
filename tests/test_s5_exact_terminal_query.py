@@ -159,12 +159,14 @@ def test_terminal_query_fails_when_exact_filter_form_is_not_unique(monkeypatch):
 
 
 class _Option:
-    def __init__(self, *, text="target", visible=True, classes="", aria_disabled=None, box=None):
+    def __init__(self, *, text="target", visible=True, classes="", aria_disabled=None, box=None, click_error=False):
         self.text = text
         self.visible = visible
         self.classes = classes
         self.aria_disabled = aria_disabled
         self.box = {"x": 10, "y": 20, "width": 30, "height": 40} if box is None else box
+        self.click_error = click_error
+        self.clicks = 0
 
     def is_visible(self):
         return self.visible
@@ -181,6 +183,11 @@ class _Option:
 
     def bounding_box(self):
         return self.box
+
+    def click(self):
+        self.clicks += 1
+        if self.click_error:
+            raise RuntimeError("actionability failure")
 
 
 class _Locator:
@@ -209,63 +216,71 @@ class _Dropdown(_Option):
         return self.options
 
 
-class _Mouse:
-    def __init__(self, error=False):
-        self.error = error
-        self.clicks = []
+class LocatorClickPage:
+    """Offline Playwright-shaped page; the helper drives locator.click directly."""
 
-    def click(self, x, y):
-        if self.error:
-            raise RuntimeError("click failure")
-        self.clicks.append((x, y))
-
-
-class LocatorPointerPage:
-    """Offline Playwright-shaped page; the helper drives every locator/mouse branch."""
-
-    def __init__(self, dropdowns, *, mouse_error=False):
+    def __init__(self, dropdowns):
         self.dropdowns = _Locator(dropdowns)
-        self.mouse = _Mouse(mouse_error)
 
     def locator(self, selector):
         assert selector == ".el-select-dropdown:visible"
         return self.dropdowns
 
 
-def test_real_pointer_option_helper_uses_locator_rechecks_then_one_mouse_click():
+def test_locator_option_helper_rechecks_then_clicks_exact_option_once_without_mouse(capsys):
     cap = _cap()
     option = _Option(text="target")
     dropdown = _Dropdown([option])
-    page = LocatorPointerPage([dropdown])
+    page = LocatorClickPage([dropdown])
 
-    assert cap._click_unique_exact_visible_select_option(page, "target") is True
+    assert cap._click_unique_exact_visible_select_option(page, "target", "channel") is True
     assert dropdown.options.filter_calls and "has_text" in dropdown.options.filter_calls[0]
-    assert page.mouse.clicks == [(25.0, 40.0)]
+    assert option.clicks == 1
+    assert not hasattr(page, "mouse")
+    output = capsys.readouterr().out
+    assert '"reason":"success"' in output and '"stage":"channel"' in output
+    assert "target" not in output
 
 
 @pytest.mark.parametrize(
-    ("dropdowns", "target", "mouse_error"),
+    ("dropdowns", "target", "expected_reason", "expected_clicks"),
     [
-        ([], "target", False),
-        ([_Dropdown([]), _Dropdown([])], "target", False),
-        ([_Dropdown([], visible=False)], "target", False),
-        ([_Dropdown([], aria_disabled="true")], "target", False),
-        ([_Dropdown([])], "target", False),
-        ([_Dropdown([_Option(text="target"), _Option(text="target")])], "target", False),
-        ([_Dropdown([_Option(text="wrong")])], "target", False),
-        ([_Dropdown([_Option(text="target", visible=False)])], "target", False),
-        ([_Dropdown([_Option(text="target", classes="is-disabled")])], "target", False),
-        ([_Dropdown([_Option(text="target", aria_disabled="true")])], "target", False),
-        ([_Dropdown([_Option(text="target", box={})])], "target", False),
-        ([_Dropdown([_Option(text="target")])], "target", True),
+        ([], "target", "dropdown_count", 0),
+        ([_Dropdown([]), _Dropdown([])], "target", "dropdown_count", 0),
+        ([_Dropdown([], visible=False)], "target", "option_not_visible", 0),
+        ([_Dropdown([], aria_disabled="true")], "target", "option_count", 0),
+        ([_Dropdown([])], "target", "option_count", 0),
+        ([_Dropdown([_Option(text="target"), _Option(text="target")])], "target", "option_count", 0),
+        ([_Dropdown([_Option(text="wrong")])], "target", "option_text_mismatch", 0),
+        ([_Dropdown([_Option(text="target", visible=False)])], "target", "option_not_visible", 0),
+        ([_Dropdown([_Option(text="target", classes="is-disabled")])], "target", "option_disabled", 0),
+        ([_Dropdown([_Option(text="target", aria_disabled="true")])], "target", "option_disabled", 0),
+        ([_Dropdown([_Option(text="target", box={})])], "target", "option_box_invalid", 0),
+        ([_Dropdown([_Option(text="target", click_error=True)])], "target", "locator_click_failed", 1),
     ],
 )
-def test_real_pointer_option_helper_fails_closed_for_locator_and_click_guards(dropdowns, target, mouse_error):
+def test_locator_option_helper_fails_closed_with_value_free_category(dropdowns, target, expected_reason, expected_clicks, capsys):
     cap = _cap()
-    page = LocatorPointerPage(dropdowns, mouse_error=mouse_error)
+    page = LocatorClickPage(dropdowns)
 
-    assert cap._click_unique_exact_visible_select_option(page, target) is False
-    assert page.mouse.clicks == []
+    assert cap._click_unique_exact_visible_select_option(page, target, "application") is False
+    click_count = sum(option.clicks for dropdown in dropdowns for option in dropdown.options.items)
+    assert click_count == expected_clicks
+    assert not hasattr(page, "mouse")
+    output = capsys.readouterr().out
+    assert f'"reason":"{expected_reason}"' in output and '"stage":"application"' in output
+    assert target not in output and "http" not in output and "body" not in output and "header" not in output
+
+
+def test_post_click_diagnostics_are_fixed_and_value_free(capsys):
+    cap = _cap()
+
+    assert cap._exact_select_post_click_ok("channel", {"ok": False, "reason": "dropdown_not_closed"}) is False
+    assert cap._exact_select_post_click_ok("application", {"ok": False, "reason": "selected_value_mismatch"}) is False
+    output = capsys.readouterr().out
+    assert '"reason":"dropdown_not_closed"' in output
+    assert '"reason":"selected_value_mismatch"' in output
+    assert "channel-name" not in output and "application-name" not in output
 
 
 class ExactSelectPage:
@@ -289,12 +304,12 @@ class ExactSelectPage:
 
 def test_prepare_exact_filters_orders_channel_pointer_then_app_pointer_before_search(monkeypatch):
     cap = _cap()
-    page = ExactSelectPage([{"opened": True}, True, True, True])
+    page = ExactSelectPage([{"opened": True}, {"ok": True}, True, {"ok": True}])
     pointer_targets = []
-    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target: pointer_targets.append(target) or True)
+    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target, stage: pointer_targets.append((target, stage)) or True)
 
     assert cap._prepare_exact_terminal_filters(page, "channel", "application") is True
-    assert pointer_targets == ["channel", "application"]
+    assert pointer_targets == [("channel", "channel"), ("application", "application")]
     assert page.payloads == [None, "channel", None, {"channelName": "channel", "appName": "application"}]
     assert page.waits == [300, 300, 300, 300]
     assert "length !== 0" in page.scripts[1]
@@ -308,11 +323,11 @@ def test_prepare_exact_filters_orders_channel_pointer_then_app_pointer_before_se
     ("results", "pointer_results", "expected_evaluations", "expected_pointers"),
     [
         ([{"opened": False}], [], 1, []),
-        ([{"opened": True}], [False], 1, ["channel"]),
-        ([{"opened": True}, False], [True], 2, ["channel"]),
-        ([{"opened": True}, True, False], [True], 3, ["channel"]),
-        ([{"opened": True}, True, True], [True, False], 3, ["channel", "application"]),
-        ([{"opened": True}, True, True, False], [True, True], 4, ["channel", "application"]),
+        ([{"opened": True}], [False], 1, [("channel", "channel")]),
+        ([{"opened": True}, {"ok": False, "reason": "dropdown_not_closed"}], [True], 2, [("channel", "channel")]),
+        ([{"opened": True}, {"ok": True}, False], [True], 3, [("channel", "channel")]),
+        ([{"opened": True}, {"ok": True}, True], [True, False], 3, [("channel", "channel"), ("application", "application")]),
+        ([{"opened": True}, {"ok": True}, True, {"ok": False, "reason": "selected_value_mismatch"}], [True, True], 4, [("channel", "channel"), ("application", "application")]),
     ],
 )
 def test_prepare_exact_filters_fails_closed_without_lower_stage_or_search(monkeypatch, results, pointer_results, expected_evaluations, expected_pointers):
@@ -320,7 +335,7 @@ def test_prepare_exact_filters_fails_closed_without_lower_stage_or_search(monkey
     page = ExactSelectPage(results)
     targets = []
     pointer_results = iter(pointer_results)
-    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target: targets.append(target) or next(pointer_results))
+    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target, stage: targets.append((target, stage)) or next(pointer_results))
 
     assert cap._prepare_exact_terminal_filters(page, "channel", "application") is False
     assert targets == expected_pointers
