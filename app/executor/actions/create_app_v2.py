@@ -3830,6 +3830,8 @@ def _extract_list_structure(body):
         items = data.get("records")
     if items is None:
         items = data.get("rows")
+    if items is None:
+        items = data.get("appInfoList")
     if isinstance(items, list):
         meta["item_count"] = len(items)
     for key in ("pageCount", "pages", "page_count"):

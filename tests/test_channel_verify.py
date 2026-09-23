@@ -5,8 +5,10 @@ These tests never connect to UAT, Chrome, or CDP, and never create or save.
 """
 from __future__ import annotations
 
+import json
 import sys
 import types
+from pathlib import Path
 
 
 def _stub_login_and_import():
@@ -689,6 +691,35 @@ def test_extract_list_structure_requires_total_list_and_page_count():
     assert cap._extract_list_structure('{"data":{"totalCount":80}}') is None
     assert cap._extract_list_structure("not-json") is None
     assert cap._extract_list_structure("") is None
+
+
+def test_contract_documents_confirmed_app_info_list_structure():
+    contract = (Path(__file__).parents[1] / "contracts" / "hermes-http-v1.md").read_text(encoding="utf-8")
+    for field in ("data.totalCount", "data.appInfoList", "data.pageCount"):
+        assert field in contract
+
+
+def test_extract_list_structure_accepts_only_confirmed_app_info_list_alias():
+    cap = _stub_login_and_import()
+    assert cap._extract_list_structure('{"data":{"totalCount":"946","appInfoList":[],"pageCount":"48"}}') == {
+        "total_count": 946, "item_count": 0, "page_count": 48,
+    }
+    for body in (
+        '{"data":{"totalCount":"946","appInfoList":{},"pageCount":"48"}}',
+        '{"data":{"appInfoList":[],"pageCount":"48"}}',
+        '{"data":{"totalCount":"946","appInfoList":[]}}',
+        '{"data":{"totalCount":"bad","appInfoList":[],"pageCount":"48"}}',
+        '{"data":{"totalCount":"946","appInfoList":[],"pageCount":"bad"}}',
+        '{"data":{"totalCount":"946","unregisteredArray":[],"pageCount":"48"}}',
+    ):
+        assert cap._extract_list_structure(body) is None
+
+
+def test_extract_list_structure_preserves_legacy_list_records_rows_priority():
+    cap = _stub_login_and_import()
+    for key in ("list", "records", "rows"):
+        body = json.dumps({"data": {"totalCount": 1, key: [{}], "pageCount": 1, "appInfoList": []}})
+        assert cap._extract_list_structure(body) == {"total_count": 1, "item_count": 1, "page_count": 1}
 
 
 def test_2xx_already_present_final_multipage_before_wait_passes():
