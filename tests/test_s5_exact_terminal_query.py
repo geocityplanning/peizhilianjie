@@ -160,11 +160,12 @@ def test_terminal_query_fails_when_exact_filter_form_is_not_unique(monkeypatch):
 
 
 class _Option:
-    def __init__(self, *, text="target", visible=True, classes="", aria_disabled=None, box=None, click_error=False):
+    def __init__(self, *, text="target", visible=True, classes="", aria_disabled=None, aria_selected=None, box=None, click_error=False):
         self.text = text
         self.visible = visible
         self.classes = classes
         self.aria_disabled = aria_disabled
+        self.aria_selected = aria_selected
         self.box = {"x": 10, "y": 20, "width": 30, "height": 40} if box is None else box
         self.click_error = click_error
         self.clicks = 0
@@ -177,6 +178,8 @@ class _Option:
             return self.classes
         if name == "aria-disabled":
             return self.aria_disabled
+        if name == "aria-selected":
+            return self.aria_selected
         return None
 
     def inner_text(self):
@@ -329,6 +332,21 @@ def test_locator_option_helper_rechecks_then_clicks_exact_option_once_without_mo
     output = capsys.readouterr().out
     assert '"reason":"success"' in output and '"stage":"channel"' in output
     assert "target" not in output
+
+
+@pytest.mark.parametrize(("classes", "aria", "expected"), [
+    ("el-select-dropdown__item selected", None, "selected"),
+    ("el-select-dropdown__item is-selected", None, "selected"),
+    ("el-select-dropdown__item is-selected", "true", "selected"),
+    ("el-select-dropdown__item", "false", "unselected"),
+    ("el-select-dropdown__item selected", "false", "unreadable"),
+    ("el-select-dropdown__item", "true", "unreadable"),
+    (None, None, "unreadable"),
+])
+def test_exact_option_selected_state_tri_state_matrix(classes, aria, expected):
+    cap = _cap()
+    page = LocatorClickPage([_Dropdown([_Option(text="target", classes=classes, aria_selected=aria)])])
+    assert cap._read_exact_terminal_option_selected_state(page, "target") == expected
 
 
 def test_initial_visible_dropdown_count_error_is_not_projected_as_zero(capsys):
@@ -487,9 +505,15 @@ def test_close_helper_allows_passive_close_without_escape_and_projects_real_zero
 
     result = cap._close_and_wait_unique_select_dropdown(page, "channel")
 
-    assert result == {"ok": True, "reason": "success", "visible_dropdown_count": 0, "escape_attempted": False}
+    assert result == {"ok": True, "reason": "success", "visible_dropdown_count": 0, "escape_attempted": False, "close_mode": "passive"}
     assert page.keyboard.presses == []
     assert page.waits == [50, 50, 50]
+
+
+def test_close_helper_projects_not_needed_when_no_dropdown_is_visible():
+    cap = _cap()
+    result = cap._close_and_wait_unique_select_dropdown(CloseDropdownPage([0]), "channel")
+    assert result["ok"] is True and result["close_mode"] == "not_needed"
 
 
 def test_close_helper_uses_escape_once_then_closes_or_fails_closed():
@@ -592,6 +616,55 @@ def test_empty_selected_option_conflict_stops_before_click_or_application(monkey
 
     assert cap._prepare_exact_terminal_filters(ExactSelectPage([]), "channel", "application") is False
     assert calls == ["open"]
+
+
+@pytest.mark.parametrize("failure", ["channel_open", "channel_click", "app_open", "app_click"])
+def test_prepare_failure_branches_never_reach_lower_option_or_search(monkeypatch, failure):
+    cap = _cap()
+    page = ExactSelectPage([])
+    calls = []
+    states = iter([{"pre_state": "empty"}] if failure.startswith("channel") else [{"pre_state": "exact_one"}, {"pre_state": "empty"}])
+    monkeypatch.setattr(cap, "_read_exact_terminal_select_state", lambda *_args: next(states))
+    monkeypatch.setattr(cap, "_read_exact_terminal_option_selected_state", lambda *_args: "unselected")
+    monkeypatch.setattr(cap, "_wait_for_exact_terminal_select_stable", lambda *_args: (True, {"pre_state": "exact_one"}))
+    monkeypatch.setattr(cap, "_close_and_wait_unique_select_dropdown", lambda _page, stage: calls.append(("close", stage)) or {"ok": True, "visible_dropdown_count": 0, "escape_attempted": False, "close_mode": "not_needed"})
+    failure_stage = "application" if failure.startswith("app_") else "channel"
+    failure_kind = "open" if failure.endswith("_open") else "click"
+    monkeypatch.setattr(cap, "_open_exact_terminal_filter", lambda _page, stage: calls.append(("open", stage)) or not (stage == failure_stage and failure_kind == "open"))
+    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, _target, stage: calls.append(("click", stage)) or not (stage == failure_stage and failure_kind == "click"))
+
+    assert cap._prepare_exact_terminal_filters(page, "channel", "application") is False
+    if failure.startswith("channel"):
+        assert ("open", "application") not in calls and ("click", "application") not in calls
+    else:
+        assert ("click", "application") not in calls if failure == "app_open" else calls.count(("click", "application")) == 1
+
+
+def test_state_reader_uses_dom_fixture_buckets_without_returning_values():
+    cap = _cap()
+
+    class FixturePage:
+        def __init__(self, facts):
+            self.facts = facts
+            self.scripts = []
+        def evaluate(self, script, payload):
+            self.scripts.append(script)
+            return self.facts[payload["stage"]]
+
+    exact = {"pre_state": "exact_one", "physical_tag_count": 1, "visible_tag_count": 1, "readable_leaf_count": 1, "exact_match_count": 1, "main_input_present": True, "main_input_matches": True}
+    empty = {"pre_state": "empty", "physical_tag_count": 0, "visible_tag_count": 0, "readable_leaf_count": 0, "exact_match_count": 0, "main_input_present": True, "main_input_has_value": False}
+    page = FixturePage({"channel": exact, "application": empty})
+    assert cap._read_exact_terminal_select_state(page, "channel-secret", "channel")["pre_state"] == "exact_one"
+    assert cap._read_exact_terminal_select_state(page, "application-secret", "application")["pre_state"] == "empty"
+    assert all("selected_item_present" in script and "search_input_has_value" in script for script in page.scripts)
+    assert "channel-secret" not in str(page.scripts) and "application-secret" not in str(page.scripts)
+
+
+def test_state_reader_blocks_selected_item_search_input_and_tag_input_conflict_by_dom_rules():
+    cap = _cap()
+    source = inspect.getsource(cap._read_exact_terminal_select_state)
+    assert "base.selected_item_present || base.search_input_has_value" in source
+    assert "base.main_input_has_value && !base.main_input_matches" in source
 
 
 def test_unstable_double_read_stops_without_another_click(monkeypatch):
