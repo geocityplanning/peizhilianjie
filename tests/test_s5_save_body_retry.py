@@ -205,6 +205,27 @@ def test_loading_finished_delay_does_not_start_evidence_deadline(monkeypatch):
     assert candidate["evidence_attempts"] == 1
 
 
+def test_slow_started_cdp_read_ends_evidence_without_a_followup_read(monkeypatch):
+    cap, clock, session, _page, observer, _request = _setup(monkeypatch, [{}, {}])
+    original_send = session.send
+
+    def delayed_send(method, params=None):
+        result = original_send(method, params)
+        if method == "Network.getResponseBody":
+            clock[0] += 0.451
+        return result
+
+    session.send = delayed_send
+    decision = cap._save_click_observation(observer)
+    candidate = observer.candidates["r1"]
+    assert decision["outcome"] == "business_unreadable"
+    assert decision["business"]["outcome"] == "unreadable"
+    assert candidate["evidence_terminal"] is True
+    assert session.body_calls == 1 and _evidence_reads(session) == 1
+    assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
+    assert session.body_calls == 1 and _evidence_reads(session) == 1
+
+
 def test_shared_budget_exhaustion_stays_unreadable_unknown_query_and_detaches(monkeypatch):
     cap, _clock, session, page, observer, _request = _setup(monkeypatch, [{}, {}, {}])
     for _ in range(3):
