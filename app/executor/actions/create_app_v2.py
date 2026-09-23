@@ -4985,11 +4985,7 @@ def _exact_select_post_click_ok(stage, result):
     return False
 
 
-_UNIQUE_VISIBLE_DROPDOWN_SELECTOR = (
-    ".el-select-dropdown:visible"
-    ":not(:has(~ .el-select-dropdown:visible))"
-    ":not(.el-select-dropdown:visible ~ .el-select-dropdown:visible)"
-)
+_SECOND_VISIBLE_DROPDOWN_SELECTOR = ":nth-match(.el-select-dropdown:visible, 2)"
 
 
 def _click_unique_exact_visible_select_option(page, target_text, stage):
@@ -5008,8 +5004,10 @@ def _click_unique_exact_visible_select_option(page, target_text, stage):
             _log_exact_select_diagnostic(stage, "option_not_visible", dropdown_count)
             return False
         exact_text = re.compile(r"^" + re.escape(target_text) + r"$")
-        options = page.locator(
-            _UNIQUE_VISIBLE_DROPDOWN_SELECTOR + " .el-select-dropdown__item:visible"
+        second_visible_dropdown = page.locator(_SECOND_VISIBLE_DROPDOWN_SELECTOR)
+        unique_page = page.locator("body").filter(has_not=second_visible_dropdown)
+        options = unique_page.locator(
+            ".el-select-dropdown:visible .el-select-dropdown__item:visible"
         ).filter(has_text=exact_text)
         option_count = options.count()
         if option_count != 1:
