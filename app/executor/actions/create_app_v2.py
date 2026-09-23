@@ -631,11 +631,19 @@ def _click_unchecked_switch_by_known_main_row(
 
 
 def _visible_message_box_count(page):
-    """Read visible confirmation boxes before an irreversible switch click."""
+    """Read strict visual confirmation boxes before an irreversible switch click."""
     try:
-        result = page.evaluate("""() => Array.from(document.querySelectorAll('.el-message-box__wrapper')).filter(
-          item => Boolean(item) && item.offsetParent !== null
-        ).length""")
+        result = page.evaluate("""() => {
+          const visible = item => {
+            if (!item) return false;
+            const style = window.getComputedStyle(item);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            if (item.getAttribute('aria-hidden') === 'true') return false;
+            const rect = item.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          };
+          return Array.from(document.querySelectorAll('.el-message-box__wrapper')).filter(visible).length;
+        }""")
         return result if isinstance(result, int) and not isinstance(result, bool) else None
     except Exception:
         return None
@@ -645,7 +653,14 @@ def _click_unique_new_message_box_confirm(page):
     """Click exactly one enabled, exact-text confirmation button; never use Enter."""
     try:
         return bool(page.evaluate("""() => {
-          const visible = el => Boolean(el) && el.offsetParent !== null;
+          const visible = el => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            if (el.getAttribute('aria-hidden') === 'true') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          };
           const boxes = Array.from(document.querySelectorAll('.el-message-box__wrapper')).filter(visible);
           if (boxes.length !== 1) return false;
           const buttons = Array.from(boxes[0].querySelectorAll('button')).filter(button => {
