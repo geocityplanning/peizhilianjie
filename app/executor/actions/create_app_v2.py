@@ -217,8 +217,7 @@ _POST_SAVE_FALLBACK_POLL_ATTEMPTS = 6
 _POST_SAVE_FALLBACK_POLL_MS = 250
 _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS = 3
 _POST_SAVE_KNOWN_ID_POLL_MS = 500
-_POST_SAVE_KNOWN_ID_VISIBILITY_BUDGET_MS = 15_000
-_POST_SAVE_KNOWN_ID_VISIBILITY_RESCAN_MS = 7_500
+_POST_SAVE_KNOWN_ID_VISIBILITY_WAIT_BUDGET_MS = 15_000
 
 
 def _mark_unique_visible_copy_dialog_input(page, label):
@@ -3566,16 +3565,14 @@ def _locate_known_main_row_for_resource_fallback_impl(page, app_id, app_name, ch
     gate_counts = {"target_absent_requests": 0, "target_filtered_requests": 0, "unknown_requests": 0, "target_absent_2xx": 0}
     gate_diagnostics = {key: 0 for key in _LIST_DIAGNOSTIC_KEYS}
     gate_structure_diagnostics = {key: 0 for key in _LIST_STRUCTURE_BUCKETS}
-    visibility_deadline = time.monotonic() + (_POST_SAVE_KNOWN_ID_VISIBILITY_BUDGET_MS / 1000)
+    visibility_wait_remaining_ms = _POST_SAVE_KNOWN_ID_VISIBILITY_WAIT_BUDGET_MS
     attempts_run = 0
     for attempt in range(_POST_SAVE_KNOWN_ID_POLL_ATTEMPTS):
         if attempt:
-            remaining_ms = int((visibility_deadline - time.monotonic()) * 1000)
-            if remaining_ms <= 0:
-                break
-            page.wait_for_timeout(min(_POST_SAVE_KNOWN_ID_VISIBILITY_RESCAN_MS, remaining_ms))
-        if time.monotonic() >= visibility_deadline:
-            break
+            remaining_waits = _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS - attempt
+            wait_ms = visibility_wait_remaining_ms // remaining_waits
+            page.wait_for_timeout(wait_ms)
+            visibility_wait_remaining_ms -= wait_ms
         attempts_run += 1
         previous_state = _read_list_restore_state(page) or {}
         observations = (
