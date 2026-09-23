@@ -4981,11 +4981,16 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
         const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => {
           if (!visible(item)) return false;
           const label = item.querySelector('.el-form-item__label');
+          const selects = item.querySelectorAll('.el-select');
           const input = item.querySelector('input.el-input__inner');
-          return Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && input && visible(input) &&
-            !input.disabled && !input.readOnly);
+          return Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && selects.length === 1 && input && visible(input) &&
+            !input.disabled);
         });
-        return channels.length === 1 && apps.length === 1 ? {form, channel: channels[0]} : null;
+        const searches = Array.from(form.querySelectorAll('button')).filter(button =>
+          visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
+          (button.innerText || '').replace(/\\s/g, '').trim() === '搜索'
+        );
+        return channels.length === 1 && apps.length === 1 && searches.length === 1 ? {form, channel: channels[0]} : null;
       }).filter(Boolean);
       if (matches.length !== 1) return {opened: false};
       const input = matches[0].channel.querySelector('input.el-select__input') ||
@@ -5015,7 +5020,8 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
       const dropdowns = Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible);
       if (dropdowns.length !== 1) return false;
       const options = Array.from(dropdowns[0].querySelectorAll('.el-select-dropdown__item')).filter(option =>
-        visible(option) && !option.className.includes('is-disabled') && (option.innerText || '').trim() === channelName
+        visible(option) && !option.className.includes('is-disabled') && option.getAttribute('aria-disabled') !== 'true' &&
+        (option.innerText || '').trim() === channelName
       );
       if (options.length !== 1) return false;
       options[0].click(); return true;
@@ -5024,8 +5030,38 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
     if selected is not True:
         return False
     page.wait_for_timeout(300)
-    configured = page.evaluate("""
-    ({channelName, appName}) => {
+    channel_verified = page.evaluate("""
+    (channelName) => {
+      const visible = node => {
+        if (!node || node.closest('.el-dialog, .el-dialog__wrapper')) return false;
+        const style = window.getComputedStyle(node); const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
+          node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
+      };
+      if (Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible).length !== 0) return false;
+      const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible);
+      const matches = forms.map(form => {
+        const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => {
+          const item = select.closest('.el-form-item'); const label = item && item.querySelector('.el-form-item__label');
+          const input = select.querySelector('input'); const metadata = input ? `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}` : '';
+          return visible(select) && (/渠道/.test(metadata) || Boolean(label && /渠道/.test(label.innerText || '')));
+        });
+        const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => {
+          const label = item.querySelector('.el-form-item__label'); const selects = item.querySelectorAll('.el-select'); const input = item.querySelector('input.el-input__inner');
+          return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && selects.length === 1 && input && visible(input) && !input.disabled);
+        });
+        return channels.length === 1 && apps.length === 1 ? {channel: channels[0]} : null;
+      }).filter(Boolean);
+      if (matches.length !== 1) return false;
+      const input = matches[0].channel.querySelector('input.el-input__inner');
+      const tags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
+      return Boolean((input && (input.value || '').trim() === channelName) || tags.includes(channelName));
+    }
+    """, channel_name)
+    if channel_verified is not True:
+        return False
+    app_opened = page.evaluate("""
+    () => {
       const visible = node => {
         if (!node || node.closest('.el-dialog, .el-dialog__wrapper')) return false;
         const style = window.getComputedStyle(node); const rect = node.getBoundingClientRect();
@@ -5036,24 +5072,71 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
       const matches = forms.map(form => {
         const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => {
           const item = select.closest('.el-form-item'); const label = item && item.querySelector('.el-form-item__label');
+          return visible(select) && Boolean(label && /渠道/.test(label.innerText || ''));
+        });
+        const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => {
+          const label = item.querySelector('.el-form-item__label'); const selects = item.querySelectorAll('.el-select'); const input = item.querySelector('input.el-input__inner');
+          return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && selects.length === 1 && input && visible(input));
+        });
+        return channels.length === 1 && apps.length === 1 ? apps[0].querySelector('input.el-input__inner') : null;
+      }).filter(Boolean);
+      if (matches.length !== 1 || matches[0].disabled || !matches[0].readOnly) return false;
+      matches[0].click(); return true;
+    }
+    """)
+    if app_opened is not True:
+        return False
+    page.wait_for_timeout(300)
+    app_selected = page.evaluate("""
+    (appName) => {
+      const visible = node => {
+        const style = window.getComputedStyle(node); const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
+          node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
+      };
+      const dropdowns = Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible);
+      if (dropdowns.length !== 1) return false;
+      const options = Array.from(dropdowns[0].querySelectorAll('.el-select-dropdown__item')).filter(option =>
+        visible(option) && !option.className.includes('is-disabled') && option.getAttribute('aria-disabled') !== 'true' &&
+        (option.innerText || '').trim() === appName
+      );
+      if (options.length !== 1) return false;
+      options[0].click(); return true;
+    }
+    """, app_name)
+    if app_selected is not True:
+        return False
+    page.wait_for_timeout(300)
+    configured = page.evaluate("""
+    ({channelName, appName}) => {
+      const visible = node => {
+        if (!node || node.closest('.el-dialog, .el-dialog__wrapper')) return false;
+        const style = window.getComputedStyle(node); const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
+          node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
+      };
+      if (Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible).length !== 0) return false;
+      const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible);
+      const matches = forms.map(form => {
+        const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => {
+          const item = select.closest('.el-form-item'); const label = item && item.querySelector('.el-form-item__label');
           const input = select.querySelector('input'); const metadata = input ? `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}` : '';
           return visible(select) && (/渠道/.test(metadata) || Boolean(label && /渠道/.test(label.innerText || '')));
         });
         const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => {
-          const label = item.querySelector('.el-form-item__label'); const input = item.querySelector('input.el-input__inner');
-          return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && input && visible(input) && !input.disabled && !input.readOnly);
+          const label = item.querySelector('.el-form-item__label'); const selects = item.querySelectorAll('.el-select'); const input = item.querySelector('input.el-input__inner');
+          return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && selects.length === 1 && input && visible(input) && !input.disabled && input.readOnly);
         });
-        return channels.length === 1 && apps.length === 1 ? {channel: channels[0], app: apps[0].querySelector('input.el-input__inner')} : null;
+        return channels.length === 1 && apps.length === 1 ? {channel: channels[0], app: apps[0].querySelector('input.el-input__inner'), appSelect: apps[0].querySelector('.el-select')} : null;
       }).filter(Boolean);
       if (matches.length !== 1) return false;
       const channelInput = matches[0].channel.querySelector('input.el-input__inner');
       const channelTags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
-      if (!((channelInput && (channelInput.value || '').trim() === channelName) || channelTags.includes(channelName))) return false;
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-      setter.call(matches[0].app, appName);
-      matches[0].app.dispatchEvent(new Event('input', {bubbles: true}));
-      matches[0].app.dispatchEvent(new Event('change', {bubbles: true}));
-      return (matches[0].app.value || '').trim() === appName;
+      const appTags = Array.from(matches[0].appSelect.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
+      return Boolean(
+        ((channelInput && (channelInput.value || '').trim() === channelName) || channelTags.includes(channelName)) &&
+        ((matches[0].app.value || '').trim() === appName || appTags.includes(appName))
+      );
     }
     """, {"channelName": channel_name, "appName": app_name})
     return configured is True
@@ -5077,16 +5160,17 @@ def _click_exact_terminal_search_once(page, channel_name, app_name):
           return visible(select) && (/渠道/.test(metadata) || Boolean(label && /渠道/.test(label.innerText || '')));
         });
         const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => {
-          const label = item.querySelector('.el-form-item__label'); const input = item.querySelector('input.el-input__inner');
-          return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && input && visible(input));
+          const label = item.querySelector('.el-form-item__label'); const selects = item.querySelectorAll('.el-select'); const input = item.querySelector('input.el-input__inner');
+          return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && selects.length === 1 && input && visible(input) && !input.disabled && input.readOnly);
         });
-        return channels.length === 1 && apps.length === 1 ? {form, channel: channels[0], app: apps[0].querySelector('input.el-input__inner')} : null;
+        return channels.length === 1 && apps.length === 1 ? {form, channel: channels[0], app: apps[0].querySelector('input.el-input__inner'), appSelect: apps[0].querySelector('.el-select')} : null;
       }).filter(Boolean);
       if (matches.length !== 1) return false;
       const channelInput = matches[0].channel.querySelector('input.el-input__inner');
       const channelTags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
+      const appTags = Array.from(matches[0].appSelect.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
       if (!((channelInput && (channelInput.value || '').trim() === channelName) || channelTags.includes(channelName)) ||
-          !matches[0].app || (matches[0].app.value || '').trim() !== appName) return false;
+          !matches[0].app || !((matches[0].app.value || '').trim() === appName || appTags.includes(appName))) return false;
       const buttons = Array.from(matches[0].form.querySelectorAll('button')).filter(button =>
         visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
         (button.innerText || '').replace(/\\s/g, '').trim() === '搜索'

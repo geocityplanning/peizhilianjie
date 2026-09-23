@@ -6,6 +6,8 @@ import inspect
 import sys
 import types
 
+import pytest
+
 
 def _cap():
     if "actions.ensure_login" not in sys.modules:
@@ -154,6 +156,90 @@ def test_terminal_query_fails_when_exact_filter_form_is_not_unique(monkeypatch):
 
     assert cap._verify_enable_with_fresh_exact_terminal_query(page, "id", "name", "channel") is False
     assert calls == ["attach", "prepare", "detach"]
+
+
+class ExactSelectPage:
+    """Offline evaluator that drives each real _prepare branch in order."""
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.scripts = []
+        self.payloads = []
+        self.waits = []
+
+    def evaluate(self, script, payload=None):
+        self.scripts.append(script)
+        self.payloads.append(payload)
+        assert self.results, "unexpected page evaluation"
+        return self.results.pop(0)
+
+    def wait_for_timeout(self, milliseconds):
+        self.waits.append(milliseconds)
+
+
+def test_prepare_exact_filters_physically_selects_readonly_app_dropdown_before_search():
+    cap = _cap()
+    page = ExactSelectPage([
+        {"opened": True}, True, True, True, True, True,
+    ])
+
+    assert cap._prepare_exact_terminal_filters(page, "channel", "application") is True
+    assert page.payloads == ["channel", "channel", "channel", None, "application", {
+        "channelName": "channel", "appName": "application",
+    }]
+    assert page.waits == [300, 300, 300, 300]
+    assert "searches.length === 1" in page.scripts[0]
+    assert "dropdowns.length !== 1" in page.scripts[1]
+    assert "aria-disabled" in page.scripts[1]
+    assert "length !== 0" in page.scripts[2]
+    assert "!matches[0].readOnly" in page.scripts[3]
+    assert "selects.length === 1" in page.scripts[3]
+    assert "dropdowns.length !== 1" in page.scripts[4]
+    assert "aria-disabled" in page.scripts[4]
+    assert "length !== 0" in page.scripts[5]
+    app_select_source = "\n".join(page.scripts[3:])
+    assert "HTMLInputElement.prototype" not in app_select_source
+    assert "dispatchEvent" not in app_select_source
+
+
+@pytest.mark.parametrize(
+    ("results", "expected_evaluations"),
+    [
+        ([{"opened": False}], 1),  # zero/multiple form, control, or search button
+        ([{"opened": True}, False], 2),  # zero/multiple/disabled/wrong channel option
+        ([{"opened": True}, True, False], 3),  # channel did not close or recheck
+        ([{"opened": True}, True, True, False], 4),  # app select is absent/non-readonly/disabled
+        ([{"opened": True}, True, True, True, False], 5),  # zero/multiple/disabled/wrong app option
+        ([{"opened": True}, True, True, True, True, False], 6),  # app close/value recheck mismatch
+    ],
+)
+def test_prepare_exact_filters_fails_closed_at_each_unique_control_gate(results, expected_evaluations):
+    cap = _cap()
+    page = ExactSelectPage(results)
+
+    assert cap._prepare_exact_terminal_filters(page, "channel", "application") is False
+    assert len(page.scripts) == expected_evaluations
+    assert len(page.scripts) < 6 or page.scripts[-1]
+
+
+def test_exact_terminal_search_rechecks_readonly_app_value_without_model_write():
+    cap = _cap()
+
+    class SearchPage:
+        def __init__(self):
+            self.script = ""
+        def evaluate(self, script, payload=None):
+            self.script = script
+            return False
+
+    page = SearchPage()
+    assert cap._click_exact_terminal_search_once(page, "channel", "application") is False
+    assert "input.readOnly" in page.script
+    assert "selects.length === 1" in page.script
+    assert "appTags" in page.script
+    assert "buttons.length !== 1" in page.script
+    assert "HTMLInputElement.prototype" not in page.script
+    assert "dispatchEvent" not in page.script
 
 
 def test_exact_terminal_search_is_called_once_and_failure_does_not_retry(monkeypatch):
