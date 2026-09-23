@@ -474,10 +474,15 @@ def test_save_page_event_listener_requires_current_window_request_and_detaches()
     assert session.detached is True
 
 
-def test_contract_documents_wrapper_safe_page_response_fallback():
+def test_contract_documents_wrapper_safe_bounded_page_response_fallback():
     contract = (Path(__file__).parents[1] / "contracts" / "hermes-http-v1.md").read_text(encoding="utf-8")
     assert "不得依赖 Python wrapper 对象身份" in contract
     assert "response.request` 即时投影 method/path-hash/status" in contract
+    assert "正文读取必须在回调外进行" in contract
+    assert "首次实际正文读取即将发生时起" in contract
+    assert "合计最多三次、共享 450ms 证据窗口" in contract
+    assert "不得触发第二次保存、启用、搜索、重建、换幂等键或任何业务重试" in contract
+    assert "耗尽仍保持 `SAVE_FAILED` / `UNKNOWN` / `QUERY`" in contract
 
 
 def test_save_observation_rejects_missing_or_multiple_candidates():
