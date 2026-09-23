@@ -138,18 +138,17 @@ def test_contract_limits_enable_no_candidate_diagnostic_to_value_free_fields():
     assert "最多三个 16 位 path 哈希" in contract
 
 
-def test_enable_diagnostic_logs_confirmation_and_switch_only_as_diagnostics(capsys):
+def test_enable_diagnostic_logs_confirmation_without_old_switch_dom_state(capsys):
     cap, _session, _page, observer = _observer()
     observer.confirmation_trace = "unique_clicked_closed"
     observer.confirmation_clicked = True
     observer.confirmation_closed = True
-    observer.post_action_switch_state = "switch_checked"
 
     cap._log_enable_click_observation(observer, {"outcome": "no_candidate", "candidate_count": 0})
 
     output = capsys.readouterr().out
     assert '"outcome":"no_candidate"' in output
     assert '"trace":"unique_clicked_closed"' in output
-    assert '"post_action_switch_state":"switch_checked"' in output
+    assert "post_action_switch_state" not in output
     assert "http://" not in output and "https://" not in output
     assert "query" not in output and "body" not in output and "header" not in output

@@ -1861,7 +1861,6 @@ class _SaveClickObserver:
         self.confirmation_trace = "none_seen"
         self.confirmation_clicked = False
         self.confirmation_closed = False
-        self.post_action_switch_state = "not_inferable"
 
 
 _SAVE_PAGE_RESPONSE_LIMIT = 2
@@ -2829,9 +2828,6 @@ def _enable_action_observation_diagnostic(observer, decision):
     trace = getattr(observer, "confirmation_trace", "not_inferable")
     if trace not in {"none_seen", "unique_seen", "unique_clicked_closed", "multiple_visible", "reappeared", "request_before_confirmation", "confirm_button_rejected", "unclosed", "unreadable"}:
         trace = "not_inferable"
-    switch_state = getattr(observer, "post_action_switch_state", "not_inferable")
-    if switch_state not in _NARROW_ROW_SWITCH_STATES:
-        switch_state = "not_inferable"
     return {
         "observation": _save_click_diagnostic(decision),
         "request_observer": {"cdp": cdp_projection, "page_event": page_projection},
@@ -2840,7 +2836,6 @@ def _enable_action_observation_diagnostic(observer, decision):
             "unique_confirm_clicked": bool(getattr(observer, "confirmation_clicked", False)),
             "confirmation_closed": bool(getattr(observer, "confirmation_closed", False)),
         },
-        "post_action_switch_state": switch_state,
     }
 
 
@@ -5170,7 +5165,7 @@ def _verify_enable_with_fresh_exact_terminal_query(page, app_id, app_name, chann
 
 
 def _stage_enable(page, execution_id, target_app_id, app_name, actual_channel_name, known_main_handle):
-    """Stage 2: one anchored enable click plus new unfiltered terminal proof."""
+    """Stage 2: one anchored enable click plus a fresh exact terminal proof."""
     _set_stage(execution_id, "正在检查应用状态")
     if not isinstance(known_main_handle, dict) or not known_main_handle.get("success"):
         return _enable_unknown_failure("缺少保存后已核验主行身份，已停止")
@@ -5208,22 +5203,18 @@ def _stage_enable(page, execution_id, target_app_id, app_name, actual_channel_na
         _detach_save_click_observer(observer)
     if not clicked:
         return _enable_unknown_failure("上线同行开关未通过原子复核或不可点击，已停止")
-    try:
-        observer.post_action_switch_state = _post_save_narrow_row_switch_state(
-            page, target_app_id, app_name, actual_channel_name
-        )
-    except Exception:
-        observer.post_action_switch_state = "unreadable"
     _log_enable_click_observation(observer, observation)
     if observation.get("outcome") != "success":
         return _enable_unknown_failure("上线响应未能唯一确认业务成功，已停止")
 
-    # Checked state is diagnostic only and never substitutes for the write proof.
-    if observer.post_action_switch_state != "switch_checked":
-        return _enable_unknown_failure("上线后开关状态未能连续稳定回读，已停止")
-
-    # Throw away every narrow locator, response and DOM observation. The final
-    # proof owns a new observer and performs one exact channel+application query.
+    # The write proof is now complete: release every old observer/DOM reference
+    # before the terminal proof installs its own observer and queries once.
+    observer = None
+    observation = None
+    clicked = None
+    pre_click_handle = None
+    known_main_handle = None
+    # The final proof owns a new observer and performs one exact channel+application query.
     try:
         terminal_verified = _verify_enable_with_fresh_exact_terminal_query(
             page, target_app_id, app_name, actual_channel_name
