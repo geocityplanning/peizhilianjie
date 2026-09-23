@@ -765,6 +765,11 @@ def test_channel_names_empty_is_target_absent_but_nonempty_is_target_filtered():
     assert cap._list_request_filter_state(LIST_URL, '{"channelNames":["secret"]}') == "target_filtered"
 
 
+def test_contract_documents_context_relation_enum_only():
+    contract = (Path(__file__).parents[1] / "contracts" / "hermes-http-v1.md").read_text(encoding="utf-8")
+    assert "context_relation`（equal/different/unreadable" in contract
+
+
 def test_contract_documents_confirmed_list_filters_and_platform_context():
     contract = (Path(__file__).parents[1] / "contracts" / "hermes-http-v1.md").read_text(encoding="utf-8")
     for field in ("appStatus", "appShortUrl", "appLongUrl", "placeList", "categoryList", "balanceType", "platformType"):
@@ -795,6 +800,72 @@ def test_confirmed_platform_type_context_values_are_not_filters(value):
 def test_platform_type_invalid_values_remain_unknown(value):
     cap = _stub_login_and_import()
     assert cap._list_request_filter_state(LIST_URL, json.dumps({"platformType": value, "pageNum": 1})) == "unknown"
+
+
+def test_list_context_relation_uses_only_confirmed_platform_category():
+    cap = _stub_login_and_import()
+    same = {"platformType": "2", "pageNum": 1, "channelNames": ["private-value"]}
+    other = {"platformType": 1, "pageNum": 1, "channelNames": ["private-value"]}
+    unknown = {"platformType": 2, "pageNum": 1, "privateDimension": "private-value"}
+    missing = {"pageNum": 1}
+    multiple = [("platformType", "2"), ("platformType", "2")]
+    url = LIST_URL
+    assert cap._list_request_filter_state(url, json.dumps(same)) == "target_filtered"
+    assert cap._list_context_relation(
+        [cap._list_request_context_profile(url, json.dumps(same))],
+        [cap._list_request_context_profile(url, json.dumps(same))],
+    ) == "equal"
+    assert cap._list_context_relation(
+        [cap._list_request_context_profile(url, json.dumps(same))],
+        [cap._list_request_context_profile(url, json.dumps(other))],
+    ) == "different"
+    assert cap._list_context_relation(
+        [cap._list_request_context_profile(url, json.dumps(same))],
+        [cap._list_request_context_profile(url, json.dumps(unknown))],
+    ) == "unreadable"
+    assert cap._list_context_relation(
+        [cap._list_request_context_profile(url, json.dumps(missing))],
+        [cap._list_request_context_profile(url, "&".join(f"{key}={value}" for key, value in multiple))],
+    ) == "unreadable"
+
+
+def test_observer_keeps_context_profiles_only_in_memory():
+    cap = _stub_login_and_import()
+    session = FakeCdpSession(response_bodies={
+        "unfiltered": {"body": '{"data":{"totalCount":1,"pageCount":1,"list":[{}]}}', "base64Encoded": False},
+    })
+    observations = cap._attach_list_response_observer(FakePage(session=session), target_filter=SECRET_CHANNEL)
+    session.emit("Network.requestWillBeSent", {
+        "requestId": "filtered", "request": {
+            "url": LIST_URL, "method": "POST",
+            "postData": json.dumps({"platformType": 2, "channelName": SECRET_CHANNEL}),
+        },
+    })
+    session.emit("Network.requestWillBeSent", {
+        "requestId": "unfiltered", "request": {
+            "url": LIST_URL, "method": "POST", "postData": '{"platformType":2,"pageNum":1}',
+        },
+    })
+    session.emit("Network.responseReceived", {"requestId": "unfiltered", "response": {"url": LIST_URL, "status": 200}})
+    session.emit("Network.loadingFinished", {"requestId": "unfiltered"})
+    assert observations.target_filter_context_profiles == [2]
+    assert observations.complete_unfiltered_context_profiles == [2]
+    assert observations.request_filter_states["unfiltered"] == "target_absent"
+    assert SECRET_CHANNEL not in str(observations.complete_unfiltered_context_profiles)
+
+
+def test_context_relation_log_projection_is_fixed_and_value_free(capsys):
+    cap = _stub_login_and_import()
+    cap._log_unfiltered_list_gate(
+        cap._LIST_GATE_NO_COMPLETE_RESPONSE, 1, False,
+        {"target_absent_requests": 0, "target_filtered_requests": 0, "unknown_requests": 0, "target_absent_2xx": 0},
+        False, False, {key: 0 for key in cap._LIST_DIAGNOSTIC_KEYS},
+        {key: 0 for key in cap._LIST_STRUCTURE_BUCKETS}, "different",
+    )
+    output = capsys.readouterr().out
+    assert '"context_relation":"different"' in output
+    for forbidden in ("privateDimension", "private-value", LIST_URL, "platformType"):
+        assert forbidden not in output
 
 
 def test_channel_names_query_form_null_and_empty_array_classification():

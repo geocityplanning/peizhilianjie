@@ -619,10 +619,10 @@ def _close_copy_dialog_after_verify(page):
     return False
 
 
-def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_name, expected_channel_name):
+def _verify_persisted_resource_fallback(page, app_id, expected, expected_app_name, expected_channel_name, narrow_context_profiles=None):
     """Read the exact new app, its identity, and its fallback value with bounded stability."""
     main_identity = _locate_known_main_row_for_resource_fallback(
-        page, app_id, expected_app_name, expected_channel_name
+        page, app_id, expected_app_name, expected_channel_name, narrow_context_profiles=narrow_context_profiles
     )
     if not main_identity["success"]:
         diagnostics = _known_main_redacted_facts(
@@ -1943,6 +1943,9 @@ class _ListRequestObserver(list):
         self.target_filter_field_is_channel = None
         self.success_records = []
         self.request_filter_states = {}
+        self.request_context_profiles = {}
+        self.target_filter_context_profiles = []
+        self.complete_unfiltered_context_profiles = []
         self.target_absent_2xx_count = 0
         self.target_absent_structure_invalid_count = 0
         self.list_request_count = 0
@@ -2084,6 +2087,62 @@ def _is_valid_list_platform_context(value):
         except ValueError:
             return False
     return False
+
+
+def _list_request_context_profile(url, post_data, payload_known=True):
+    """Return only an in-memory normalized platform category, else None.
+
+    No request values, keys, or raw payloads escape this function.  Any
+    unregistered dimension is deliberately unreadable rather than fingerprinted.
+    """
+    if not payload_known:
+        return None
+
+    def normalized(key):
+        return re.sub(r"[^a-z0-9]", "", str(key or "").lower())
+
+    fields = []
+    try:
+        fields.extend((normalized(key), value) for key, value in parse_qsl(urlparse(_as_text(url)).query, keep_blank_values=True))
+    except Exception:
+        return None
+    raw = _as_text(post_data)
+    if raw:
+        try:
+            body = json.loads(raw)
+        except Exception:
+            try:
+                form = parse_qsl(raw, keep_blank_values=True)
+            except Exception:
+                return None
+            if not form:
+                return None
+            fields.extend((normalized(key), value) for key, value in form)
+        else:
+            if not isinstance(body, dict):
+                return None
+            fields.extend((normalized(key), value) for key, value in body.items())
+    platforms = []
+    for key, value in fields:
+        if key == _LIST_PLATFORM_CONTEXT_KEY:
+            platforms.append(value)
+        elif key not in _LIST_PAGING_KEYS and key not in _LIST_FILTER_KEYS:
+            return None
+    if len(platforms) != 1 or not _is_valid_list_platform_context(platforms[0]):
+        return None
+    value = platforms[0]
+    return int(value.strip()) if isinstance(value, str) else value
+
+
+def _list_context_relation(narrow_profiles, unfiltered_profiles):
+    """Compare in-memory profiles and return the sole public fixed enum."""
+    narrow = list(narrow_profiles or [])
+    unfiltered = list(unfiltered_profiles or [])
+    if len(narrow) != 1 or not unfiltered or any(profile not in {0, 1, 2} for profile in narrow + unfiltered):
+        return "unreadable"
+    if any(profile != narrow[0] for profile in unfiltered):
+        return "different"
+    return "equal"
 
 
 def _list_request_filter_state(url, post_data):
@@ -2670,6 +2729,7 @@ def _attach_list_response_observer(page, target_filter=None, private_outline_bat
         if request_id is not None:
             list_request_ids.add(request_id)
             state = _list_request_filter_state(url, post_data) if payload_known else "unknown"
+            observations.request_context_profiles[request_id] = _list_request_context_profile(url, post_data, payload_known)
             _note_list_request_diagnostic(
                 observations, url, post_data, source=source, payload_state=payload_state,
                 payload_known=payload_known, method=method,
@@ -2684,6 +2744,10 @@ def _attach_list_response_observer(page, target_filter=None, private_outline_bat
                 observations.unknown_request_count += 1
         location = _locate_target_filter_field(url, post_data, target_filter)
         if location is not None:
+            if request_id is not None:
+                observations.target_filter_context_profiles.append(
+                    observations.request_context_profiles.get(request_id)
+                )
             observations.carried_target_filter = True
             _note_filter_field(location)
             if request_id is not None:
@@ -2741,6 +2805,9 @@ def _attach_list_response_observer(page, target_filter=None, private_outline_bat
                     )
                     if meta:
                         meta["status"] = int(status)
+                        observations.complete_unfiltered_context_profiles.append(
+                            observations.request_context_profiles.get(request_id)
+                        )
             finally:
                 body = None
 
@@ -2869,6 +2936,9 @@ def _attach_list_response_observer(page, target_filter=None, private_outline_bat
                     meta = _record_target_absent_structure(observations, body, observer_source="page_event")
                     if meta:
                         meta["status"] = int(status or 0)
+                        observations.complete_unfiltered_context_profiles.append(
+                            observations.request_context_profiles.get(request_id)
+                        )
             finally:
                 body = None
 
@@ -2906,7 +2976,7 @@ def _dismiss_stray_dropdowns(page):
         pass
 
 
-def _search_list_by_channel(page, channel_name, return_detail=False):
+def _search_list_by_channel(page, channel_name, return_detail=False, context_sink=None):
     """Select an exact channel in the list filter and verify the table refresh."""
     _reset_list_filters(page)
     previous_state = _read_pagination_state(page)
@@ -3133,6 +3203,8 @@ def _search_list_by_channel(page, channel_name, return_detail=False):
             detail["response_contains_target_channel"] = None
             detail["target_filter_field"] = None
             detail["target_filter_field_is_channel"] = None
+    if context_sink is not None and observations is not None:
+        context_sink.extend(getattr(observations, "target_filter_context_profiles", []) or [])
     _detach_list_response_observer(observations)
     if not stable:
         print(f"[create_app] 渠道筛选未稳定: {detail}")
@@ -3522,7 +3594,7 @@ def _scan_known_main_id_pages(page, app_id, app_name, channel_name):
     return {"status": "failure", "snapshot": {}, "reason": "page_scan_limit_reached"}
 
 
-def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_attempted, refresh_clicked, diagnostics, structure_diagnostics):
+def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_attempted, refresh_clicked, diagnostics, structure_diagnostics, context_relation="unreadable"):
     bounded = lambda value: min(max(int(value or 0), 0), _POST_SAVE_KNOWN_ID_POLL_ATTEMPTS * 2)
     print("[create_app] unfiltered_list_gate=" + json.dumps({
         "reason": reason,
@@ -3536,6 +3608,7 @@ def _log_unfiltered_list_gate(reason, attempts, gate_passed, counts, refresh_att
         "target_absent_2xx": bounded(counts.get("target_absent_2xx")),
         "observer_diagnostics": {key: bounded(diagnostics.get(key)) for key in _LIST_DIAGNOSTIC_KEYS},
         "response_structure": {key: bounded(structure_diagnostics.get(key)) for key in _LIST_STRUCTURE_BUCKETS},
+        "context_relation": context_relation if context_relation in {"equal", "different", "unreadable"} else "unreadable",
     }, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
 
 
@@ -3549,7 +3622,7 @@ def _deepest_list_gate_reason(reasons):
     return max(reasons, key=lambda reason: ranks.get(reason, 0), default=_LIST_GATE_NO_COMPLETE_RESPONSE)
 
 
-def _locate_known_main_row_for_resource_fallback_impl(page, app_id, app_name, channel_name, private_outline_batch):
+def _locate_known_main_row_for_resource_fallback_impl(page, app_id, app_name, channel_name, private_outline_batch, narrow_context_profiles=None):
     """Read-only post-save locator: require a fresh unfiltered response before scanning.
 
     `_identify_new_app` may have found an ID in a channel-filtered view.  Resetting
@@ -3565,6 +3638,7 @@ def _locate_known_main_row_for_resource_fallback_impl(page, app_id, app_name, ch
     gate_counts = {"target_absent_requests": 0, "target_filtered_requests": 0, "unknown_requests": 0, "target_absent_2xx": 0}
     gate_diagnostics = {key: 0 for key in _LIST_DIAGNOSTIC_KEYS}
     gate_structure_diagnostics = {key: 0 for key in _LIST_STRUCTURE_BUCKETS}
+    unfiltered_context_profiles = []
     visibility_wait_remaining_ms = _POST_SAVE_KNOWN_ID_VISIBILITY_WAIT_BUDGET_MS
     attempts_run = 0
     for attempt in range(_POST_SAVE_KNOWN_ID_POLL_ATTEMPTS):
@@ -3611,6 +3685,9 @@ def _locate_known_main_row_for_resource_fallback_impl(page, app_id, app_name, ch
                     gate_diagnostics[key] += int(getattr(observations, "diagnostic_counts", {}).get(key, 0) or 0)
                 for key in _LIST_STRUCTURE_BUCKETS:
                     gate_structure_diagnostics[key] += int(getattr(observations, "structure_diagnostic_counts", {}).get(key, 0) or 0)
+                unfiltered_context_profiles.extend(
+                    getattr(observations, "complete_unfiltered_context_profiles", []) or []
+                )
             _detach_list_response_observer(observations)
         if not isinstance(restored, dict):
             restored = {"restored": bool(restored), "reason": _LIST_GATE_NO_COMPLETE_RESPONSE}
@@ -3652,22 +3729,23 @@ def _locate_known_main_row_for_resource_fallback_impl(page, app_id, app_name, ch
     _log_unfiltered_list_gate(
         reason, attempts_run, gate_passed, gate_counts, refresh_attempted, refresh_clicked,
         gate_diagnostics, gate_structure_diagnostics,
+        _list_context_relation(narrow_context_profiles, unfiltered_context_profiles),
     )
     return _known_main_failure("zero_candidates_after_poll", scanned.get("snapshot"))
 
 
-def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel_name):
+def _locate_known_main_row_for_resource_fallback(page, app_id, app_name, channel_name, narrow_context_profiles=None):
     """Run the entire post-save locator with one optional private outline batch."""
     batch = _PrivateOutlineBatch(_safe_private_outline_target())
     try:
         return _locate_known_main_row_for_resource_fallback_impl(
-            page, app_id, app_name, channel_name, batch
+            page, app_id, app_name, channel_name, batch, narrow_context_profiles
         )
     finally:
         batch.write_once()
 
 
-def _identify_new_app(page, before_ids, actual_channel_name, app_name):
+def _identify_new_app(page, before_ids, actual_channel_name, app_name, context_sink=None):
     """Find the row created by this save using an ID set difference."""
     last_candidates = []
 
@@ -3677,10 +3755,16 @@ def _identify_new_app(page, before_ids, actual_channel_name, app_name):
     # times, then fall back to a full scan. This path never creates or saves.
     channel_filter = None
     for filter_attempt in range(_POST_SAVE_FILTER_ATTEMPTS):
-        channel_filter = _search_list_by_channel(page, actual_channel_name, return_detail=True)
+        attempt_context_profiles = []
+        channel_filter = (
+            _search_list_by_channel(page, actual_channel_name, return_detail=True, context_sink=attempt_context_profiles)
+            if context_sink is not None else _search_list_by_channel(page, actual_channel_name, return_detail=True)
+        )
         if channel_filter is True or (
             isinstance(channel_filter, dict) and channel_filter.get("filter_stable")
         ):
+            if context_sink is not None:
+                context_sink.extend(attempt_context_profiles)
             break
         carried = isinstance(channel_filter, dict) and channel_filter.get(
             "request_carried_target_filter"
@@ -4266,7 +4350,10 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
         pass
 
     _set_stage(execution_id, "正在识别新增应用ID")
-    identified = _identify_new_app(page, before_ids, data["actual_channel_name"], app_name)
+    narrow_context_profiles = []
+    identified = _identify_new_app(
+        page, before_ids, data["actual_channel_name"], app_name, context_sink=narrow_context_profiles
+    )
     if not identified["success"]:
         return _post_save_unconfirmed_failure(identified["error"])
     target_app_id = identified["app_id"]
@@ -4278,6 +4365,7 @@ def _stage_create_save(page, execution_id, data, ref_cloud_app_link, ref_app_id,
         resource_fallback_page,
         app_name,
         data["actual_channel_name"],
+        narrow_context_profiles=narrow_context_profiles,
     )
     if not fallback_persisted["success"]:
         return _post_save_unconfirmed_failure(fallback_persisted["error"])
