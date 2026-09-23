@@ -635,4 +635,6 @@ def test_only_post_save_path_uses_special_locator_and_downstream_find_is_unchang
     assert "_verify_resource_fallback_by_known_main_row" in stage_source
     assert "_find_target_row_by_id(page, target_app_id" not in stage_source
     assert "_click_unchecked_switch_by_known_main_row" in enable_source
-    assert "_locate_known_main_row_for_resource_fallback" in enable_source
+    assert "_verify_enable_with_fresh_exact_terminal_query" in enable_source
+    assert "_locate_known_main_row_for_resource_fallback" not in enable_source
+    assert "_reset_list_filters" not in enable_source

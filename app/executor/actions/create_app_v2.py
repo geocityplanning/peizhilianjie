@@ -2134,6 +2134,10 @@ class _ListRequestObserver(list):
         self.response_contains_target_channel = None
         self.target_filter_field = None
         self.target_filter_field_is_channel = None
+        self.exact_required_filter_request_count = 0
+        self.exact_required_filter_2xx_count = 0
+        self.exact_required_filter_success_records = []
+        self.exact_required_filter_structure_invalid_count = 0
         self.success_records = []
         self.request_filter_states = {}
         self.request_context_profiles = {}
@@ -2446,6 +2450,81 @@ def _request_carries_target_filter(url, post_data, target_filter):
     query string, request body, or channel text.
     """
     return _locate_target_filter_field(url, post_data, target_filter) is not None
+
+
+_EXACT_TERMINAL_FILTER_KEYS = {
+    "channel": {"channelname", "channelnames"},
+    "app": {"appname", "applicationname"},
+}
+
+
+def _exact_terminal_filter_fields(url, post_data):
+    """Parse only registered top-level list fields; discard values after the check."""
+    def normalized(key):
+        return re.sub(r"[^a-z0-9]", "", str(key or "").lower())
+
+    fields = []
+    try:
+        fields.extend((normalized(key), value) for key, value in parse_qsl(
+            urlparse(_as_text(url)).query, keep_blank_values=True
+        ))
+    except Exception:
+        return None
+    raw = _as_text(post_data)
+    if not raw:
+        return fields
+    try:
+        body = json.loads(raw)
+    except Exception:
+        try:
+            parsed = parse_qsl(raw, keep_blank_values=True)
+        except Exception:
+            return None
+        if not parsed:
+            return None
+        fields.extend((normalized(key), value) for key, value in parsed)
+        return fields
+    if not isinstance(body, dict):
+        return None
+    fields.extend((normalized(key), value) for key, value in body.items())
+    return fields
+
+
+def _exact_terminal_filter_value(value, expected):
+    if isinstance(value, str):
+        return value == expected
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str):
+        return value[0] == expected
+    return False
+
+
+def _request_carries_exact_terminal_filters(url, post_data, channel_name, app_name):
+    """Prove both exact filters using only registered fields and values in memory."""
+    if not isinstance(channel_name, str) or not channel_name or not isinstance(app_name, str) or not app_name:
+        return False
+    fields = _exact_terminal_filter_fields(url, post_data)
+    if fields is None or _list_request_context_profile(url, post_data, payload_known=True) not in {0, 1, 2}:
+        return False
+    seen = {"channel": 0, "app": 0}
+    allowed_exact = _EXACT_TERMINAL_FILTER_KEYS["channel"] | _EXACT_TERMINAL_FILTER_KEYS["app"]
+    for key, value in fields:
+        if key in _EXACT_TERMINAL_FILTER_KEYS["channel"]:
+            if not _exact_terminal_filter_value(value, channel_name):
+                return False
+            seen["channel"] += 1
+        elif key in _EXACT_TERMINAL_FILTER_KEYS["app"]:
+            if not _exact_terminal_filter_value(value, app_name):
+                return False
+            seen["app"] += 1
+        elif key == _LIST_PLATFORM_CONTEXT_KEY or key in _LIST_PAGING_KEYS:
+            continue
+        elif key in _LIST_FILTER_KEYS:
+            # A hidden nonempty list filter weakens the exact-query proof.
+            if value not in (None, "", [], {}, "[]", "null"):
+                return False
+        elif key not in allowed_exact:
+            return False
+    return seen == {"channel": 1, "app": 1}
 
 
 def _filter_field_rank(field, is_channel):
@@ -2996,7 +3075,22 @@ def _record_target_absent_structure(observations, body, *, base64_encoded=False,
     return meta
 
 
-def _attach_list_response_observer(page, target_filter=None, private_outline_batch=None):
+def _record_exact_terminal_filter_structure(observations, body, *, base64_encoded=False, read_error=False):
+    """Record a completed exact dual-filter response without retaining its body."""
+    observations.exact_required_filter_2xx_count += 1
+    if read_error:
+        bucket, meta = "response_body_read_error", None
+    else:
+        bucket, meta = _classify_list_structure_body(body, base64_encoded=base64_encoded)
+    observations.structure_diagnostic_counts[bucket] += 1
+    if meta:
+        observations.exact_required_filter_success_records.append(dict(meta))
+    else:
+        observations.exact_required_filter_structure_invalid_count += 1
+    return meta
+
+
+def _attach_list_response_observer(page, target_filter=None, private_outline_batch=None, exact_terminal_filters=None):
     """只读网络观察器：列表请求、HTTP 状态、是否携带筛选、响应是否含目标。
 
     只记录状态码和布尔结果。响应正文只在内存中为已携带目标筛选的请求做
@@ -3007,8 +3101,17 @@ def _attach_list_response_observer(page, target_filter=None, private_outline_bat
     给出"未观察到请求"而不是失败。
     """
     observations = _ListRequestObserver(private_outline_batch=private_outline_batch)
+    if exact_terminal_filters is not None:
+        if not isinstance(exact_terminal_filters, tuple) or len(exact_terminal_filters) != 2:
+            return None
+        exact_channel_name, exact_app_name = exact_terminal_filters
+        if not all(isinstance(value, str) and value for value in exact_terminal_filters):
+            return None
+    else:
+        exact_channel_name = exact_app_name = None
     list_request_ids = set()
     carried_request_ids = set()
+    exact_required_request_ids = set()
     list_status_by_id = {}
 
     def _note_response_contains_target(contained):
@@ -3052,6 +3155,14 @@ def _attach_list_response_observer(page, target_filter=None, private_outline_bat
                 observations.target_filtered_request_count += 1
             else:
                 observations.unknown_request_count += 1
+        if (
+            request_id is not None
+            and exact_terminal_filters is not None
+            and payload_known
+            and _request_carries_exact_terminal_filters(url, post_data, exact_channel_name, exact_app_name)
+        ):
+            exact_required_request_ids.add(request_id)
+            observations.exact_required_filter_request_count += 1
         location = _locate_target_filter_field(url, post_data, target_filter)
         if location is not None:
             if request_id is not None:
@@ -3091,17 +3202,26 @@ def _attach_list_response_observer(page, target_filter=None, private_outline_bat
                 and status is not None
                 and 200 <= int(status) < 300
             )
-            if not need_target and not need_structure:
+            need_exact_structure = (
+                request_id in exact_required_request_ids
+                and status is not None
+                and 200 <= int(status) < 300
+            )
+            if not need_target and not need_structure and not need_exact_structure:
                 return
             try:
                 result = session.send("Network.getResponseBody", {"requestId": request_id})
             except Exception:
                 if need_structure:
                     _record_target_absent_structure(observations, None, read_error=True)
+                if need_exact_structure:
+                    _record_exact_terminal_filter_structure(observations, None, read_error=True)
                 return
             if not isinstance(result, dict) or "body" not in result:
                 if need_structure:
                     _record_target_absent_structure(observations, None)
+                if need_exact_structure:
+                    _record_exact_terminal_filter_structure(observations, None)
                 return
             body = result.get("body")
             try:
@@ -3118,6 +3238,10 @@ def _attach_list_response_observer(page, target_filter=None, private_outline_bat
                         observations.complete_unfiltered_context_profiles.append(
                             observations.request_context_profiles.get(request_id)
                         )
+                if need_exact_structure:
+                    _record_exact_terminal_filter_structure(
+                        observations, body, base64_encoded=bool(result.get("base64Encoded"))
+                    )
             finally:
                 body = None
 
@@ -3222,7 +3346,8 @@ def _attach_list_response_observer(page, target_filter=None, private_outline_bat
             except (TypeError, ValueError):
                 is_2xx = False
             need_structure = is_2xx and observations.request_filter_states.get(request_id) == "target_absent"
-            if not need_target and not need_structure:
+            need_exact_structure = is_2xx and request_id in exact_required_request_ids
+            if not need_target and not need_structure and not need_exact_structure:
                 return
             body = None
             try:
@@ -3234,11 +3359,15 @@ def _attach_list_response_observer(page, target_filter=None, private_outline_bat
             except Exception:
                 if need_structure:
                     _record_target_absent_structure(observations, None, read_error=True)
+                if need_exact_structure:
+                    _record_exact_terminal_filter_structure(observations, None, read_error=True)
                 return
             try:
                 if body is None:
                     if need_structure:
                         _record_target_absent_structure(observations, None)
+                    if need_exact_structure:
+                        _record_exact_terminal_filter_structure(observations, None)
                     return
                 if need_target:
                     _note_response_contains_target(_body_contains_target(body))
@@ -3249,6 +3378,8 @@ def _attach_list_response_observer(page, target_filter=None, private_outline_bat
                         observations.complete_unfiltered_context_profiles.append(
                             observations.request_context_profiles.get(request_id)
                         )
+                if need_exact_structure:
+                    _record_exact_terminal_filter_structure(observations, body)
             finally:
                 body = None
 
@@ -4830,6 +4961,214 @@ def _enable_unknown_failure(message):
     }
 
 
+def _prepare_exact_terminal_filters(page, channel_name, app_name):
+    """Fill the sole visible list form without searching or retaining values."""
+    opened = page.evaluate("""
+    (channelName) => {
+      const visible = node => {
+        if (!node || node.closest('.el-dialog, .el-dialog__wrapper')) return false;
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' &&
+          style.opacity !== '0' && node.getAttribute('aria-hidden') !== 'true' &&
+          rect.width > 0 && rect.height > 0;
+      };
+      const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible);
+      const matches = forms.map(form => {
+        const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => {
+          if (!visible(select)) return false;
+          const item = select.closest('.el-form-item');
+          const label = item && item.querySelector('.el-form-item__label');
+          const input = select.querySelector('input');
+          const metadata = input ? `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}` : '';
+          return /渠道/.test(metadata) || Boolean(label && /渠道/.test(label.innerText || ''));
+        });
+        const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => {
+          if (!visible(item)) return false;
+          const label = item.querySelector('.el-form-item__label');
+          const input = item.querySelector('input.el-input__inner');
+          return Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && input && visible(input) &&
+            !input.disabled && !input.readOnly);
+        });
+        return channels.length === 1 && apps.length === 1 ? {form, channel: channels[0]} : null;
+      }).filter(Boolean);
+      if (matches.length !== 1) return {opened: false};
+      const input = matches[0].channel.querySelector('input.el-select__input') ||
+        matches[0].channel.querySelector('input.el-input__inner');
+      if (!input || input.disabled) return {opened: false};
+      input.click();
+      const searchInput = matches[0].channel.querySelector('input.el-select__input');
+      if (searchInput && !searchInput.readOnly) {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(searchInput, channelName);
+        searchInput.dispatchEvent(new Event('input', {bubbles: true}));
+        searchInput.dispatchEvent(new Event('change', {bubbles: true}));
+      }
+      return {opened: true};
+    }
+    """, channel_name) or {}
+    if not opened.get("opened"):
+        return False
+    page.wait_for_timeout(300)
+    selected = page.evaluate("""
+    (channelName) => {
+      const visible = node => {
+        const style = window.getComputedStyle(node); const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
+          node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
+      };
+      const dropdowns = Array.from(document.querySelectorAll('.el-select-dropdown')).filter(visible);
+      if (dropdowns.length !== 1) return false;
+      const options = Array.from(dropdowns[0].querySelectorAll('.el-select-dropdown__item')).filter(option =>
+        visible(option) && !option.className.includes('is-disabled') && (option.innerText || '').trim() === channelName
+      );
+      if (options.length !== 1) return false;
+      options[0].click(); return true;
+    }
+    """, channel_name)
+    if selected is not True:
+        return False
+    page.wait_for_timeout(300)
+    configured = page.evaluate("""
+    ({channelName, appName}) => {
+      const visible = node => {
+        if (!node || node.closest('.el-dialog, .el-dialog__wrapper')) return false;
+        const style = window.getComputedStyle(node); const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
+          node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
+      };
+      const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible);
+      const matches = forms.map(form => {
+        const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => {
+          const item = select.closest('.el-form-item'); const label = item && item.querySelector('.el-form-item__label');
+          const input = select.querySelector('input'); const metadata = input ? `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}` : '';
+          return visible(select) && (/渠道/.test(metadata) || Boolean(label && /渠道/.test(label.innerText || '')));
+        });
+        const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => {
+          const label = item.querySelector('.el-form-item__label'); const input = item.querySelector('input.el-input__inner');
+          return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && input && visible(input) && !input.disabled && !input.readOnly);
+        });
+        return channels.length === 1 && apps.length === 1 ? {channel: channels[0], app: apps[0].querySelector('input.el-input__inner')} : null;
+      }).filter(Boolean);
+      if (matches.length !== 1) return false;
+      const channelInput = matches[0].channel.querySelector('input.el-input__inner');
+      const channelTags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
+      if (!((channelInput && (channelInput.value || '').trim() === channelName) || channelTags.includes(channelName))) return false;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(matches[0].app, appName);
+      matches[0].app.dispatchEvent(new Event('input', {bubbles: true}));
+      matches[0].app.dispatchEvent(new Event('change', {bubbles: true}));
+      return (matches[0].app.value || '').trim() === appName;
+    }
+    """, {"channelName": channel_name, "appName": app_name})
+    return configured is True
+
+
+def _click_exact_terminal_search_once(page, channel_name, app_name):
+    """Atomically recheck both exact filters and consume the one-search budget."""
+    result = page.evaluate("""
+    ({channelName, appName}) => {
+      const visible = node => {
+        if (!node || node.closest('.el-dialog, .el-dialog__wrapper')) return false;
+        const style = window.getComputedStyle(node); const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
+          node.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
+      };
+      const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible);
+      const matches = forms.map(form => {
+        const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => {
+          const item = select.closest('.el-form-item'); const label = item && item.querySelector('.el-form-item__label');
+          const input = select.querySelector('input'); const metadata = input ? `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}` : '';
+          return visible(select) && (/渠道/.test(metadata) || Boolean(label && /渠道/.test(label.innerText || '')));
+        });
+        const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => {
+          const label = item.querySelector('.el-form-item__label'); const input = item.querySelector('input.el-input__inner');
+          return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && input && visible(input));
+        });
+        return channels.length === 1 && apps.length === 1 ? {form, channel: channels[0], app: apps[0].querySelector('input.el-input__inner')} : null;
+      }).filter(Boolean);
+      if (matches.length !== 1) return false;
+      const channelInput = matches[0].channel.querySelector('input.el-input__inner');
+      const channelTags = Array.from(matches[0].channel.querySelectorAll('.el-tag__content, .el-select__tags-text')).map(tag => (tag.innerText || '').trim());
+      if (!((channelInput && (channelInput.value || '').trim() === channelName) || channelTags.includes(channelName)) ||
+          !matches[0].app || (matches[0].app.value || '').trim() !== appName) return false;
+      const buttons = Array.from(matches[0].form.querySelectorAll('button')).filter(button =>
+        visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
+        (button.innerText || '').replace(/\\s/g, '').trim() === '搜索'
+      );
+      if (buttons.length !== 1) return false;
+      buttons[0].click(); return true;
+    }
+    """, {"channelName": channel_name, "appName": app_name})
+    return result is True
+
+
+def _wait_for_fresh_exact_terminal_proof(page, observations, records_before, requests_before, app_id, app_name, channel_name):
+    """Accept one new exact response only when its one-row DOM is stable twice."""
+    stable_fingerprint = None
+    stable_reads = 0
+    for _ in range(24):
+        page.wait_for_timeout(250)
+        records = list(getattr(observations, "exact_required_filter_success_records", []) or [])[records_before:]
+        request_count = int(getattr(observations, "exact_required_filter_request_count", 0) or 0) - int(requests_before or 0)
+        if len(records) != 1 or request_count != 1:
+            stable_fingerprint = None
+            stable_reads = 0
+            continue
+        state = _read_list_restore_state(page) or {}
+        meta = records[0]
+        if (
+            not _dom_matches_success_structure(state, meta)
+            or meta.get("item_count") != 1
+            or meta.get("total_count") != 1
+        ):
+            stable_fingerprint = None
+            stable_reads = 0
+            continue
+        snapshot = _snapshot_known_main_id_rows(page, app_id)
+        decision = _known_main_identity_from_snapshot(snapshot, app_id, app_name, channel_name)
+        if not decision.get("success"):
+            _log_known_main_snapshot(snapshot, decision, False)
+            stable_fingerprint = None
+            stable_reads = 0
+            continue
+        row = decision["row"]
+        fingerprint = (
+            snapshot.get("page"), row.get("logical_key"), row.get("row_idx"),
+            _restore_fingerprint(state),
+        )
+        if fingerprint == stable_fingerprint:
+            stable_reads += 1
+        else:
+            stable_fingerprint = fingerprint
+            stable_reads = 1
+        _log_known_main_snapshot(snapshot, decision, stable_reads >= 2)
+        if stable_reads >= 2:
+            return True
+    return False
+
+
+def _verify_enable_with_fresh_exact_terminal_query(page, app_id, app_name, channel_name):
+    """D-044 B: a new observer plus one exact dual-filter terminal query only."""
+    observations = _attach_list_response_observer(
+        page, exact_terminal_filters=(channel_name, app_name)
+    )
+    if observations is None:
+        return False
+    try:
+        if not _prepare_exact_terminal_filters(page, channel_name, app_name):
+            return False
+        records_before = len(getattr(observations, "exact_required_filter_success_records", []) or [])
+        requests_before = int(getattr(observations, "exact_required_filter_request_count", 0) or 0)
+        if not _click_exact_terminal_search_once(page, channel_name, app_name):
+            return False
+        return _wait_for_fresh_exact_terminal_proof(
+            page, observations, records_before, requests_before, app_id, app_name, channel_name
+        )
+    finally:
+        _detach_list_response_observer(observations)
+
+
 def _stage_enable(page, execution_id, target_app_id, app_name, actual_channel_name, known_main_handle):
     """Stage 2: one anchored enable click plus new unfiltered terminal proof."""
     _set_stage(execution_id, "正在检查应用状态")
@@ -4883,16 +5222,16 @@ def _stage_enable(page, execution_id, target_app_id, app_name, actual_channel_na
     if observer.post_action_switch_state != "switch_checked":
         return _enable_unknown_failure("上线后开关状态未能连续稳定回读，已停止")
 
-    # Throw away every narrow locator, response and DOM observation.  The final
-    # proof starts a fresh unfiltered observer/gate and finds the same three anchors.
+    # Throw away every narrow locator, response and DOM observation. The final
+    # proof owns a new observer and performs one exact channel+application query.
     try:
-        final_handle = _locate_known_main_row_for_resource_fallback(
+        terminal_verified = _verify_enable_with_fresh_exact_terminal_query(
             page, target_app_id, app_name, actual_channel_name
         )
     except Exception:
-        final_handle = {"success": False}
-    if not final_handle.get("success"):
-        return _enable_unknown_failure("上线后未筛选终验未能唯一定位目标主行，已停止")
+        terminal_verified = False
+    if not terminal_verified:
+        return _enable_unknown_failure("上线后精确窄查询终验未能唯一稳定核验目标主行，已停止")
     _shot(page, "08_published")
     return {"success": True, "error": None}
 

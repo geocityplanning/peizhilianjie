@@ -74,12 +74,13 @@ def test_application_name_and_target_identity_are_separate():
     assert "用应用名称搜索新创建的应用" not in create_source
 
 
-def test_later_stages_relocate_by_exact_app_id():
+def test_later_stages_keep_exact_app_id_identity():
     source = SOURCE_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
     enable = ast.get_source_segment(source, _function(tree, "_stage_enable")) or ""
     assert "target_app_id" in enable
-    assert "_locate_known_main_row_for_resource_fallback" in enable
+    assert "_verify_enable_with_fresh_exact_terminal_query" in enable
+    assert "_locate_known_main_row_for_resource_fallback" not in enable
     assert "_click_unchecked_switch_by_known_main_row" in enable
     for name in ("_stage_set_group", "_stage_collect_result"):
         function_source = ast.get_source_segment(source, _function(tree, name)) or ""

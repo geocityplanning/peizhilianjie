@@ -47,12 +47,12 @@ def _install_enable_success(monkeypatch, cap, page):
     monkeypatch.setattr(cap, "_wait_for_switch_action_observation", lambda *args: {"outcome": "success"})
     states = iter(["switch_unchecked", "switch_checked"])
     monkeypatch.setattr(cap, "_post_save_narrow_row_switch_state", lambda *args: next(states))
-    monkeypatch.setattr(cap, "_locate_known_main_row_for_resource_fallback", lambda *args: calls.append("terminal") or dict(HANDLE))
+    monkeypatch.setattr(cap, "_verify_enable_with_fresh_exact_terminal_query", lambda *args: calls.append("terminal") or True)
     monkeypatch.setattr(cap, "_shot", lambda *args, **kwargs: None)
     return calls
 
 
-def test_enable_happy_path_uses_one_anchored_click_then_fresh_terminal_gate(monkeypatch):
+def test_enable_happy_path_uses_one_anchored_click_then_fresh_exact_terminal_gate(monkeypatch):
     cap = _cap()
     page = Page()
     calls = _install_enable_success(monkeypatch, cap, page)
@@ -89,7 +89,7 @@ def test_enable_non_success_write_never_runs_checked_or_terminal_gate(monkeypatc
     monkeypatch.setattr(cap, "_click_unchecked_switch_by_known_main_row", lambda *args: True)
     monkeypatch.setattr(cap, "_wait_for_switch_action_observation", lambda *args: {"outcome": "business_rejected"})
     monkeypatch.setattr(cap, "_post_save_narrow_row_switch_state", lambda *args: "switch_unchecked")
-    monkeypatch.setattr(cap, "_locate_known_main_row_for_resource_fallback", lambda *args: (_ for _ in ()).throw(AssertionError("no terminal gate")))
+    monkeypatch.setattr(cap, "_verify_enable_with_fresh_exact_terminal_query", lambda *args: (_ for _ in ()).throw(AssertionError("no terminal gate")))
 
     result = cap._stage_enable(page, "exec", "id", "name", "channel", dict(HANDLE))
 
@@ -278,7 +278,7 @@ def test_stage_failure_after_single_switch_detaches_and_never_runs_terminal_gate
     monkeypatch.setattr(cap, "_attach_save_click_observer", lambda _page: observer)
     monkeypatch.setattr(cap, "_detach_save_click_observer", lambda _observer: calls.append("detach"))
     monkeypatch.setattr(cap, "_click_unchecked_switch_by_known_main_row", lambda *args: calls.append("switch") or True)
-    monkeypatch.setattr(cap, "_locate_known_main_row_for_resource_fallback", lambda *args: calls.append("terminal") or dict(HANDLE))
+    monkeypatch.setattr(cap, "_verify_enable_with_fresh_exact_terminal_query", lambda *args: calls.append("terminal") or True)
 
     result = cap._stage_enable(page, "exec", "id", "name", "channel", dict(HANDLE))
 
