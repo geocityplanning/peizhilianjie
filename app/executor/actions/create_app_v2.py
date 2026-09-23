@@ -2682,19 +2682,21 @@ def _log_save_click_observation(decision):
     ))
 
 
-def _apply_save_page_response_fallback(observer, candidate):
-    """Read one exact page response only within the candidate's shared evidence pass."""
-    if observer is None or not isinstance(candidate, dict):
-        return False
+def _unique_save_page_response(observer, candidate):
+    if observer is None or not isinstance(candidate, dict) or getattr(observer, "page_response_overflow", False):
+        return None
     matches = [
         item for item in getattr(observer, "page_responses", [])
         if item.get("method") == candidate.get("method")
         and item.get("path_hash") == candidate.get("path_hash")
         and item.get("http_status") == candidate.get("http_status")
     ]
-    if getattr(observer, "page_response_overflow", False) or len(matches) != 1:
-        return False
-    response = matches[0].get("response")
+    return matches[0] if len(matches) == 1 and matches[0].get("response") is not None else None
+
+
+def _apply_save_page_response_fallback(match, candidate):
+    """Read one exact page response after its shared evidence attempt is consumed."""
+    response = match.get("response") if isinstance(match, dict) else None
     try:
         if response is None or not hasattr(response, "finished") or not hasattr(response, "text"):
             return False
@@ -2710,12 +2712,12 @@ def _apply_save_page_response_fallback(observer, candidate):
     candidate["response_body"] = {"fetch_state": "available", "parse_state": parse_state}
     candidate["business"] = business
     candidate["page_fallback_attempted"] = True
-    matches[0]["response"] = None
+    match["response"] = None
     return True
 
 
 def _drain_save_response_evidence(observer, candidate):
-    """Use at most three shared, post-callback evidence passes within 450ms."""
+    """Consume at most three CDP-or-page reads in one 450ms window started by the first read."""
     if observer is None or not isinstance(candidate, dict) or not candidate.get("completed"):
         return
     body = candidate.get("response_body") if isinstance(candidate.get("response_body"), dict) else {}
@@ -2724,22 +2726,33 @@ def _drain_save_response_evidence(observer, candidate):
         return
     now = time.monotonic()
     deadline = candidate.get("evidence_deadline")
-    if not isinstance(deadline, (int, float)):
-        deadline = now + (_SAVE_EVIDENCE_TOTAL_MS / 1000)
-        candidate["evidence_deadline"] = deadline
-        candidate["evidence_next_at"] = now
-        candidate["evidence_attempts"] = 0
-    attempts = int(candidate.get("evidence_attempts") or 0)
-    if attempts >= _SAVE_EVIDENCE_MAX_ATTEMPTS or now > deadline:
+    if isinstance(deadline, (int, float)) and now > deadline:
         candidate["evidence_terminal"] = True
         return
     if now < float(candidate.get("evidence_next_at") or now):
         return
-    candidate["evidence_attempts"] = attempts + 1
-    candidate["evidence_next_at"] = now + (_SAVE_EVIDENCE_RETRY_MS / 1000)
+    page_match = _unique_save_page_response(observer, candidate)
     session = getattr(observer, "keepalive", None)
     request_id = candidate.get("request_id")
-    if session is not None and request_id:
+    source = "page" if page_match is not None else ("cdp" if session is not None and request_id else None)
+    if source is None:
+        return
+    attempts = int(candidate.get("evidence_attempts") or 0)
+    if attempts >= _SAVE_EVIDENCE_MAX_ATTEMPTS:
+        candidate["evidence_terminal"] = True
+        return
+    # The timer deliberately begins here, immediately before the first actual
+    # body-read attempt, never in the loadingFinished callback.
+    if not isinstance(deadline, (int, float)):
+        deadline = now + (_SAVE_EVIDENCE_TOTAL_MS / 1000)
+        candidate["evidence_deadline"] = deadline
+    candidate["evidence_attempts"] = attempts + 1
+    candidate["evidence_next_at"] = now + (_SAVE_EVIDENCE_RETRY_MS / 1000)
+    if source == "page":
+        if _apply_save_page_response_fallback(page_match, candidate):
+            candidate["evidence_terminal"] = True
+            return
+    else:
         try:
             result = session.send("Network.getResponseBody", {"requestId": request_id})
             text, fetch_state = _save_response_body(result)
@@ -2754,9 +2767,6 @@ def _drain_save_response_evidence(observer, candidate):
         except Exception:
             candidate["response_body"] = {"fetch_state": "read_error", "parse_state": "not_applicable"}
             candidate["business"] = {"outcome": "unreadable"}
-    if _apply_save_page_response_fallback(observer, candidate):
-        candidate["evidence_terminal"] = True
-        return
     if candidate["evidence_attempts"] >= _SAVE_EVIDENCE_MAX_ATTEMPTS or time.monotonic() >= deadline:
         candidate["evidence_terminal"] = True
 
@@ -2950,8 +2960,7 @@ def _attach_save_click_observer(page):
                 return
             candidate["completed"] = True
             candidate["evidence_attempts"] = 0
-            candidate["evidence_next_at"] = time.monotonic()
-            candidate["evidence_deadline"] = candidate["evidence_next_at"] + (_SAVE_EVIDENCE_TOTAL_MS / 1000)
+            candidate["evidence_next_at"] = None
             candidate["evidence_terminal"] = False
             candidate["response_body"] = {"fetch_state": "missing", "parse_state": "not_applicable"}
             candidate["business"] = {"outcome": "unreadable"}

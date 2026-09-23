@@ -116,6 +116,10 @@ def _advance(page):
     page.wait_for_timeout(150)
 
 
+def _evidence_reads(session, response=None):
+    return session.body_calls + (response.finished_calls if response is not None else 0)
+
+
 def test_loading_finished_only_registers_then_missing_body_retries_same_request(monkeypatch):
     cap, _clock, session, page, observer, _request = _setup(monkeypatch, [
         {}, {"body": '{"header":{"status":"200"}}'},
@@ -126,7 +130,7 @@ def test_loading_finished_only_registers_then_missing_body_retries_same_request(
     assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
     _advance(page)
     assert cap._save_click_observation(observer)["outcome"] == "success"
-    assert session.body_calls == 2
+    assert session.body_calls == 2 and _evidence_reads(session) <= 3
     assert len(observer.candidates) == 1 and page.save_clicks == 1
 
 
@@ -137,7 +141,7 @@ def test_read_error_then_body_success_uses_same_shared_evidence_budget(monkeypat
     assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
     _advance(page)
     assert cap._save_click_observation(observer)["outcome"] == "success"
-    assert session.body_calls == 2
+    assert session.body_calls == 2 and _evidence_reads(session) <= 3
     assert observer.candidates["r1"]["evidence_attempts"] == 2
 
 
@@ -154,11 +158,12 @@ def test_late_page_response_retries_finished_then_text_without_permanent_first_e
     _advance(page)
     assert cap._save_click_observation(observer)["outcome"] == "success"
     assert response.finished_calls == 2 and response.text_calls == 2
-    assert session.body_calls == 3
+    assert session.body_calls == 1
+    assert _evidence_reads(session, response) == 3
 
 
 def test_page_finished_transient_error_does_not_permanently_close_same_response(monkeypatch):
-    cap, _clock, _session, page, observer, request = _setup(monkeypatch, [{}, {}, {}])
+    cap, _clock, session, page, observer, request = _setup(monkeypatch, [{}, {}, {}])
     page.handlers["request"](request)
     response = Response(
         request,
@@ -172,6 +177,32 @@ def test_page_finished_transient_error_does_not_permanently_close_same_response(
     _advance(page)
     assert cap._save_click_observation(observer)["outcome"] == "success"
     assert response.finished_calls == 2 and response.text_calls == 1
+    assert _evidence_reads(session, response) == 2
+
+
+def test_page_budget_exhaustion_consumes_only_three_shared_reads(monkeypatch):
+    cap, _clock, session, page, observer, request = _setup(monkeypatch, [{}])
+    page.handlers["request"](request)
+    response = Response(request, text_results=[RuntimeError("transient")] * 3)
+    page.handlers["response"](response)
+    for _ in range(3):
+        assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
+        _advance(page)
+    candidate = observer.candidates["r1"]
+    assert candidate["evidence_terminal"] is True
+    assert response.finished_calls == 3 and response.text_calls == 3
+    assert session.body_calls == 0 and _evidence_reads(session, response) == 3
+    assert candidate.get("page_fallback_attempted") is not True
+
+
+def test_loading_finished_delay_does_not_start_evidence_deadline(monkeypatch):
+    cap, clock, session, _page, observer, _request = _setup(monkeypatch, [{"body": '{"header":{"status":"200"}}'}])
+    clock[0] += 1.0
+    assert cap._save_click_observation(observer)["outcome"] == "success"
+    candidate = observer.candidates["r1"]
+    assert session.body_calls == 1
+    assert candidate["evidence_deadline"] == 1.45
+    assert candidate["evidence_attempts"] == 1
 
 
 def test_shared_budget_exhaustion_stays_unreadable_unknown_query_and_detaches(monkeypatch):
@@ -185,7 +216,8 @@ def test_shared_budget_exhaustion_stays_unreadable_unknown_query_and_detaches(mo
     decision = cap._save_click_observation(observer)
     assert decision["outcome"] == "business_unreadable"
     assert decision["business"]["outcome"] == "unreadable"
-    assert session.body_calls == 3 and len(observer.candidates) == 1 and page.save_clicks == 1
+    assert session.body_calls == 3 and _evidence_reads(session) <= 3
+    assert len(observer.candidates) == 1 and page.save_clicks == 1
     assert session.detached is False and set(page.handlers) == {"request", "response"}
     cap._detach_save_click_observer(observer)
     assert session.detached is True and page.handlers == {}
