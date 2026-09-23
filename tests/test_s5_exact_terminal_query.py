@@ -529,8 +529,11 @@ def test_close_helper_rejects_multiple_or_unreadable_dropdowns_without_escape():
 ])
 def test_prepare_close_failure_logs_real_count_and_never_opens_application(monkeypatch, capsys, reason, count):
     cap = _cap()
-    page = ExactSelectPage([{"opened": True}])
+    page = ExactSelectPage([])
     pointers = []
+    monkeypatch.setattr(cap, "_read_exact_terminal_select_state", lambda *_args: {"pre_state": "empty"})
+    monkeypatch.setattr(cap, "_open_exact_terminal_filter", lambda *_args: True)
+    monkeypatch.setattr(cap, "_read_exact_terminal_option_selected_state", lambda *_args: "unselected")
     monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target, stage: pointers.append((target, stage)) or True)
     monkeypatch.setattr(cap, "_close_and_wait_unique_select_dropdown", lambda *_args: {
         "ok": False, "reason": reason, "visible_dropdown_count": count,
@@ -545,70 +548,77 @@ def test_prepare_close_failure_logs_real_count_and_never_opens_application(monke
     assert "channel-secret" not in output and "application-secret" not in output
 
 
-def test_prepare_exact_filters_orders_close_and_exact_verification_before_app_pointer(monkeypatch):
+def test_prepare_reuses_exact_channel_then_selects_empty_application_once(monkeypatch):
     cap = _cap()
-    page = ExactSelectPage([{"opened": True}, {"ok": True}, True, {"ok": True}])
-    pointer_targets = []
-    close_stages = []
-    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target, stage: pointer_targets.append((target, stage)) or True)
-    monkeypatch.setattr(cap, "_close_and_wait_unique_select_dropdown", lambda _page, stage: close_stages.append(stage) or {
-        "ok": True, "visible_dropdown_count": 0,
-    })
+    page = ExactSelectPage([])
+    pointers, opens, closes, searches = [], [], [], []
+    states = iter([
+        {"pre_state": "exact_one"}, {"pre_state": "empty"},
+    ])
+    monkeypatch.setattr(cap, "_read_exact_terminal_select_state", lambda *_args: next(states))
+    monkeypatch.setattr(cap, "_open_exact_terminal_filter", lambda _page, stage: opens.append(stage) or True)
+    monkeypatch.setattr(cap, "_read_exact_terminal_option_selected_state", lambda *_args: "unselected")
+    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target, stage: pointers.append((target, stage)) or True)
+    monkeypatch.setattr(cap, "_close_and_wait_unique_select_dropdown", lambda _page, stage: closes.append(stage) or {"ok": True, "visible_dropdown_count": 0, "escape_attempted": False})
+    monkeypatch.setattr(cap, "_wait_for_exact_terminal_select_stable", lambda _page, target, stage: (True, {"pre_state": "exact_one"}))
 
     assert cap._prepare_exact_terminal_filters(page, "channel", "application") is True
-    assert pointer_targets == [("channel", "channel"), ("application", "application")]
-    assert close_stages == ["channel", "application"]
-    assert page.payloads == [None, "channel", None, {"channelName": "channel", "appName": "application"}]
-    assert page.waits == [300, 300]
-    assert "length !== 0" not in page.scripts[1]
-    assert "!matches[0].readOnly" in page.scripts[2]
-    assert "length !== 0" not in page.scripts[3]
-    assert "tags.length === 1" in page.scripts[1]
-    assert "channelTags.length === 1" in page.scripts[3] and "appTags.length === 1" in page.scripts[3]
-    assert page.scripts[1].count("tagContainers") >= 2
-    assert page.scripts[3].count("tagContainers") >= 2
-    assert ".el-tag__content, .el-select__tags-text" not in page.scripts[1]
-    assert ".el-tag__content, .el-select__tags-text" not in page.scripts[3]
-    assert "HTMLInputElement.prototype" not in "\n".join(page.scripts)
-    assert "dispatchEvent" not in "\n".join(page.scripts)
+    assert pointers == [("application", "application")]
+    assert opens == ["application"] and closes == ["channel", "application"]
+    assert searches == []
 
 
-@pytest.mark.parametrize(
-    ("results", "pointer_results", "expected_evaluations", "expected_pointers"),
-    [
-        ([{"opened": False}], [], 1, []),
-        ([{"opened": True}], [False], 1, [("channel", "channel")]),
-        ([{"opened": True}, {"ok": False, "reason": "dropdown_not_closed"}], [True], 2, [("channel", "channel")]),
-        ([{"opened": True}, {"ok": True}, False], [True], 3, [("channel", "channel")]),
-        ([{"opened": True}, {"ok": True}, True], [True, False], 3, [("channel", "channel"), ("application", "application")]),
-        ([{"opened": True}, {"ok": True}, True, {"ok": False, "reason": "selected_value_mismatch"}], [True, True], 4, [("channel", "channel"), ("application", "application")]),
-    ],
-)
-def test_prepare_exact_filters_fails_closed_without_lower_stage_or_search(monkeypatch, results, pointer_results, expected_evaluations, expected_pointers):
+@pytest.mark.parametrize("pre_state", ["other", "unreadable"])
+def test_other_or_unreadable_prestate_stops_before_option_or_lower_stage(monkeypatch, pre_state):
     cap = _cap()
-    page = ExactSelectPage(results)
-    targets = []
-    pointer_results = iter(pointer_results)
-    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda _page, target, stage: targets.append((target, stage)) or next(pointer_results))
-    monkeypatch.setattr(cap, "_close_and_wait_unique_select_dropdown", lambda _page, _stage: {
-        "ok": True, "visible_dropdown_count": 0,
-    })
+    calls = []
+    monkeypatch.setattr(cap, "_read_exact_terminal_select_state", lambda *_args: {"pre_state": pre_state})
+    monkeypatch.setattr(cap, "_open_exact_terminal_filter", lambda *args: calls.append("open") or True)
+    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda *args: calls.append("click") or True)
+    monkeypatch.setattr(cap, "_close_and_wait_unique_select_dropdown", lambda *args: calls.append("close") or {"ok": True})
 
-    assert cap._prepare_exact_terminal_filters(page, "channel", "application") is False
-    assert targets == expected_pointers
-    assert len(page.scripts) == expected_evaluations
+    assert cap._prepare_exact_terminal_filters(ExactSelectPage([]), "channel", "application") is False
+    assert calls == []
+
+
+def test_empty_selected_option_conflict_stops_before_click_or_application(monkeypatch):
+    cap = _cap()
+    calls = []
+    monkeypatch.setattr(cap, "_read_exact_terminal_select_state", lambda *_args: {"pre_state": "empty"})
+    monkeypatch.setattr(cap, "_open_exact_terminal_filter", lambda *args: calls.append("open") or True)
+    monkeypatch.setattr(cap, "_read_exact_terminal_option_selected_state", lambda *args: "selected")
+    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda *args: calls.append("click") or True)
+    monkeypatch.setattr(cap, "_close_and_wait_unique_select_dropdown", lambda *args: calls.append("close") or {"ok": True})
+
+    assert cap._prepare_exact_terminal_filters(ExactSelectPage([]), "channel", "application") is False
+    assert calls == ["open"]
+
+
+def test_unstable_double_read_stops_without_another_click(monkeypatch):
+    cap = _cap()
+    calls = []
+    monkeypatch.setattr(cap, "_read_exact_terminal_select_state", lambda *_args: {"pre_state": "exact_one"})
+    monkeypatch.setattr(cap, "_close_and_wait_unique_select_dropdown", lambda *args: calls.append("close") or {"ok": True, "visible_dropdown_count": 0, "escape_attempted": False})
+    monkeypatch.setattr(cap, "_wait_for_exact_terminal_select_stable", lambda *args: (False, {"pre_state": "other"}))
+    monkeypatch.setattr(cap, "_click_unique_exact_visible_select_option", lambda *args: calls.append("click") or True)
+
+    assert cap._prepare_exact_terminal_filters(ExactSelectPage([]), "channel", "application") is False
+    assert calls == ["close"]
 
 
 def test_terminal_tag_guards_count_physical_containers_in_all_three_gates():
     cap = _cap()
-    source = inspect.getsource(cap._prepare_exact_terminal_filters) + inspect.getsource(cap._click_exact_terminal_search_once)
-    # One physical .el-tag may contain both leaf classes; it is mapped once. Two
-    # physical containers yield two values and fail each length===1 exact guard.
-    assert source.count("const tagContainers = Array.from(select.querySelectorAll('.el-tag'))") == 3
-    assert source.count("tagContainers.map(tag =>") == 3
-    assert source.count("const fallbackText = Array.from(select.querySelectorAll('.el-select__tags-text'))") == 3
+    source = inspect.getsource(cap._read_exact_terminal_select_state) + inspect.getsource(cap._click_exact_terminal_search_once)
+    # The shared pre/post reader covers channel and application; search repeats
+    # the same physical-container guard before consuming its one-click budget.
+    assert "const containers = Array.from(select.querySelectorAll('.el-tag'))" in source
+    assert "const tagContainers = Array.from(select.querySelectorAll('.el-tag'))" in source
+    assert "containers.length ? containers.map" in source
+    assert "tagContainers.map(tag =>" in source
+    assert "const text = Array.from(select.querySelectorAll('.el-select__tags-text'))" in source
+    assert "fallbackText = Array.from(select.querySelectorAll('.el-select__tags-text'))" in source
     assert ".el-tag__content, .el-select__tags-text" not in source
-    assert source.count("length === 1") >= 5
+    assert source.count("length === 1") >= 3
 
 
 def test_contract_documents_exact_terminal_dropdown_close_and_no_extra_tag_guards():
@@ -617,7 +627,9 @@ def test_contract_documents_exact_terminal_dropdown_close_and_no_extra_tag_guard
     assert "至多一次 Escape 并在有界窗口内确认关闭" in contract
     assert "tag/输入值必须恰好为目标且无额外值" in contract
     assert "tag 按物理 `.el-tag` 容器计数，每个容器只取一个叶子文本" in contract
-    assert "两个筛选均复核后才原子触发一次精确“搜索”" in contract
+    assert "已精确预选的渠道或应用必须零 option 点击复用" in contract
+    assert "同一唯一表单连续两次稳定精确复核" in contract
+    assert "两个筛选才原子触发一次精确“搜索”" in contract
 
 
 def test_exact_terminal_search_rechecks_readonly_app_value_without_model_write():

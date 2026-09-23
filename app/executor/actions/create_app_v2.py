@@ -5018,10 +5018,13 @@ _EXACT_SELECT_CLOSE_TOTAL_MS = 600
 _EXACT_SELECT_CLOSE_POLL_MS = 50
 
 
-def _log_exact_select_diagnostic(stage, reason, dropdown_count=0, option_count=0, click_attempted=False, click_succeeded=False):
+def _log_exact_select_diagnostic(stage, reason, dropdown_count=0, option_count=0, click_attempted=False, click_succeeded=False, selection=None, close=None):
     """Emit fixed, value-free exact-select facts only; never expose filter values."""
     bounded = lambda value: min(max(int(value or 0), 0), 2)
     count_readable = isinstance(dropdown_count, int) and dropdown_count >= 0
+    selection = selection if isinstance(selection, dict) else {}
+    close = close if isinstance(close, dict) else {}
+    fixed_state = lambda value, allowed, default: value if value in allowed else default
     print("[create_app] exact_select=" + json.dumps({
         "stage": stage if stage in {"channel", "application"} else "unknown",
         "reason": reason if reason in _EXACT_SELECT_DIAGNOSTIC_REASONS else "locator_click_failed",
@@ -5030,6 +5033,20 @@ def _log_exact_select_diagnostic(stage, reason, dropdown_count=0, option_count=0
         "exact_option_count": bounded(option_count),
         "click_attempted": bool(click_attempted),
         "click_succeeded": bool(click_succeeded),
+        "pre_state": fixed_state(selection.get("pre_state"), {"exact_one", "empty", "other", "unreadable"}, "unreadable"),
+        "option_selected_state": fixed_state(selection.get("option_selected_state"), {"selected", "unselected", "unreadable", "not_observed"}, "not_observed"),
+        "physical_tag_count": bounded(selection.get("physical_tag_count")),
+        "visible_tag_count": bounded(selection.get("visible_tag_count")),
+        "readable_leaf_count": bounded(selection.get("readable_leaf_count")),
+        "exact_match_count": bounded(selection.get("exact_match_count")),
+        "main_input_present": bool(selection.get("main_input_present")),
+        "main_input_has_value": bool(selection.get("main_input_has_value")),
+        "main_input_matches": bool(selection.get("main_input_matches")),
+        "search_input_present": bool(selection.get("search_input_present")),
+        "search_input_has_value": bool(selection.get("search_input_has_value")),
+        "selected_item_present": bool(selection.get("selected_item_present")),
+        "escape_attempted": bool(close.get("escape_attempted")),
+        "close_mode": fixed_state(close.get("close_mode"), {"passive", "escape", "not_needed"}, "not_needed"),
     }, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
 
 
@@ -5139,8 +5156,8 @@ def _click_unique_exact_visible_select_option(page, target_text, stage):
         return False
 
 
-def _prepare_exact_terminal_filters(page, channel_name, app_name):
-    """Fill the sole visible list form without searching or retaining values."""
+def _prepare_exact_terminal_filters_legacy(page, channel_name, app_name):
+    """Legacy unconditional selector path retained only for source-history comparison."""
     opened = page.evaluate("""
     (channelName) => {
       const visible = node => {
@@ -5313,6 +5330,122 @@ def _prepare_exact_terminal_filters(page, channel_name, app_name):
     }
     """, {"channelName": channel_name, "appName": app_name})
     return _exact_select_post_click_ok("application", configured, app_closed.get("visible_dropdown_count"), 1)
+
+
+def _read_exact_terminal_select_state(page, target, stage):
+    """Read one terminal filter's fixed pre-state without returning values to Python."""
+    try:
+        result = page.evaluate("""
+        ({target, stage}) => {
+          const visible = n => { if (!n || n.closest('.el-dialog, .el-dialog__wrapper')) return false; const s = getComputedStyle(n), r = n.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' && n.getAttribute('aria-hidden') !== 'true' && r.width > 0 && r.height > 0; };
+          const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible);
+          const matches = forms.map(form => {
+            const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => { const item = select.closest('.el-form-item'), label = item && item.querySelector('.el-form-item__label'), input = select.querySelector('input'); const meta = input ? `${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}` : ''; return visible(select) && (/渠道/.test(meta) || Boolean(label && /渠道/.test(label.innerText || ''))); });
+            const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => { const label = item.querySelector('.el-form-item__label'), selects = item.querySelectorAll('.el-select'), input = item.querySelector('input.el-input__inner'); return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && selects.length === 1 && input && visible(input) && !input.disabled); });
+            return channels.length === 1 && apps.length === 1 ? {channel: channels[0], app: apps[0].querySelector('.el-select')} : null;
+          }).filter(Boolean);
+          const base = {pre_state: 'unreadable', physical_tag_count: 0, visible_tag_count: 0, readable_leaf_count: 0, exact_match_count: 0, main_input_present: false, main_input_has_value: false, main_input_matches: false, search_input_present: false, search_input_has_value: false, selected_item_present: false};
+          if (matches.length !== 1 || !matches[0][stage]) return base;
+          const select = matches[0][stage], main = select.querySelector('input.el-input__inner'), search = select.querySelector('input.el-select__input');
+          base.main_input_present = Boolean(main); base.main_input_has_value = Boolean(main && (main.value || '').trim()); base.main_input_matches = Boolean(main && (main.value || '').trim() === target);
+          base.search_input_present = Boolean(search); base.search_input_has_value = Boolean(search && (search.value || '').trim()); base.selected_item_present = Boolean(select.querySelector('.selected-item, [aria-selected="true"]'));
+          const containers = Array.from(select.querySelectorAll('.el-tag')); base.physical_tag_count = containers.length; base.visible_tag_count = containers.filter(visible).length;
+          const leaves = containers.length ? containers.map(tag => tag.querySelector('.el-tag__content') || tag.querySelector('.el-select__tags-text')) : (() => { const text = Array.from(select.querySelectorAll('.el-select__tags-text')); return text.length ? text : Array.from(select.querySelectorAll('.el-tag__content')); })();
+          base.readable_leaf_count = leaves.filter(Boolean).length; base.exact_match_count = leaves.filter(leaf => leaf && (leaf.innerText || '').trim() === target).length;
+          if (containers.length || leaves.length) { if (leaves.some(leaf => !leaf)) return base; base.pre_state = leaves.length === 1 && base.exact_match_count === 1 ? 'exact_one' : 'other'; return base; }
+          if (!main) return base;
+          base.pre_state = base.main_input_matches ? 'exact_one' : (base.main_input_has_value ? 'other' : 'empty'); return base;
+        }
+        """, {"target": target, "stage": stage})
+        return result if isinstance(result, dict) else {"pre_state": "unreadable"}
+    except Exception:
+        return {"pre_state": "unreadable"}
+
+
+def _read_exact_terminal_option_selected_state(page, target):
+    """Return selected/unselected only when one visible exact option is structurally readable."""
+    try:
+        dropdowns = page.locator(".el-select-dropdown:visible")
+        if dropdowns.count() != 1:
+            return "unreadable"
+        exact = re.compile(r"^" + re.escape(target) + r"$")
+        option = page.locator(".el-select-dropdown:visible .el-select-dropdown__item:visible").filter(has_text=exact)
+        if option.count() != 1 or not option.is_visible() or (option.inner_text() or "").strip() != target:
+            return "unreadable"
+        classes, aria = option.get_attribute("class"), option.get_attribute("aria-selected")
+        if not isinstance(classes, str) or aria not in {None, "true", "false"}:
+            return "unreadable"
+        class_selected = "is-selected" in classes.split()
+        if aria == "true" and not class_selected:
+            return "unreadable"
+        if aria == "false" and class_selected:
+            return "unreadable"
+        return "selected" if class_selected or aria == "true" else "unselected"
+    except Exception:
+        return "unreadable"
+
+
+def _open_exact_terminal_filter(page, stage):
+    """Physically open only the unique empty filter; no model mutation."""
+    try:
+        return page.evaluate("""
+        stage => { const visible = n => { if (!n || n.closest('.el-dialog, .el-dialog__wrapper')) return false; const s = getComputedStyle(n), r = n.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' && r.width > 0 && r.height > 0; }; const forms = Array.from(document.querySelectorAll('.el-form')).filter(visible); const matches = forms.map(form => { const channels = Array.from(form.querySelectorAll('.el-select')).filter(select => { const item = select.closest('.el-form-item'), label = item && item.querySelector('.el-form-item__label'); return visible(select) && Boolean(label && /渠道/.test(label.innerText || '')); }); const apps = Array.from(form.querySelectorAll('.el-form-item')).filter(item => { const label=item.querySelector('.el-form-item__label'), input=item.querySelector('input.el-input__inner'); return visible(item) && Boolean(label && /应用.*(名称|名)/.test(label.innerText || '') && input && visible(input) && !input.disabled); }); return channels.length===1 && apps.length===1 ? {channel: channels[0], app: apps[0].querySelector('input.el-input__inner')} : null; }).filter(Boolean); if (matches.length !== 1) return false; const input = stage === 'channel' ? (matches[0].channel.querySelector('input.el-select__input') || matches[0].channel.querySelector('input.el-input__inner')) : matches[0].app; if (!input || input.disabled || (stage === 'application' && !input.readOnly)) return false; input.click(); return true; }
+        """, stage) is True
+    except Exception:
+        return False
+
+
+def _wait_for_exact_terminal_select_stable(page, target, stage):
+    """Require two consecutive exact reads in the same unique form within 300ms."""
+    stable = 0
+    facts = {"pre_state": "unreadable"}
+    for attempt in range(7):
+        facts = _read_exact_terminal_select_state(page, target, stage)
+        if facts.get("pre_state") == "exact_one":
+            stable += 1
+            if stable >= 2:
+                return True, facts
+        else:
+            stable = 0
+        if attempt < 6:
+            page.wait_for_timeout(50)
+    return False, facts
+
+
+def _prepare_exact_terminal_filters(page, channel_name, app_name):
+    """Reuse exact filters or select one empty value, then prove both stable before one search."""
+    for stage, target in (("channel", channel_name), ("application", app_name)):
+        facts = _read_exact_terminal_select_state(page, target, stage)
+        pre_state = facts.get("pre_state")
+        clicked = False
+        option_state = "not_observed"
+        close = {"escape_attempted": False, "close_mode": "not_needed", "visible_dropdown_count": 0}
+        if pre_state == "empty":
+            if not _open_exact_terminal_filter(page, stage):
+                _log_exact_select_diagnostic(stage, "selected_value_mismatch", selection=facts, close=close)
+                return False
+            page.wait_for_timeout(300)
+            option_state = _read_exact_terminal_option_selected_state(page, target)
+            facts["option_selected_state"] = option_state
+            if option_state != "unselected" or not _click_unique_exact_visible_select_option(page, target, stage):
+                _log_exact_select_diagnostic(stage, "selected_value_mismatch", selection=facts, close=close)
+                return False
+            clicked = True
+        elif pre_state != "exact_one":
+            _log_exact_select_diagnostic(stage, "selected_value_mismatch", selection=facts, close=close)
+            return False
+        close = _close_and_wait_unique_select_dropdown(page, stage)
+        close["close_mode"] = "escape" if close.get("escape_attempted") else "passive"
+        if not close.get("ok"):
+            _log_exact_select_diagnostic(stage, close.get("reason"), close.get("visible_dropdown_count"), 1 if clicked else 0, clicked, clicked, facts, close)
+            return False
+        stable, final_facts = _wait_for_exact_terminal_select_stable(page, target, stage)
+        final_facts["option_selected_state"] = option_state
+        if not stable:
+            _log_exact_select_diagnostic(stage, "selected_value_mismatch", close.get("visible_dropdown_count"), 1 if clicked else 0, clicked, clicked, final_facts, close)
+            return False
+        _log_exact_select_diagnostic(stage, "success", close.get("visible_dropdown_count"), 1 if clicked else 0, clicked, clicked, final_facts, close)
+    return True
 
 
 def _click_exact_terminal_search_once(page, channel_name, app_name):
