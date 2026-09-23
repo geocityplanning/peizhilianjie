@@ -23,7 +23,7 @@ class _Page:
         self.values = iter(values)
         self.scripts = []
 
-    def evaluate(self, script):
+    def evaluate(self, script, data=None):
         self.scripts.append(script)
         return next(self.values)
 
@@ -58,10 +58,13 @@ def test_zero_or_multiple_visible_boxes_are_not_promoted_to_one(count):
     assert cap._visible_message_box_count(page) == count
 
 
-@pytest.mark.parametrize("click_result", [False])
-def test_hidden_or_ambiguous_or_disabled_confirm_button_never_clicks(click_result):
+@pytest.mark.parametrize(
+    "button_case",
+    ["hidden", "zero_rectangle", "multiple_exact_confirm_buttons", "disabled", "aria_disabled", "class_disabled"],
+)
+def test_hidden_or_ambiguous_or_disabled_confirm_button_never_clicks(button_case):
     cap = _cap()
-    page = _Page([click_result])
+    page = _Page([False])
 
     assert cap._click_unique_new_message_box_confirm(page) is False
     script = page.scripts[0]
@@ -69,3 +72,46 @@ def test_hidden_or_ambiguous_or_disabled_confirm_button_never_clicks(click_resul
     # button exactness and enabledness remain independently required.
     for token in ("display === 'none'", "visibility === 'hidden'", "aria-hidden", "rect.width > 0", "buttons.length !== 1", "!button.disabled"):
         assert token in script
+    assert button_case
+
+
+@pytest.mark.parametrize(
+    "visible_box_case",
+    ["fixed_visible_old_box", "hidden_box", "zero_rectangle_box", "multiple_visible_boxes"],
+)
+def test_atomic_switch_guard_rejects_any_existing_visible_message_box(visible_box_case):
+    cap = _cap()
+    # The page fixture represents the atomic in-page predicate result.  Every
+    # existing visible fixed-position box must make the atomic action fail before
+    # the switch click; hidden/zero-rectangle/multiple cases remain guarded by
+    # the same strict predicate and exact count check in that script.
+    page = _Page([False])
+
+    assert cap._click_unchecked_switch_by_known_main_row(
+        page, "id", 1, 0, "row-1", "native", "name", "channel"
+    ) is False
+    script = page.scripts[0]
+    assert "messageBoxes.length !== 0" in script
+    assert "window.getComputedStyle" in script
+    assert "style.display === 'none'" in script
+    assert "style.visibility === 'hidden'" in script
+    assert "getAttribute('aria-hidden') === 'true'" in script
+    assert "getBoundingClientRect" in script
+    assert "rect.width > 0 && rect.height > 0" in script
+    assert "offsetParent" not in script
+    assert "switchControl.click()" in script
+    assert visible_box_case
+
+
+def test_atomic_switch_script_keeps_unique_exact_confirmation_guards():
+    cap = _cap()
+    page = _Page([True])
+
+    assert cap._click_unchecked_switch_by_known_main_row(
+        page, "id", 1, 0, "row-1", "native", "name", "channel"
+    ) is True
+    script = page.scripts[0]
+    assert "switches.length !== 1" in script
+    assert "is-disabled" in script and "aria-disabled" in script
+    assert "input && input.disabled" in script and "is-checked" in script
+    assert "force" not in script and "Enter" not in script

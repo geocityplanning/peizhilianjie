@@ -574,7 +574,14 @@ def _click_unchecked_switch_by_known_main_row(
         return bool(page.evaluate(
             """
             ({appId, pageNumber, rowIdx, logicalKey, keyKind, appName, channelName}) => {
-              const visible = el => Boolean(el) && el.offsetParent !== null;
+              const visible = el => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                if (el.getAttribute('aria-hidden') === 'true') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
               const inDialog = el => Boolean(el && el.closest('.el-dialog, .el-dialog__wrapper'));
               const utility = el => /el-table__expand-column|el-table-column--selection|\\bgutter\\b/.test(String(el.className || ''));
               const messageBoxes = Array.from(document.querySelectorAll('.el-message-box__wrapper')).filter(visible);
