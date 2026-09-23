@@ -308,6 +308,144 @@ def test_save_observation_never_treats_http_2xx_alone_as_success(record, expecte
     assert cap._save_click_observation(_save_observer(cap, record))["outcome"] == expected
 
 
+class _PageSaveResponse:
+    def __init__(self, text, *, raise_on_text=False):
+        self._text = text
+        self.raise_on_text = raise_on_text
+        self.text_calls = 0
+
+    def text(self):
+        self.text_calls += 1
+        if self.raise_on_text:
+            raise RuntimeError("unavailable")
+        return self._text
+
+
+def _page_fallback_observer(cap, *, fetch_state="missing", status=200, responses=()):
+    observer = cap._SaveClickObserver()
+    observer.candidates = {"r1": {
+        "method": "POST", "path_hash": "0123456789abcdef", "completed": True, "http_status": status,
+        "response_body": {"fetch_state": fetch_state, "parse_state": "not_applicable"},
+        "business": {"outcome": "unreadable"},
+    }}
+    observer.page_responses = list(responses)
+    return observer
+
+
+def test_save_page_fallback_uses_only_missing_or_read_error_cdp_body():
+    cap = _stub_login_and_import()
+    page_response = _PageSaveResponse('{"header":{"status":"200"}}')
+    observer = _page_fallback_observer(cap, fetch_state="available", responses=[{
+        "method": "POST", "path_hash": "0123456789abcdef", "http_status": 200, "response": page_response,
+    }])
+    observer.candidates["r1"]["business"] = {"outcome": "success"}
+    assert cap._save_click_observation(observer)["outcome"] == "success"
+    assert page_response.text_calls == 0
+
+    observer = _page_fallback_observer(cap, responses=[{
+        "method": "POST", "path_hash": "0123456789abcdef", "http_status": 200,
+        "response": _PageSaveResponse('{"header":{"status":"200"}}'),
+    }])
+    decision = cap._save_click_observation(observer)
+    assert decision["outcome"] == "success"
+    assert decision["response_body"]["fetch_state"] == "available"
+
+    observer = _page_fallback_observer(cap, fetch_state="read_error", responses=[{
+        "method": "POST", "path_hash": "0123456789abcdef", "http_status": 200,
+        "response": _PageSaveResponse('{"header":{"status":"500"}}'),
+    }])
+    assert cap._save_click_observation(observer)["outcome"] == "business_rejected"
+
+
+@pytest.mark.parametrize("responses", [
+    [],
+    [
+        {"method": "POST", "path_hash": "0123456789abcdef", "http_status": 200, "response": _PageSaveResponse('{"header":{"status":"200"}}')},
+        {"method": "POST", "path_hash": "0123456789abcdef", "http_status": 200, "response": _PageSaveResponse('{"header":{"status":"200"}}')},
+    ],
+    [{"method": "PUT", "path_hash": "0123456789abcdef", "http_status": 200, "response": _PageSaveResponse('{"header":{"status":"200"}}')}],
+    [{"method": "POST", "path_hash": "fedcba9876543210", "http_status": 200, "response": _PageSaveResponse('{"header":{"status":"200"}}')}],
+    [{"method": "POST", "path_hash": "0123456789abcdef", "http_status": 201, "response": _PageSaveResponse('{"header":{"status":"200"}}')}],
+])
+def test_save_page_fallback_rejects_zero_ambiguous_or_nonmatching_responses(responses):
+    cap = _stub_login_and_import()
+    observer = _page_fallback_observer(cap, responses=responses)
+    assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
+
+
+def test_save_page_fallback_no_body_or_invalid_envelope_stays_fail_closed():
+    cap = _stub_login_and_import()
+    for response in (_PageSaveResponse(None), _PageSaveResponse('not-json'), _PageSaveResponse('{"data":{}}'), _PageSaveResponse('', raise_on_text=True)):
+        observer = _page_fallback_observer(cap, responses=[{
+            "method": "POST", "path_hash": "0123456789abcdef", "http_status": 200, "response": response,
+        }])
+        assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
+
+
+def test_save_page_event_listener_requires_current_window_request_and_detaches():
+    cap = _stub_login_and_import()
+
+    class Session:
+        def __init__(self):
+            self.handlers = {}
+            self.detached = False
+        def send(self, method, params=None):
+            if method == "Network.enable":
+                return {}
+            if method == "Network.getResponseBody":
+                return {}
+            return {}
+        def on(self, event, handler):
+            self.handlers[event] = handler
+        def detach(self):
+            self.detached = True
+
+    class Context:
+        def __init__(self, session):
+            self.session = session
+        def new_cdp_session(self, page):
+            return self.session
+
+    class Page:
+        def __init__(self, session):
+            self.context = Context(session)
+            self.handlers = {}
+        def on(self, event, handler):
+            self.handlers[event] = handler
+        def off(self, event, handler):
+            if self.handlers.get(event) is handler:
+                del self.handlers[event]
+
+    class Request:
+        url = "https://uat-cloud.139.com/save"
+        method = "POST"
+
+    class Response:
+        status = 200
+        def __init__(self, request):
+            self.request = request
+        def text(self):
+            return '{"header":{"status":"200"}}'
+
+    session = Session()
+    page = Page(session)
+    observer = cap._attach_save_click_observer(page)
+    request = Request()
+    # A response without this window's page request is an old/unrelated event.
+    page.handlers["response"](Response(request))
+    session.handlers["Network.requestWillBeSent"]({"requestId": "r1", "request": {"url": request.url, "method": request.method}})
+    session.handlers["Network.responseReceived"]({"requestId": "r1", "response": {"status": 200}})
+    session.handlers["Network.loadingFinished"]({"requestId": "r1"})
+    assert cap._save_click_observation(observer)["outcome"] == "business_unreadable"
+
+    page.handlers["request"](request)
+    page.handlers["response"](Response(request))
+    assert cap._save_click_observation(observer)["outcome"] == "success"
+    cap._detach_save_click_observer(observer)
+    assert page.handlers == {}
+    assert session.detached is True
+
+
 def test_save_observation_rejects_missing_or_multiple_candidates():
     cap = _stub_login_and_import()
     assert cap._save_click_observation(_save_observer(cap))["outcome"] == "no_candidate"

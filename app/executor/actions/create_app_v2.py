@@ -1665,6 +1665,13 @@ class _SaveClickObserver:
     def __init__(self):
         self.keepalive = None
         self.candidates = {}
+        self.page_request_meta = {}
+        self.page_responses = []
+        self.page_response_overflow = False
+        self.page_event_handlers = []
+
+
+_SAVE_PAGE_RESPONSE_LIMIT = 2
 
 
 _LIST_STRUCTURE_BUCKETS = (
@@ -2341,6 +2348,37 @@ def _log_save_click_observation(decision):
     ))
 
 
+def _apply_save_page_response_fallback(observer, candidate):
+    """Read one strictly associated page response only after CDP body unavailability."""
+    if observer is None or not isinstance(candidate, dict) or candidate.get("page_fallback_attempted"):
+        return
+    body_state = candidate.get("response_body") if isinstance(candidate.get("response_body"), dict) else {}
+    if body_state.get("fetch_state") not in {"missing", "read_error"}:
+        return
+    matches = [
+        item for item in getattr(observer, "page_responses", [])
+        if item.get("method") == candidate.get("method")
+        and item.get("path_hash") == candidate.get("path_hash")
+        and item.get("http_status") == candidate.get("http_status")
+    ]
+    if getattr(observer, "page_response_overflow", False) or len(matches) != 1:
+        if matches or getattr(observer, "page_response_overflow", False):
+            candidate["page_fallback_attempted"] = True
+        return
+    candidate["page_fallback_attempted"] = True
+    response = matches[0].get("response")
+    try:
+        text = response.text() if response is not None and hasattr(response, "text") else None
+    except Exception:
+        return
+    if text is None:
+        return
+    business, parse_state = _save_business_summary_detail(text)
+    candidate["response_body"] = {"fetch_state": "available", "parse_state": parse_state}
+    candidate["business"] = business
+    matches[0]["response"] = None
+
+
 def _save_click_observation(observer):
     """Return a redacted atomic decision; never promote 2xx alone to success."""
     if observer is None:
@@ -2349,6 +2387,7 @@ def _save_click_observation(observer):
     if len(candidates) != 1:
         return {"outcome": "no_candidate" if not candidates else "ambiguous_candidate", "candidate_count": len(candidates)}
     candidate = candidates[0]
+    _apply_save_page_response_fallback(observer, candidate)
     evidence = _save_candidate_evidence(candidate)
     if not candidate.get("completed"):
         return {"outcome": "response_timeout", **evidence}
@@ -2360,11 +2399,33 @@ def _save_click_observation(observer):
     return {"outcome": "success", **evidence}
 
 
+def _save_page_fallback_pending(observer):
+    if observer is None or getattr(observer, "page_response_overflow", False):
+        return False
+    candidates = list(getattr(observer, "candidates", {}).values())
+    if len(candidates) != 1:
+        return False
+    candidate = candidates[0]
+    body = candidate.get("response_body") if isinstance(candidate.get("response_body"), dict) else {}
+    if not candidate.get("completed") or body.get("fetch_state") not in {"missing", "read_error"}:
+        return False
+    if candidate.get("page_fallback_attempted"):
+        return False
+    return not any(
+        item.get("method") == candidate.get("method")
+        and item.get("path_hash") == candidate.get("path_hash")
+        and item.get("http_status") == candidate.get("http_status")
+        for item in getattr(observer, "page_responses", [])
+    )
+
+
 def _wait_for_save_click_observation(page, observer, timeout_ms=6000, poll_interval_ms=150):
     deadline = time.monotonic() + (timeout_ms / 1000)
     while time.monotonic() < deadline:
         decision = _save_click_observation(observer)
-        if decision.get("outcome") not in {"no_candidate", "response_timeout"}:
+        if decision.get("outcome") not in {"no_candidate", "response_timeout"} and not (
+            decision.get("outcome") == "business_unreadable" and _save_page_fallback_pending(observer)
+        ):
             return decision
         page.wait_for_timeout(poll_interval_ms)
     return _save_click_observation(observer)
@@ -2378,14 +2439,19 @@ def _attach_save_click_observer(page):
         session.send("Network.enable")
         origin = urlparse(BASE_URL_H5).netloc
 
+        def _is_save_write(url, method):
+            return (
+                method in {"POST", "PUT", "PATCH", "DELETE"}
+                and not _is_list_request_url(url)
+                and urlparse(url).netloc == origin
+            )
+
         def _on_request(params):
             data = params or {}
             request = data.get("request") or {}
             url = request.get("url") or ""
             method = str(request.get("method") or "").upper()
-            if method not in {"POST", "PUT", "PATCH", "DELETE"} or _is_list_request_url(url):
-                return
-            if urlparse(url).netloc != origin:
+            if not _is_save_write(url, method):
                 return
             request_id = data.get("requestId")
             if request_id:
@@ -2434,6 +2500,45 @@ def _attach_save_click_observer(page):
         session.on("Network.responseReceived", _on_response)
         session.on("Network.loadingFinished", _on_finished)
         session.on("Network.loadingFailed", _on_failed)
+
+        def _on_page_request(request):
+            try:
+                url = getattr(request, "url", "") or ""
+                method = str(getattr(request, "method", "") or "").upper()
+                if not _is_save_write(url, method):
+                    return
+                if len(observer.page_request_meta) >= _SAVE_PAGE_RESPONSE_LIMIT:
+                    observer.page_response_overflow = True
+                    return
+                observer.page_request_meta[id(request)] = {
+                    "method": method, "path_hash": _save_path_hash(url),
+                }
+            except Exception:
+                return
+
+        def _on_page_response(response):
+            try:
+                request = getattr(response, "request", None)
+                meta = observer.page_request_meta.pop(id(request), None) if request is not None else None
+                if meta is None:
+                    return
+                if len(observer.page_responses) >= _SAVE_PAGE_RESPONSE_LIMIT:
+                    observer.page_response_overflow = True
+                    return
+                try:
+                    status = int(getattr(response, "status", 0) or 0)
+                except (TypeError, ValueError):
+                    status = 0
+                observer.page_responses.append({**meta, "http_status": status, "response": response})
+            except Exception:
+                return
+
+        try:
+            page.on("request", _on_page_request)
+            page.on("response", _on_page_response)
+            observer.page_event_handlers = [(page, "request", _on_page_request), (page, "response", _on_page_response)]
+        except Exception:
+            observer.page_event_handlers = []
         observer.keepalive = session
         return observer
     except Exception:
