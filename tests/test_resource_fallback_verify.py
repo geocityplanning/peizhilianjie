@@ -314,6 +314,9 @@ class _PageSaveResponse:
         self.raise_on_text = raise_on_text
         self.text_calls = 0
 
+    def finished(self):
+        return None
+
     def text(self):
         self.text_calls += 1
         if self.raise_on_text:
@@ -435,6 +438,8 @@ def test_save_page_event_listener_requires_current_window_request_and_detaches()
         status = 200
         def __init__(self, request):
             self.request = request
+        def finished(self):
+            return None
         def text(self):
             return '{"header":{"status":"200"}}'
 
@@ -462,6 +467,7 @@ def test_save_page_event_listener_requires_current_window_request_and_detaches()
     assert set(projected) == {"method", "path_hash", "http_status", "response"}
     assert request.url not in str({key: value for key, value in projected.items() if key != "response"})
     assert "secret=query" not in str({key: value for key, value in projected.items() if key != "response"})
+    observer.candidates["r1"]["evidence_next_at"] = 0
     assert cap._save_click_observation(observer)["outcome"] == "success"
     cap._detach_save_click_observer(observer)
     assert page.handlers == {}

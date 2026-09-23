@@ -1865,6 +1865,9 @@ class _SaveClickObserver:
 
 _SAVE_PAGE_RESPONSE_LIMIT = 2
 _SAVE_CANDIDATE_LIMIT = 2
+_SAVE_EVIDENCE_MAX_ATTEMPTS = 3
+_SAVE_EVIDENCE_TOTAL_MS = 450
+_SAVE_EVIDENCE_RETRY_MS = 150
 
 
 _LIST_STRUCTURE_BUCKETS = (
@@ -2680,12 +2683,9 @@ def _log_save_click_observation(decision):
 
 
 def _apply_save_page_response_fallback(observer, candidate):
-    """Read one strictly associated page response only after CDP body unavailability."""
-    if observer is None or not isinstance(candidate, dict) or candidate.get("page_fallback_attempted"):
-        return
-    body_state = candidate.get("response_body") if isinstance(candidate.get("response_body"), dict) else {}
-    if body_state.get("fetch_state") not in {"missing", "read_error"}:
-        return
+    """Read one exact page response only within the candidate's shared evidence pass."""
+    if observer is None or not isinstance(candidate, dict):
+        return False
     matches = [
         item for item in getattr(observer, "page_responses", [])
         if item.get("method") == candidate.get("method")
@@ -2693,21 +2693,72 @@ def _apply_save_page_response_fallback(observer, candidate):
         and item.get("http_status") == candidate.get("http_status")
     ]
     if getattr(observer, "page_response_overflow", False) or len(matches) != 1:
-        if matches or getattr(observer, "page_response_overflow", False):
-            candidate["page_fallback_attempted"] = True
-        return
-    candidate["page_fallback_attempted"] = True
+        return False
     response = matches[0].get("response")
     try:
-        text = response.text() if response is not None and hasattr(response, "text") else None
+        if response is None or not hasattr(response, "finished") or not hasattr(response, "text"):
+            return False
+        finished = response.finished()
+        if finished is not None:
+            return False
+        text = response.text()
     except Exception:
-        return
+        return False
     if text is None:
-        return
+        return False
     business, parse_state = _save_business_summary_detail(text)
     candidate["response_body"] = {"fetch_state": "available", "parse_state": parse_state}
     candidate["business"] = business
+    candidate["page_fallback_attempted"] = True
     matches[0]["response"] = None
+    return True
+
+
+def _drain_save_response_evidence(observer, candidate):
+    """Use at most three shared, post-callback evidence passes within 450ms."""
+    if observer is None or not isinstance(candidate, dict) or not candidate.get("completed"):
+        return
+    body = candidate.get("response_body") if isinstance(candidate.get("response_body"), dict) else {}
+    if body.get("fetch_state") not in {"missing", "read_error"}:
+        candidate["evidence_terminal"] = True
+        return
+    now = time.monotonic()
+    deadline = candidate.get("evidence_deadline")
+    if not isinstance(deadline, (int, float)):
+        deadline = now + (_SAVE_EVIDENCE_TOTAL_MS / 1000)
+        candidate["evidence_deadline"] = deadline
+        candidate["evidence_next_at"] = now
+        candidate["evidence_attempts"] = 0
+    attempts = int(candidate.get("evidence_attempts") or 0)
+    if attempts >= _SAVE_EVIDENCE_MAX_ATTEMPTS or now > deadline:
+        candidate["evidence_terminal"] = True
+        return
+    if now < float(candidate.get("evidence_next_at") or now):
+        return
+    candidate["evidence_attempts"] = attempts + 1
+    candidate["evidence_next_at"] = now + (_SAVE_EVIDENCE_RETRY_MS / 1000)
+    session = getattr(observer, "keepalive", None)
+    request_id = candidate.get("request_id")
+    if session is not None and request_id:
+        try:
+            result = session.send("Network.getResponseBody", {"requestId": request_id})
+            text, fetch_state = _save_response_body(result)
+            if fetch_state not in {"missing", "read_error"}:
+                business, parse_state = _save_business_summary_detail(text)
+                candidate["response_body"] = {"fetch_state": fetch_state, "parse_state": parse_state}
+                candidate["business"] = business
+                candidate["evidence_terminal"] = True
+                return
+            candidate["response_body"] = {"fetch_state": fetch_state, "parse_state": "not_applicable"}
+            candidate["business"] = {"outcome": "unreadable"}
+        except Exception:
+            candidate["response_body"] = {"fetch_state": "read_error", "parse_state": "not_applicable"}
+            candidate["business"] = {"outcome": "unreadable"}
+    if _apply_save_page_response_fallback(observer, candidate):
+        candidate["evidence_terminal"] = True
+        return
+    if candidate["evidence_attempts"] >= _SAVE_EVIDENCE_MAX_ATTEMPTS or time.monotonic() >= deadline:
+        candidate["evidence_terminal"] = True
 
 
 def _save_click_observation(observer):
@@ -2718,7 +2769,7 @@ def _save_click_observation(observer):
     if len(candidates) != 1:
         return {"outcome": "no_candidate" if not candidates else "ambiguous_candidate", "candidate_count": len(candidates)}
     candidate = candidates[0]
-    _apply_save_page_response_fallback(observer, candidate)
+    _drain_save_response_evidence(observer, candidate)
     evidence = _save_candidate_evidence(candidate)
     if not candidate.get("completed"):
         return {"outcome": "response_timeout", **evidence}
@@ -2740,14 +2791,7 @@ def _save_page_fallback_pending(observer):
     body = candidate.get("response_body") if isinstance(candidate.get("response_body"), dict) else {}
     if not candidate.get("completed") or body.get("fetch_state") not in {"missing", "read_error"}:
         return False
-    if candidate.get("page_fallback_attempted"):
-        return False
-    return not any(
-        item.get("method") == candidate.get("method")
-        and item.get("path_hash") == candidate.get("path_hash")
-        and item.get("http_status") == candidate.get("http_status")
-        for item in getattr(observer, "page_responses", [])
-    )
+    return not bool(candidate.get("evidence_terminal"))
 
 
 def _wait_for_save_click_observation(page, observer, timeout_ms=6000, poll_interval_ms=150):
@@ -2806,6 +2850,7 @@ def _wait_for_switch_action_observation(page, observer, timeout_ms=6000, poll_in
             confirm_closed = True
             observer.confirmation_closed = True
             observer.confirmation_trace = "unique_clicked_closed"
+        _save_click_observation(observer)
         page.wait_for_timeout(poll_interval_ms)
     if saw_box and (not confirm_clicked or not confirm_closed):
         observer.confirmation_trace = "unclosed"
@@ -2878,6 +2923,7 @@ def _attach_save_click_observer(page):
             observer.candidates[request_id] = {
                 "method": method,
                 "path_hash": _save_path_hash(url),
+                "request_id": request_id,
                 "completed": False,
             }
 
@@ -2903,15 +2949,12 @@ def _attach_save_click_observer(page):
             if candidate is None:
                 return
             candidate["completed"] = True
-            try:
-                result = session.send("Network.getResponseBody", {"requestId": request_id})
-                body, fetch_state = _save_response_body(result)
-                business, parse_state = _save_business_summary_detail(body)
-                candidate["response_body"] = {"fetch_state": fetch_state, "parse_state": parse_state}
-                candidate["business"] = business
-            except Exception:
-                candidate["response_body"] = {"fetch_state": "read_error", "parse_state": "not_applicable"}
-                candidate["business"] = {"outcome": "unreadable"}
+            candidate["evidence_attempts"] = 0
+            candidate["evidence_next_at"] = time.monotonic()
+            candidate["evidence_deadline"] = candidate["evidence_next_at"] + (_SAVE_EVIDENCE_TOTAL_MS / 1000)
+            candidate["evidence_terminal"] = False
+            candidate["response_body"] = {"fetch_state": "missing", "parse_state": "not_applicable"}
+            candidate["business"] = {"outcome": "unreadable"}
 
         def _on_failed(params):
             if observer.detached:
